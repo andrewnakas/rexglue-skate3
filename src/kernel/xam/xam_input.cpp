@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 
@@ -42,7 +44,7 @@ constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
 
 namespace {
 
-constexpr size_t kMaxSyntheticInputSteps = 16;
+constexpr size_t kMaxSyntheticInputSteps = 1024;
 
 std::atomic<bool> g_synthetic_input_active{false};
 std::mutex g_synthetic_input_mutex;
@@ -50,10 +52,18 @@ std::array<SyntheticInputStep, kMaxSyntheticInputSteps> g_synthetic_input_steps{
 size_t g_synthetic_input_step_count = 0;
 size_t g_synthetic_input_step_index = 0;
 uint32_t g_synthetic_input_step_remaining = 0;
+SyntheticInputStep g_synthetic_held_state{};
+bool g_synthetic_hold_active = false;
+bool g_synthetic_replace_physical_input = false;
+uint64_t g_synthetic_sequence_id = 0;
+uint64_t g_synthetic_completed_sequence_id = 0;
+uint64_t g_synthetic_applied_poll_count = 0;
 uint16_t g_synthetic_auto_tap_buttons = 0;
 bool g_synthetic_auto_tap_enabled = false;
+std::atomic<SyntheticInputMarkerCallback> g_synthetic_marker_callback{nullptr};
 
 void QueueSyntheticInputSequenceLocked(const SyntheticInputStep* steps, size_t step_count) {
+  ++g_synthetic_sequence_id;
   g_synthetic_input_step_count = std::min(step_count, kMaxSyntheticInputSteps);
   g_synthetic_input_step_index = 0;
   for (size_t i = 0; i < g_synthetic_input_step_count; ++i) {
@@ -83,6 +93,42 @@ void EnsureSyntheticAutoTapLocked() {
   QueueSyntheticInputSequenceLocked(auto_tap, std::size(auto_tap));
 }
 
+void ApplySyntheticStep(X_INPUT_STATE* input_state, const SyntheticInputStep& step,
+                        bool replace_physical_input) {
+  if (replace_physical_input) {
+    std::memset(&input_state->gamepad, 0, sizeof(input_state->gamepad));
+  }
+
+  input_state->gamepad.buttons =
+      static_cast<uint16_t>(static_cast<uint16_t>(input_state->gamepad.buttons) |
+                            step.buttons);
+  input_state->gamepad.left_trigger =
+      std::max(input_state->gamepad.left_trigger, step.left_trigger);
+  input_state->gamepad.right_trigger =
+      std::max(input_state->gamepad.right_trigger, step.right_trigger);
+
+  auto merge_axis = [replace_physical_input](int16_t physical,
+                                              int16_t synthetic) -> int16_t {
+    if (replace_physical_input) {
+      return synthetic;
+    }
+    return std::abs(static_cast<int>(physical)) >=
+                   std::abs(static_cast<int>(synthetic))
+               ? physical
+               : synthetic;
+  };
+  input_state->gamepad.thumb_lx =
+      merge_axis(input_state->gamepad.thumb_lx, step.thumb_lx);
+  input_state->gamepad.thumb_ly =
+      merge_axis(input_state->gamepad.thumb_ly, step.thumb_ly);
+  input_state->gamepad.thumb_rx =
+      merge_axis(input_state->gamepad.thumb_rx, step.thumb_rx);
+  input_state->gamepad.thumb_ry =
+      merge_axis(input_state->gamepad.thumb_ry, step.thumb_ry);
+  input_state->packet_number =
+      static_cast<uint32_t>(static_cast<uint32_t>(input_state->packet_number) + 1);
+}
+
 void ApplySyntheticInput(X_INPUT_STATE* input_state) {
   if (!input_state) {
     return;
@@ -90,36 +136,42 @@ void ApplySyntheticInput(X_INPUT_STATE* input_state) {
 
   std::lock_guard lock(g_synthetic_input_mutex);
   EnsureSyntheticAutoTapLocked();
-  if (!g_synthetic_input_active.load(std::memory_order_relaxed) ||
-      g_synthetic_input_step_index >= g_synthetic_input_step_count) {
-    g_synthetic_input_active.store(false, std::memory_order_relaxed);
+  if (g_synthetic_input_active.load(std::memory_order_relaxed) &&
+      g_synthetic_input_step_index < g_synthetic_input_step_count) {
+    const auto& step = g_synthetic_input_steps[g_synthetic_input_step_index];
+    if (step.marker != 0 &&
+        g_synthetic_input_step_remaining == step.poll_count) {
+      if (const auto callback =
+              g_synthetic_marker_callback.load(std::memory_order_acquire)) {
+        callback(step.marker);
+      }
+    }
+    ApplySyntheticStep(input_state, step, g_synthetic_replace_physical_input);
+    ++g_synthetic_applied_poll_count;
+
+    if (g_synthetic_input_step_remaining > 0) {
+      --g_synthetic_input_step_remaining;
+    }
+
+    while (g_synthetic_input_step_remaining == 0) {
+      ++g_synthetic_input_step_index;
+      if (g_synthetic_input_step_index >= g_synthetic_input_step_count) {
+        g_synthetic_input_active.store(false, std::memory_order_relaxed);
+        g_synthetic_completed_sequence_id = g_synthetic_sequence_id;
+        break;
+      }
+      g_synthetic_input_step_remaining =
+          g_synthetic_input_steps[g_synthetic_input_step_index].poll_count;
+    }
     return;
   }
 
-  const auto& step = g_synthetic_input_steps[g_synthetic_input_step_index];
-  if (step.buttons != 0 || step.left_trigger != 0 || step.right_trigger != 0) {
-    input_state->gamepad.buttons =
-        static_cast<uint16_t>(static_cast<uint16_t>(input_state->gamepad.buttons) | step.buttons);
-    input_state->gamepad.left_trigger =
-        std::max(input_state->gamepad.left_trigger, step.left_trigger);
-    input_state->gamepad.right_trigger =
-        std::max(input_state->gamepad.right_trigger, step.right_trigger);
-    input_state->packet_number =
-        static_cast<uint32_t>(static_cast<uint32_t>(input_state->packet_number) + 1);
-  }
-
-  if (g_synthetic_input_step_remaining > 0) {
-    --g_synthetic_input_step_remaining;
-  }
-
-  while (g_synthetic_input_step_remaining == 0) {
-    ++g_synthetic_input_step_index;
-    if (g_synthetic_input_step_index >= g_synthetic_input_step_count) {
-      g_synthetic_input_active.store(false, std::memory_order_relaxed);
-      return;
-    }
-    g_synthetic_input_step_remaining =
-        g_synthetic_input_steps[g_synthetic_input_step_index].poll_count;
+  if (g_synthetic_hold_active) {
+    g_synthetic_input_active.store(false, std::memory_order_relaxed);
+    ApplySyntheticStep(input_state, g_synthetic_held_state,
+                       g_synthetic_replace_physical_input);
+    ++g_synthetic_applied_poll_count;
+    return;
   }
 }
 
@@ -147,7 +199,43 @@ void QueueSyntheticInputSequence(const SyntheticInputStep* steps, size_t step_co
   }
 
   std::lock_guard lock(g_synthetic_input_mutex);
+  g_synthetic_hold_active = false;
   QueueSyntheticInputSequenceLocked(steps, step_count);
+}
+
+void SetSyntheticInputMode(bool replace_physical_input) {
+  std::lock_guard lock(g_synthetic_input_mutex);
+  g_synthetic_replace_physical_input = replace_physical_input;
+}
+
+void SetSyntheticInputState(const SyntheticInputStep& state) {
+  std::lock_guard lock(g_synthetic_input_mutex);
+  g_synthetic_held_state = state;
+  g_synthetic_hold_active = true;
+  g_synthetic_input_step_count = 0;
+  g_synthetic_input_step_index = 0;
+  g_synthetic_input_step_remaining = 0;
+  g_synthetic_input_active.store(false, std::memory_order_relaxed);
+}
+
+SyntheticInputTelemetry GetSyntheticInputTelemetry() {
+  std::lock_guard lock(g_synthetic_input_mutex);
+  SyntheticInputTelemetry telemetry{};
+  telemetry.queue_active =
+      g_synthetic_input_active.load(std::memory_order_relaxed);
+  telemetry.hold_active = g_synthetic_hold_active;
+  telemetry.replace_physical_input = g_synthetic_replace_physical_input;
+  telemetry.step_count = g_synthetic_input_step_count;
+  telemetry.step_index = g_synthetic_input_step_index;
+  telemetry.step_polls_remaining = g_synthetic_input_step_remaining;
+  telemetry.sequence_id = g_synthetic_sequence_id;
+  telemetry.completed_sequence_id = g_synthetic_completed_sequence_id;
+  telemetry.applied_poll_count = g_synthetic_applied_poll_count;
+  return telemetry;
+}
+
+void SetSyntheticInputMarkerCallback(SyntheticInputMarkerCallback callback) {
+  g_synthetic_marker_callback.store(callback, std::memory_order_release);
 }
 
 void SetSyntheticAutoTap(uint16_t buttons, bool enabled) {
@@ -161,6 +249,8 @@ void ClearSyntheticInput() {
   g_synthetic_input_step_count = 0;
   g_synthetic_input_step_index = 0;
   g_synthetic_input_step_remaining = 0;
+  g_synthetic_held_state = {};
+  g_synthetic_hold_active = false;
   g_synthetic_auto_tap_buttons = 0;
   g_synthetic_auto_tap_enabled = false;
   g_synthetic_input_active.store(false, std::memory_order_relaxed);

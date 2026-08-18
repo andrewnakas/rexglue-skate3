@@ -19,6 +19,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/logging.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
@@ -51,6 +52,8 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+  REXLOG_INFO("Content mount: root={} package={} device={}", root_name_,
+              package_path_.string(), device_path_);
 }
 
 ContentPackage::~ContentPackage() {
@@ -188,6 +191,14 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     }
   }
 
+  if (content_type == XContentType::kMarketplaceContent) {
+    REXLOG_INFO("Marketplace enumeration: root={} xuid={:016X} title={:08X} count={}",
+                package_root.string(), xuid, title_id, result.size());
+    for (const auto& content : result) {
+      REXLOG_INFO("Marketplace enumeration entry: {}", content.file_name());
+    }
+  }
+
   return result;
 }
 
@@ -195,8 +206,12 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
   auto package_path = ResolvePackagePath(xuid, data);
   if (!std::filesystem::exists(package_path)) {
+    REXLOG_WARN("Content resolve failed: root={} package={} path={}", root_name,
+                data.file_name(), package_path.string());
     return nullptr;
   }
+  REXLOG_INFO("Content resolve: root={} package={} path={}", root_name,
+              data.file_name(), package_path.string());
   auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
   return package;
 }
@@ -305,6 +320,9 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
 X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t xuid,
                                      const XCONTENT_AGGREGATE_DATA& data,
                                      uint32_t& content_license) {
+  REXLOG_INFO("Content open request: root={} package={} type={:08X} title={:08X}",
+              root_name, data.file_name(), static_cast<uint32_t>(data.content_type.get()),
+              static_cast<uint32_t>(data.title_id));
   {
     auto global_lock = global_critical_region_.Acquire();
     if (open_packages_.count(string::string_key_case(root_name))) {

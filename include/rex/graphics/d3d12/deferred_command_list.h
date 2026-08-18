@@ -29,6 +29,11 @@ class D3D12CommandProcessor;
 
 class DeferredCommandList {
  public:
+  using ExtensionCallback = void (*)(
+      ID3D12GraphicsCommandList* command_list,
+      ID3D12GraphicsCommandList1* command_list_1,
+      const void* payload, size_t payload_size);
+
   DeferredCommandList(D3D12CommandProcessor& command_processor,
                       size_t initial_size_bytes = 1_MiB);
 
@@ -468,6 +473,21 @@ class DeferredCommandList {
     std::memcpy(args_ptr + sizeof(DebugMarkerHeader), label_name, label_len + 1);
   }
 
+  // Ordered D3D12-only escape hatch for app-owned advanced passes. The
+  // payload is copied into the deferred stream, so frame-local input is safe.
+  void D3DExecuteExtension(ExtensionCallback callback,
+                           const void* payload, size_t payload_size) {
+    auto* bytes = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kD3DExecuteExtension,
+                     sizeof(ExtensionHeader) + payload_size));
+    auto& args = *reinterpret_cast<ExtensionHeader*>(bytes);
+    args.callback = callback;
+    args.payload_size = payload_size;
+    if (payload_size != 0) {
+      std::memcpy(bytes + sizeof(ExtensionHeader), payload, payload_size);
+    }
+  }
+
  public:
   enum class Command {
     kD3DClearDepthStencilView,
@@ -512,6 +532,7 @@ class DeferredCommandList {
     kBeginDebugMarker,
     kEndDebugMarker,
     kInsertDebugMarker,
+    kD3DExecuteExtension,
   };
 
  private:
@@ -655,6 +676,11 @@ class DeferredCommandList {
   struct DebugMarkerHeader {
     uint32_t label_length;
     // Followed by null-terminated label string.
+  };
+
+  struct ExtensionHeader {
+    ExtensionCallback callback;
+    size_t payload_size;
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);

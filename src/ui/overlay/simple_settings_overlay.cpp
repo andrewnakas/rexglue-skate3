@@ -148,11 +148,13 @@ struct CategoryInfo {
   const char* name;
   const char* desc;
 };
-constexpr std::array<CategoryInfo, 5> kCategories = {{
+constexpr std::array<CategoryInfo, 7> kCategories = {{
     {"Video", "Display, resolution, framerate and renderer quality settings."},
     {"Controls", "Controller, mouse and keyboard input settings."},
     {"Audio", "Sound output settings."},
     {"Profile", "Local player profile and sign-in."},
+    {"Maps", "Install, select and load project-owned skate maps."},
+    {"World", "Live sky, time-of-day and world-lighting controls."},
     {"System", "Game language, pending changes and closing the settings."},
 }};
 
@@ -972,6 +974,12 @@ struct SimpleSettingsDialog::NavIntents {
 SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem::path config_path,
                                            LoadProfilesCallback load_profiles,
                                            SaveProfileCallback save_profile,
+                                           LoadMapsCallback load_maps,
+                                           ActivateMapCallback activate_map,
+                                           OpenMapsFolderCallback open_maps_folder,
+                                           LoadWorldLightingCallback load_world_lighting,
+                                           UpdateWorldLightingCallback update_world_lighting,
+                                           ResetWorldLightingCallback reset_world_lighting,
                                            CloseSettingsCallback close_settings,
                                            CloseGameCallback close_game,
                                            RestartGameCallback restart_game,
@@ -980,11 +988,19 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
       config_path_(std::move(config_path)),
       load_profiles_(std::move(load_profiles)),
       save_profile_(std::move(save_profile)),
+      load_maps_(std::move(load_maps)),
+      activate_map_(std::move(activate_map)),
+      open_maps_folder_(std::move(open_maps_folder)),
+      load_world_lighting_(std::move(load_world_lighting)),
+      update_world_lighting_(std::move(update_world_lighting)),
+      reset_world_lighting_(std::move(reset_world_lighting)),
       close_settings_(std::move(close_settings)),
       close_game_(std::move(close_game)),
       restart_game_(std::move(restart_game)),
       poll_gamepad_(std::move(poll_gamepad)) {
   ReloadProfiles();
+  ReloadMaps();
+  ReloadWorldLighting();
   LoadSettingsFromCvars();
   SetDrawActive(false);
 }
@@ -995,6 +1011,8 @@ void SimpleSettingsDialog::Show() {
   visible_ = true;
   SetDrawActive(true);
   ReloadProfiles();
+  ReloadMaps();
+  ReloadWorldLighting();
   LoadSettingsFromCvars();
   zone_ = FocusZone::kRail;
   rail_sel_ = category_;
@@ -1128,6 +1146,39 @@ void SimpleSettingsDialog::ReloadProfiles() {
   CopyToBuffer(gamertag_buf_, sizeof(gamertag_buf_),
                profiles_.profiles[profiles_.selected_index].gamertag);
   profile_signed_in_ = profiles_.profiles[profiles_.selected_index].signed_in;
+}
+
+void SimpleSettingsDialog::ReloadMaps() {
+  std::filesystem::path selected_path;
+  if (!maps_.maps.empty()) {
+    const int selected = std::clamp(
+        maps_.selected_index, 0, static_cast<int>(maps_.maps.size()) - 1);
+    selected_path = maps_.maps[selected].package_path;
+  }
+  maps_ = load_maps_ ? load_maps_() : SimpleMapState{};
+  if (!selected_path.empty()) {
+    const auto found = std::find_if(
+        maps_.maps.begin(), maps_.maps.end(),
+        [&selected_path](const SimpleMapInfo& map) {
+          return map.package_path == selected_path;
+        });
+    if (found != maps_.maps.end()) {
+      maps_.selected_index =
+          static_cast<int>(std::distance(maps_.maps.begin(), found));
+    }
+  }
+  if (maps_.maps.empty()) {
+    maps_.selected_index = 0;
+  } else {
+    maps_.selected_index = std::clamp(
+        maps_.selected_index, 0, static_cast<int>(maps_.maps.size()) - 1);
+  }
+}
+
+void SimpleSettingsDialog::ReloadWorldLighting() {
+  world_lighting_ = load_world_lighting_
+                        ? load_world_lighting_()
+                        : SimpleWorldLightingState{};
 }
 
 void SimpleSettingsDialog::SaveVideo() {
@@ -2013,7 +2064,336 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       }
       break;
     }
-    case 4: {  // System
+    case 4: {  // Maps
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Map";
+        row.desc =
+            "Choose an SKATE package from the dedicated Maps folder. The "
+            "currently running map is marked as active.";
+        if (maps_.maps.empty()) {
+          row.options.push_back("No maps installed");
+          row.enabled = false;
+        } else {
+          for (const SimpleMapInfo& map : maps_.maps) {
+            row.options.push_back(
+                map.name + (map.active ? "  [Active]" : ""));
+          }
+          row.index = &maps_.selected_index;
+          row.on_enum_change = [this](int) { map_status_.clear(); };
+        }
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Load Selected Map";
+        row.desc =
+            "Load the selected map. The game session restarts automatically "
+            "so every renderer, collision, grind and physics resource is "
+            "rebuilt cleanly for the new world.";
+        row.enabled = !maps_.maps.empty();
+        if (!map_status_.empty()) {
+          row.desc_extra = map_status_;
+        } else if (!maps_.active_name.empty()) {
+          row.desc_extra = "Currently active: " + maps_.active_name;
+        }
+        row.action = [this] {
+          if (maps_.maps.empty()) {
+            return;
+          }
+          maps_.selected_index = std::clamp(
+              maps_.selected_index, 0,
+              static_cast<int>(maps_.maps.size()) - 1);
+          const SimpleMapInfo& selected = maps_.maps[maps_.selected_index];
+          if (selected.active) {
+            map_status_ = selected.name + " is already active.";
+            return;
+          }
+          map_status_ = "Loading " + selected.name + "...";
+          if (activate_map_) {
+            activate_map_(selected.package_path);
+          }
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Refresh Map List";
+        row.desc =
+            "Scan the Maps folder again after adding or removing SKATE files.";
+        row.action = [this] {
+          ReloadMaps();
+          map_status_ = maps_.maps.empty()
+                            ? "No .skate packages were found."
+                            : "Map list refreshed.";
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Open Maps Folder";
+        row.desc =
+            "Open the dedicated folder where custom .skate packages are "
+            "installed.";
+        if (!maps_.maps_folder.empty()) {
+          row.desc_extra = maps_.maps_folder.string();
+        }
+        row.action = [this] {
+          if (open_maps_folder_) {
+            open_maps_folder_();
+          }
+        };
+        rows.push_back(std::move(row));
+      }
+      break;
+    }
+    case 5: {  // World
+      const bool enabled = world_lighting_.available;
+      auto update = [this](SimpleWorldLightingField field, float value) {
+        if (update_world_lighting_) {
+          update_world_lighting_(field, value);
+        }
+      };
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Day / Night Cycle";
+        row.desc =
+            "Run or pause the active map's celestial clock. Pausing holds "
+            "the exact current sun, moon, sky and shadow state.";
+        row.options = {"Running", "Paused"};
+        row.flag = &world_lighting_.paused;
+        row.enabled = enabled;
+        row.on_enum_change = [update](int value) {
+          update(SimpleWorldLightingField::kPaused, float(value));
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kSlider;
+        row.label = "Time of Day";
+        row.desc =
+            "Scrub the world clock directly. Lighting, shadows, reflections "
+            "and the skater all use this same time.";
+        row.value = &world_lighting_.time_of_day_hours;
+        if (world_lighting_.ping_pong) {
+          row.min = std::min(world_lighting_.start_hour,
+                             world_lighting_.end_hour);
+          row.max = std::max(world_lighting_.start_hour,
+                             world_lighting_.end_hour);
+          if (row.max - row.min < 0.25f) {
+            row.min = 0.0f;
+            row.max = 24.0f;
+          }
+        } else {
+          row.min = 0.0f;
+          row.max = 24.0f;
+        }
+        row.step = 0.25f;
+        row.fmt = "%.2f h";
+        row.enabled = enabled;
+        row.on_value_change = [this, update] {
+          update(SimpleWorldLightingField::kTimeOfDay,
+                 world_lighting_.time_of_day_hours);
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kSlider;
+        row.label = "Cycle Duration";
+        row.desc =
+            "Real seconds for one full cycle, or one out-and-back trip. "
+            "Zero makes the map authored as a fixed time.";
+        row.value = &world_lighting_.cycle_duration_seconds;
+        row.min = 0.0f;
+        row.max = 1800.0f;
+        row.step = 5.0f;
+        row.fmt = "%.0f s";
+        row.enabled = enabled;
+        row.on_value_change = [this, update] {
+          update(SimpleWorldLightingField::kCycleDuration,
+                 world_lighting_.cycle_duration_seconds);
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Time Path";
+        row.desc =
+            "Full Day loops through 24 hours. Between Hours travels from "
+            "Start Hour to End Hour and smoothly returns.";
+        row.options = {"Full Day", "Between Hours"};
+        row.flag = &world_lighting_.ping_pong;
+        row.enabled = enabled;
+        row.on_enum_change = [update](int value) {
+          update(SimpleWorldLightingField::kPingPong, float(value));
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kSlider;
+        row.label = "Start Hour";
+        row.desc = "Starting hour and first endpoint for Between Hours.";
+        row.value = &world_lighting_.start_hour;
+        row.min = 0.0f;
+        row.max = 23.75f;
+        row.step = 0.25f;
+        row.fmt = "%.2f h";
+        row.enabled = enabled;
+        row.on_value_change = [this, update] {
+          update(SimpleWorldLightingField::kStartHour,
+                 world_lighting_.start_hour);
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kSlider;
+        row.label = "End Hour";
+        row.desc = "Second endpoint used by Between Hours.";
+        row.value = &world_lighting_.end_hour;
+        row.min = 0.0f;
+        row.max = 23.75f;
+        row.step = 0.25f;
+        row.fmt = "%.2f h";
+        row.enabled = enabled;
+        row.on_value_change = [this, update] {
+          update(SimpleWorldLightingField::kEndHour,
+                 world_lighting_.end_hour);
+        };
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kSlider;
+        row.label = "Sun Orbit Direction";
+        row.desc =
+            "Rotate the sun and moon path around the map to change the "
+            "direction of world shadows.";
+        row.value = &world_lighting_.orbit_azimuth_degrees;
+        row.min = -180.0f;
+        row.max = 180.0f;
+        row.step = 5.0f;
+        row.fmt = "%.0f deg";
+        row.enabled = enabled;
+        row.on_value_change = [this, update] {
+          update(SimpleWorldLightingField::kOrbitAzimuthDegrees,
+                 world_lighting_.orbit_azimuth_degrees);
+        };
+        rows.push_back(std::move(row));
+      }
+      header("Sky");
+      auto add_color_slider =
+          [&rows, enabled, update](
+              const char* label, const char* desc, float* value,
+              SimpleWorldLightingField field) {
+            RowSpec row;
+            row.kind = RowSpec::kSlider;
+            row.label = label;
+            row.desc = desc;
+            row.value = value;
+            row.min = 0.0f;
+            row.max = 2.0f;
+            row.step = 0.01f;
+            row.fmt = "%.2f";
+            row.enabled = enabled;
+            row.on_value_change = [value, field, update] {
+              update(field, *value);
+            };
+            rows.push_back(std::move(row));
+          };
+      add_color_slider(
+          "Sky Colour - Red",
+          "Red component applied to the complete authored sky palette.",
+          &world_lighting_.sky_red, SimpleWorldLightingField::kSkyRed);
+      add_color_slider(
+          "Sky Colour - Green",
+          "Green component applied to the complete authored sky palette.",
+          &world_lighting_.sky_green, SimpleWorldLightingField::kSkyGreen);
+      add_color_slider(
+          "Sky Colour - Blue",
+          "Blue component applied to the complete authored sky palette.",
+          &world_lighting_.sky_blue, SimpleWorldLightingField::kSkyBlue);
+      header("World Light");
+      auto add_light_slider =
+          [&rows, enabled, update](
+              const char* label, const char* desc, float* value,
+              float maximum, SimpleWorldLightingField field) {
+            RowSpec row;
+            row.kind = RowSpec::kSlider;
+            row.label = label;
+            row.desc = desc;
+            row.value = value;
+            row.min = 0.0f;
+            row.max = maximum;
+            row.step = 0.01f;
+            row.fmt = "%.2f";
+            row.enabled = enabled;
+            row.on_value_change = [value, field, update] {
+              update(field, *value);
+            };
+            rows.push_back(std::move(row));
+          };
+      add_color_slider(
+          "Sunlight Colour - Red",
+          "Red component of the directional light cast across the world.",
+          &world_lighting_.sunlight_red,
+          SimpleWorldLightingField::kSunlightRed);
+      add_color_slider(
+          "Sunlight Colour - Green",
+          "Green component of the directional light cast across the world.",
+          &world_lighting_.sunlight_green,
+          SimpleWorldLightingField::kSunlightGreen);
+      add_color_slider(
+          "Sunlight Colour - Blue",
+          "Blue component of the directional light cast across the world.",
+          &world_lighting_.sunlight_blue,
+          SimpleWorldLightingField::kSunlightBlue);
+      add_light_slider(
+          "Sun Strength", "Direct sunlight and sun-shadow strength.",
+          &world_lighting_.sun_intensity, 4.0f,
+          SimpleWorldLightingField::kSunIntensity);
+      add_light_slider(
+          "Moon Strength", "Direct moonlight strength at night.",
+          &world_lighting_.moon_intensity, 2.0f,
+          SimpleWorldLightingField::kMoonIntensity);
+      add_light_slider(
+          "Day Ambient",
+          "Shadow fill and default world light during daytime.",
+          &world_lighting_.day_ambient, 1.0f,
+          SimpleWorldLightingField::kDayAmbient);
+      add_light_slider(
+          "Night Ambient",
+          "Shadow fill and default world light during nighttime.",
+          &world_lighting_.night_ambient, 1.0f,
+          SimpleWorldLightingField::kNightAmbient);
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Restore Map Defaults";
+        row.desc =
+            "Discard every live adjustment and restore the lighting values "
+            "authored inside the active .skate map.";
+        row.enabled = enabled;
+        row.action = [this] {
+          if (reset_world_lighting_) {
+            reset_world_lighting_();
+          }
+          ReloadWorldLighting();
+        };
+        rows.push_back(std::move(row));
+      }
+      break;
+    }
+    case 6: {  // System
       if (HasCvar("user_language")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;

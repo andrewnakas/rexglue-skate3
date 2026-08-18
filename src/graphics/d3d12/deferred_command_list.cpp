@@ -363,6 +363,16 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
             reinterpret_cast<const uint8_t*>(stream) + sizeof(DebugMarkerHeader));
         command_list->SetMarker(1, label_name, static_cast<UINT>(args.label_length + 1));
       } break;
+      case Command::kD3DExecuteExtension: {
+        auto& args = *reinterpret_cast<const ExtensionHeader*>(stream);
+        if (args.callback != nullptr) {
+          args.callback(
+              command_list, command_list_1,
+              reinterpret_cast<const uint8_t*>(stream) +
+                  sizeof(ExtensionHeader),
+              args.payload_size);
+        }
+      } break;
       default:
         assert_unhandled_case(header.command);
         break;

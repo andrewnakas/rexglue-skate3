@@ -35,6 +35,11 @@ using namespace rex::system::xam;
 uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
                         uint32_t buffer_size, uint32_t* items_returned, uint32_t overlapped_ptr) {
   assert_true(flags == 0);
+  REXKRNL_WARN(
+      "XamEnumerate: handle=0x{:08X} buffer=0x{:08X} bytes={} sync={} "
+      "overlapped=0x{:08X}",
+      handle, buffer_ptr.guest_address(), buffer_size, items_returned != nullptr,
+      overlapped_ptr);
 
   auto e = REX_KERNEL_OBJECTS()->LookupObject<XEnumerator>(handle);
   if (!e) {
