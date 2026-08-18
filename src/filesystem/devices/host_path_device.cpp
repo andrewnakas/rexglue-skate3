@@ -52,11 +52,17 @@ void HostPathDevice::Dump(string::StringBuffer* string_buffer) {
 }
 
 Entry* HostPathDevice::ResolvePath(const std::string_view path) {
+  const bool audit_custom_dlc =
+      host_path_.string().find("DLCCODEX") != std::string::npos;
   // The filesystem will have stripped our prefix off already, so the path will
   // be in the form:
   // some\PATH.foo
   auto* resolved = root_entry_->ResolvePath(path);
   if (resolved) {
+    if (audit_custom_dlc) {
+      REXLOG_INFO("Custom DLC path resolved: package={} guest={}",
+                  host_path_.string(), path);
+    }
     return resolved;
   }
 
@@ -75,6 +81,10 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
         return rex::string::utf8_equal_case(rex::path_to_utf8(info.name), part);
       });
       if (match == child_infos.end()) {
+        if (audit_custom_dlc) {
+          REXLOG_WARN("Custom DLC path missing: package={} guest={}",
+                      host_path_.string(), path);
+        }
         return nullptr;
       }
 
@@ -90,6 +100,10 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
     current_entry = static_cast<HostPathEntry*>(child);
   }
 
+  if (audit_custom_dlc) {
+    REXLOG_INFO("Custom DLC path lazily resolved: package={} guest={}",
+                host_path_.string(), path);
+  }
   return current_entry;
 }
 

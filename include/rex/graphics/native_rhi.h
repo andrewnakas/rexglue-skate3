@@ -117,6 +117,9 @@ enum TextureUsage : uint32_t {
   kTextureUsageRenderTarget = 1u << 0,
   kTextureUsageDepthStencil = 1u << 1,
   kTextureUsageCopySource = 1u << 2,  // readback source
+  // D3D12 advanced-pass output (DXR / inline ray queries). Other backends
+  // may reject creation when storage-image support is not implemented.
+  kTextureUsageUnorderedAccess = 1u << 3,
 };
 
 enum class ViewDimension : uint32_t {

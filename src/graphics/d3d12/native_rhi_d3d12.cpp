@@ -575,6 +575,9 @@ class NrDeviceD3D12 : public nrhi::Device {
       clear.DepthStencil.Depth = desc.clear_depth;
       clear_ptr = &clear;
     }
+    if (desc.usage & nrhi::kTextureUsageUnorderedAccess) {
+      rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    }
     ID3D12Resource* resource = nullptr;
     if (FAILED(device_->CreateCommittedResource(
             &ui::d3d12::util::kHeapPropertiesDefault,
@@ -1488,6 +1491,52 @@ nrhi::Cmd* NativeRhiBeginFrame(nrhi::Device* device, ID3D12Resource* guest_outpu
   return static_cast<NrDeviceD3D12*>(device)->BeginFrame(
       guest_output_resource, guest_output_format, guest_output_internal_state, width, height,
       guest_output_out);
+}
+
+ID3D12Device* NativeRhiD3D12GetDevice(nrhi::Device* device) {
+  if (device == nullptr || device->backend() != nrhi::Backend::kD3D12) {
+    return nullptr;
+  }
+  return static_cast<NrDeviceD3D12*>(device)->cp()
+      ->GetD3D12Provider().GetDevice();
+}
+
+ID3D12Resource* NativeRhiD3D12GetTextureResource(
+    nrhi::Texture* texture) {
+  return texture != nullptr
+             ? static_cast<NrTextureD3D12*>(texture)->resource
+             : nullptr;
+}
+
+bool NativeRhiD3D12CopyTextureViewDescriptor(
+    nrhi::Device* device, nrhi::TextureView* view,
+    D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+  if (device == nullptr || view == nullptr ||
+      device->backend() != nrhi::Backend::kD3D12) {
+    return false;
+  }
+  auto* typed_device = static_cast<NrDeviceD3D12*>(device);
+  auto* typed_view = static_cast<NrTextureViewD3D12*>(view);
+  if (typed_view->staging_slot == ~0u) {
+    return false;
+  }
+  typed_device->cp()->GetD3D12Provider().GetDevice()
+      ->CopyDescriptorsSimple(
+          1, destination,
+          typed_device->StagingHandle(typed_view->staging_slot),
+          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  return true;
+}
+
+void NativeRhiD3D12RecordExtension(
+    nrhi::Cmd* cmd, NativeRhiD3D12ExtensionCallback callback,
+    const void* payload, size_t payload_size) {
+  if (cmd == nullptr || callback == nullptr) {
+    return;
+  }
+  static_cast<NrCmdD3D12*>(cmd)->device->cp()
+      ->GetDeferredCommandList()
+      .D3DExecuteExtension(callback, payload, payload_size);
 }
 
 }  // namespace rex::graphics::d3d12

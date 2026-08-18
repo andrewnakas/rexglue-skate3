@@ -30,6 +30,60 @@ struct SimpleProfileState {
   int selected_index = 0;
 };
 
+struct SimpleMapInfo {
+  std::string name;
+  std::filesystem::path package_path;
+  bool active = false;
+};
+
+struct SimpleMapState {
+  std::vector<SimpleMapInfo> maps;
+  int selected_index = 0;
+  std::filesystem::path maps_folder;
+  std::string active_name;
+};
+
+enum class SimpleWorldLightingField {
+  kPaused,
+  kTimeOfDay,
+  kCycleDuration,
+  kPingPong,
+  kStartHour,
+  kEndHour,
+  kOrbitAzimuthDegrees,
+  kSkyRed,
+  kSkyGreen,
+  kSkyBlue,
+  kSunlightRed,
+  kSunlightGreen,
+  kSunlightBlue,
+  kSunIntensity,
+  kMoonIntensity,
+  kDayAmbient,
+  kNightAmbient,
+};
+
+struct SimpleWorldLightingState {
+  bool available = false;
+  bool paused = false;
+  bool ping_pong = false;
+  float time_of_day_hours = 0.0f;
+  float cycle_duration_seconds = 0.0f;
+  float start_hour = 0.0f;
+  float end_hour = 0.0f;
+  float orbit_azimuth_degrees = 0.0f;
+  float sky_red = 1.0f;
+  float sky_green = 1.0f;
+  float sky_blue = 1.0f;
+  float sunlight_red = 1.0f;
+  float sunlight_green = 1.0f;
+  float sunlight_blue = 1.0f;
+  float sun_intensity = 0.0f;
+  float moon_intensity = 0.0f;
+  float day_ambient = 0.0f;
+  float night_ambient = 0.0f;
+};
+
 // Raw pad snapshot for overlay navigation (host-side, already merged across
 // pads). Poll callback runs on the UI thread every drawn frame.
 struct SimpleSettingsGamepad {
@@ -44,6 +98,15 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   using LoadProfilesCallback = std::function<SimpleProfileState()>;
   using SaveProfileCallback =
       std::function<void(int selected_index, std::string gamertag, bool signed_in)>;
+  using LoadMapsCallback = std::function<SimpleMapState()>;
+  using ActivateMapCallback =
+      std::function<void(const std::filesystem::path& package_path)>;
+  using OpenMapsFolderCallback = std::function<void()>;
+  using LoadWorldLightingCallback =
+      std::function<SimpleWorldLightingState()>;
+  using UpdateWorldLightingCallback =
+      std::function<void(SimpleWorldLightingField, float)>;
+  using ResetWorldLightingCallback = std::function<void()>;
   using CloseSettingsCallback = std::function<void()>;
   using CloseGameCallback = std::function<void()>;
   using RestartGameCallback = std::function<void()>;
@@ -51,6 +114,11 @@ class SimpleSettingsDialog final : public ImGuiDialog {
 
   SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem::path config_path,
                        LoadProfilesCallback load_profiles, SaveProfileCallback save_profile,
+                       LoadMapsCallback load_maps, ActivateMapCallback activate_map,
+                       OpenMapsFolderCallback open_maps_folder,
+                       LoadWorldLightingCallback load_world_lighting,
+                       UpdateWorldLightingCallback update_world_lighting,
+                       ResetWorldLightingCallback reset_world_lighting,
                        CloseSettingsCallback close_settings, CloseGameCallback close_game,
                        RestartGameCallback restart_game,
                        PollGamepadCallback poll_gamepad = nullptr);
@@ -77,6 +145,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void LoadSettingsFromCvars();
   bool HasSettingsChanges() const;
   void ReloadProfiles();
+  void ReloadMaps();
+  void ReloadWorldLighting();
   void SaveVideo();
   void SaveProfile();
   void ApplyAndRestart();
@@ -87,11 +157,20 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   std::filesystem::path config_path_;
   LoadProfilesCallback load_profiles_;
   SaveProfileCallback save_profile_;
+  LoadMapsCallback load_maps_;
+  ActivateMapCallback activate_map_;
+  OpenMapsFolderCallback open_maps_folder_;
+  LoadWorldLightingCallback load_world_lighting_;
+  UpdateWorldLightingCallback update_world_lighting_;
+  ResetWorldLightingCallback reset_world_lighting_;
   CloseSettingsCallback close_settings_;
   CloseGameCallback close_game_;
   RestartGameCallback restart_game_;
   PollGamepadCallback poll_gamepad_;
   SimpleProfileState profiles_;
+  SimpleMapState maps_;
+  SimpleWorldLightingState world_lighting_;
+  std::string map_status_;
   bool visible_ = false;
 
   // Staged setting values (committed by SaveVideo / SaveProfile).

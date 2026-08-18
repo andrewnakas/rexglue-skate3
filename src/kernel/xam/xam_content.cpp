@@ -62,6 +62,10 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
                                      u32 content_flags, u32 items_per_enumerate,
                                      mapped_u32 buffer_size_ptr, mapped_u32 handle_out) {
   assert_not_null(handle_out);
+  REXKRNL_WARN(
+      "XamContentCreateEnumerator: user={} device=0x{:08X} type=0x{:08X} "
+      "flags=0x{:08X} max_items={}",
+      user_index, device_id, content_type, content_flags, items_per_enumerate);
 
   auto device_info = device_id == 0 ? nullptr : GetDummyDeviceInfo(device_id);
   if ((device_id && device_info == nullptr) || !handle_out) {
@@ -107,7 +111,8 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
     // TODO(gibbed): disc drive content
   }
 
-  REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
+  REXKRNL_WARN("XamContentCreateEnumerator: added {} items to enumerator handle=0x{:08X}",
+               e->item_count(), e->handle());
 
   *handle_out = e->handle();
   return X_ERROR_SUCCESS;
