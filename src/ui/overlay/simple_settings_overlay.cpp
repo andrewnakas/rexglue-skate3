@@ -980,6 +980,8 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
                                            LoadWorldLightingCallback load_world_lighting,
                                            UpdateWorldLightingCallback update_world_lighting,
                                            ResetWorldLightingCallback reset_world_lighting,
+                                           LoadUpdateStateCallback load_update_state,
+                                           StartUpdateCallback start_update,
                                            CloseSettingsCallback close_settings,
                                            CloseGameCallback close_game,
                                            RestartGameCallback restart_game,
@@ -994,6 +996,8 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
       load_world_lighting_(std::move(load_world_lighting)),
       update_world_lighting_(std::move(update_world_lighting)),
       reset_world_lighting_(std::move(reset_world_lighting)),
+      load_update_state_(std::move(load_update_state)),
+      start_update_(std::move(start_update)),
       close_settings_(std::move(close_settings)),
       close_game_(std::move(close_game)),
       restart_game_(std::move(restart_game)),
@@ -1001,6 +1005,7 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
   ReloadProfiles();
   ReloadMaps();
   ReloadWorldLighting();
+  ReloadUpdateState();
   LoadSettingsFromCvars();
   SetDrawActive(false);
 }
@@ -1013,6 +1018,7 @@ void SimpleSettingsDialog::Show() {
   ReloadProfiles();
   ReloadMaps();
   ReloadWorldLighting();
+  ReloadUpdateState();
   LoadSettingsFromCvars();
   zone_ = FocusZone::kRail;
   rail_sel_ = category_;
@@ -1179,6 +1185,12 @@ void SimpleSettingsDialog::ReloadWorldLighting() {
   world_lighting_ = load_world_lighting_
                         ? load_world_lighting_()
                         : SimpleWorldLightingState{};
+}
+
+void SimpleSettingsDialog::ReloadUpdateState() {
+  update_state_ = load_update_state_
+                      ? load_update_state_()
+                      : SimpleUpdateState{};
 }
 
 void SimpleSettingsDialog::SaveVideo() {
@@ -2078,7 +2090,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         } else {
           for (const SimpleMapInfo& map : maps_.maps) {
             row.options.push_back(
-                map.name + (map.active ? "  [Active]" : ""));
+                map.name + (map.active ? "  [Active]" : "") +
+                (!map.compatible ? "  [Update Required]" : ""));
           }
           row.index = &maps_.selected_index;
           row.on_enum_change = [this](int) { map_status_.clear(); };
@@ -2093,9 +2106,18 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
             "Load the selected map. The game session restarts automatically "
             "so every renderer, collision, grind and physics resource is "
             "rebuilt cleanly for the new world.";
-        row.enabled = !maps_.maps.empty();
+        const SimpleMapInfo* selected_map = nullptr;
+        if (!maps_.maps.empty()) {
+          maps_.selected_index = std::clamp(
+              maps_.selected_index, 0,
+              static_cast<int>(maps_.maps.size()) - 1);
+          selected_map = &maps_.maps[maps_.selected_index];
+        }
+        row.enabled = selected_map && selected_map->compatible;
         if (!map_status_.empty()) {
           row.desc_extra = map_status_;
+        } else if (selected_map && !selected_map->compatible) {
+          row.desc_extra = selected_map->compatibility_note;
         } else if (!maps_.active_name.empty()) {
           row.desc_extra = "Currently active: " + maps_.active_name;
         }
@@ -2394,6 +2416,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       break;
     }
     case 6: {  // System
+      ReloadUpdateState();
       if (HasCvar("user_language")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -2410,6 +2433,48 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
               std::clamp(int(CvarDefaultDouble("user_language", 1.0)), 1,
                          static_cast<int>(kLanguageLabels.size())) -
               1;
+        };
+        rows.push_back(std::move(row));
+      }
+      header("Custom Engine Layer");
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Update Custom Engine Layer";
+        row.desc =
+            "Check, download, verify, install, and restart into the newest "
+            "official release. Game data, saves, settings, and custom maps "
+            "are preserved.";
+        row.desc_extra = update_state_.status;
+        if (!update_state_.current_version.empty()) {
+          row.desc_extra +=
+              (row.desc_extra.empty() ? "" : "\n") +
+              std::string("Installed: ") + update_state_.current_version;
+        }
+        if (!update_state_.latest_version.empty() &&
+            update_state_.latest_version != update_state_.current_version) {
+          row.desc_extra +=
+              (row.desc_extra.empty() ? "" : "\n") +
+              std::string("Available: ") + update_state_.latest_version;
+        }
+        if (update_state_.phase == SimpleUpdatePhase::kDownloading &&
+            update_state_.progress > 0.0f) {
+          const int percent =
+              std::clamp(static_cast<int>(update_state_.progress * 100.0f),
+                         0, 100);
+          row.desc_extra +=
+              (row.desc_extra.empty() ? "" : "\n") +
+              std::string("Progress: ") + std::to_string(percent) + "%";
+        }
+        row.enabled =
+            update_state_.phase != SimpleUpdatePhase::kChecking &&
+            update_state_.phase != SimpleUpdatePhase::kDownloading &&
+            update_state_.phase != SimpleUpdatePhase::kInstalling &&
+            update_state_.phase != SimpleUpdatePhase::kUnsupported;
+        row.action = [this] {
+          if (start_update_) {
+            start_update_();
+          }
         };
         rows.push_back(std::move(row));
       }

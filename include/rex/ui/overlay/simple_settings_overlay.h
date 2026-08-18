@@ -34,6 +34,8 @@ struct SimpleMapInfo {
   std::string name;
   std::filesystem::path package_path;
   bool active = false;
+  bool compatible = true;
+  std::string compatibility_note;
 };
 
 struct SimpleMapState {
@@ -84,6 +86,24 @@ struct SimpleWorldLightingState {
   float night_ambient = 0.0f;
 };
 
+enum class SimpleUpdatePhase {
+  kIdle,
+  kChecking,
+  kDownloading,
+  kInstalling,
+  kUpToDate,
+  kFailed,
+  kUnsupported,
+};
+
+struct SimpleUpdateState {
+  SimpleUpdatePhase phase = SimpleUpdatePhase::kIdle;
+  std::string current_version;
+  std::string latest_version;
+  std::string status;
+  float progress = 0.0f;
+};
+
 // Raw pad snapshot for overlay navigation (host-side, already merged across
 // pads). Poll callback runs on the UI thread every drawn frame.
 struct SimpleSettingsGamepad {
@@ -107,6 +127,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   using UpdateWorldLightingCallback =
       std::function<void(SimpleWorldLightingField, float)>;
   using ResetWorldLightingCallback = std::function<void()>;
+  using LoadUpdateStateCallback = std::function<SimpleUpdateState()>;
+  using StartUpdateCallback = std::function<void()>;
   using CloseSettingsCallback = std::function<void()>;
   using CloseGameCallback = std::function<void()>;
   using RestartGameCallback = std::function<void()>;
@@ -119,6 +141,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
                        LoadWorldLightingCallback load_world_lighting,
                        UpdateWorldLightingCallback update_world_lighting,
                        ResetWorldLightingCallback reset_world_lighting,
+                       LoadUpdateStateCallback load_update_state,
+                       StartUpdateCallback start_update,
                        CloseSettingsCallback close_settings, CloseGameCallback close_game,
                        RestartGameCallback restart_game,
                        PollGamepadCallback poll_gamepad = nullptr);
@@ -147,6 +171,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void ReloadProfiles();
   void ReloadMaps();
   void ReloadWorldLighting();
+  void ReloadUpdateState();
   void SaveVideo();
   void SaveProfile();
   void ApplyAndRestart();
@@ -163,6 +188,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   LoadWorldLightingCallback load_world_lighting_;
   UpdateWorldLightingCallback update_world_lighting_;
   ResetWorldLightingCallback reset_world_lighting_;
+  LoadUpdateStateCallback load_update_state_;
+  StartUpdateCallback start_update_;
   CloseSettingsCallback close_settings_;
   CloseGameCallback close_game_;
   RestartGameCallback restart_game_;
@@ -170,6 +197,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   SimpleProfileState profiles_;
   SimpleMapState maps_;
   SimpleWorldLightingState world_lighting_;
+  SimpleUpdateState update_state_;
   std::string map_status_;
   bool visible_ = false;
 
