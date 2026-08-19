@@ -30,6 +30,56 @@ struct SimpleProfileState {
   int selected_index = 0;
 };
 
+enum class SimpleMultiplayerPhase {
+  kOffline,
+  kHosting,
+  kConnected,
+  kError,
+};
+
+enum class SimpleMultiplayerPrivacy {
+  kPublic,
+  kFriendsOnly,
+  kInviteOnly,
+};
+
+struct SimpleMultiplayerServerInfo {
+  std::string id;
+  std::string name;
+  std::string host_name;
+  std::string map_name;
+  int players = 1;
+  int max_players = 8;
+  int ping_ms = 0;
+  bool passworded = false;
+  bool compatible = true;
+  std::string compatibility_note;
+};
+
+struct SimpleMultiplayerState {
+  SimpleMultiplayerPhase phase = SimpleMultiplayerPhase::kOffline;
+  bool is_host = false;
+  bool steam_available = false;
+  std::string backend_name;
+  std::string steam_status;
+  std::string status;
+  std::string session_name;
+  std::string host_name;
+  std::string map_name;
+  int players = 0;
+  int max_players = 0;
+  int selected_server = 0;
+  std::vector<SimpleMultiplayerServerInfo> servers;
+};
+
+struct SimpleMultiplayerHostSettings {
+  std::string server_name;
+  std::string password;
+  int max_players = 8;
+  SimpleMultiplayerPrivacy privacy = SimpleMultiplayerPrivacy::kPublic;
+  bool allow_late_join = true;
+};
+
 struct SimpleMapInfo {
   std::string name;
   std::filesystem::path package_path;
@@ -118,6 +168,12 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   using LoadProfilesCallback = std::function<SimpleProfileState()>;
   using SaveProfileCallback =
       std::function<void(int selected_index, std::string gamertag, bool signed_in)>;
+  using LoadMultiplayerCallback = std::function<SimpleMultiplayerState(bool refresh)>;
+  using HostMultiplayerCallback =
+      std::function<void(const SimpleMultiplayerHostSettings&)>;
+  using JoinMultiplayerCallback =
+      std::function<void(const std::string& server_id, const std::string& password)>;
+  using LeaveMultiplayerCallback = std::function<void()>;
   using LoadMapsCallback = std::function<SimpleMapState()>;
   using ActivateMapCallback =
       std::function<void(const std::filesystem::path& package_path)>;
@@ -136,6 +192,10 @@ class SimpleSettingsDialog final : public ImGuiDialog {
 
   SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem::path config_path,
                        LoadProfilesCallback load_profiles, SaveProfileCallback save_profile,
+                       LoadMultiplayerCallback load_multiplayer,
+                       HostMultiplayerCallback host_multiplayer,
+                       JoinMultiplayerCallback join_multiplayer,
+                       LeaveMultiplayerCallback leave_multiplayer,
                        LoadMapsCallback load_maps, ActivateMapCallback activate_map,
                        OpenMapsFolderCallback open_maps_folder,
                        LoadWorldLightingCallback load_world_lighting,
@@ -169,6 +229,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void LoadSettingsFromCvars();
   bool HasSettingsChanges() const;
   void ReloadProfiles();
+  void ReloadMultiplayer(bool refresh);
   void ReloadMaps();
   void ReloadWorldLighting();
   void ReloadUpdateState();
@@ -182,6 +243,10 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   std::filesystem::path config_path_;
   LoadProfilesCallback load_profiles_;
   SaveProfileCallback save_profile_;
+  LoadMultiplayerCallback load_multiplayer_;
+  HostMultiplayerCallback host_multiplayer_;
+  JoinMultiplayerCallback join_multiplayer_;
+  LeaveMultiplayerCallback leave_multiplayer_;
   LoadMapsCallback load_maps_;
   ActivateMapCallback activate_map_;
   OpenMapsFolderCallback open_maps_folder_;
@@ -195,6 +260,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   RestartGameCallback restart_game_;
   PollGamepadCallback poll_gamepad_;
   SimpleProfileState profiles_;
+  SimpleMultiplayerState multiplayer_;
   SimpleMapState maps_;
   SimpleWorldLightingState world_lighting_;
   SimpleUpdateState update_state_;
@@ -222,6 +288,12 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool mnk_capture_mouse_ = false;
   bool profile_signed_in_ = true;
   char gamertag_buf_[32] = {};
+  char multiplayer_server_name_buf_[64] = "My Skate Session";
+  char multiplayer_host_password_buf_[64] = {};
+  char multiplayer_join_password_buf_[64] = {};
+  float multiplayer_max_players_ = 8.0f;
+  int multiplayer_privacy_index_ = 0;
+  bool multiplayer_late_join_ = true;
   // Live setting values (hot cvars, applied and saved on change).
   bool renderer_native_ = true;
   bool ssao_ = true;
