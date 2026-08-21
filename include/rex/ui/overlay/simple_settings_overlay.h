@@ -294,6 +294,14 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   float multiplayer_max_players_ = 8.0f;
   int multiplayer_privacy_index_ = 0;
   bool multiplayer_late_join_ = true;
+  int multiplayer_quality_index_ = 2;
+  float multiplayer_pose_rate_ = 60.0f;
+  float multiplayer_animation_rate_ = 20.0f;
+  float multiplayer_interpolation_ms_ = 50.0f;
+  float multiplayer_relevance_radius_ = 80.0f;
+  float multiplayer_attachment_radius_ = 35.0f;
+  float multiplayer_relevance_players_ = 12.0f;
+  float multiplayer_far_presence_rate_ = 2.0f;
   // Live setting values (hot cvars, applied and saved on change).
   bool renderer_native_ = true;
   bool ssao_ = true;

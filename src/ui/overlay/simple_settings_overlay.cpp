@@ -54,7 +54,7 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 32> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -78,7 +78,15 @@ constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
     "input_backend",
     "audio_mute",
     "audio_device_sample_frames",
-    "user_language"};
+    "user_language",
+    "skate3_multiplayer_quality_preset",
+    "skate3_multiplayer_local_send_rate",
+    "skate3_multiplayer_local_animation_rate",
+    "skate3_multiplayer_local_interpolation_ms",
+    "skate3_multiplayer_relevance_radius",
+    "skate3_multiplayer_attachment_radius",
+    "skate3_multiplayer_relevance_players",
+    "skate3_multiplayer_far_presence_rate"};
 
 // MSAA sample counts for the native scene renderer.
 constexpr std::array<const char*, 4> kMsaaLabels = {"Off", "2x", "4x", "8x"};
@@ -1093,6 +1101,62 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   chord_custom_.clear();
   chord_index_ = HasCvar("menu_chord") ? MenuChordIndexFromCvar(&chord_custom_) : 0;
   input_backend_index_ = HasInputBackendChoice() ? InputBackendIndexFromCvar() : 0;
+  multiplayer_quality_index_ =
+      HasCvar("skate3_multiplayer_quality_preset")
+          ? std::clamp(
+                rex::cvar::Query<int32_t>(
+                    "skate3_multiplayer_quality_preset"),
+                0, 4)
+          : 2;
+  multiplayer_pose_rate_ =
+      HasCvar("skate3_multiplayer_local_send_rate")
+          ? float(std::clamp(
+                rex::cvar::Query<int32_t>(
+                    "skate3_multiplayer_local_send_rate"),
+                10, 120))
+          : 60.0f;
+  multiplayer_animation_rate_ =
+      HasCvar("skate3_multiplayer_local_animation_rate")
+          ? float(std::clamp(
+                rex::cvar::Query<int32_t>(
+                    "skate3_multiplayer_local_animation_rate"),
+                10, 60))
+          : 20.0f;
+  multiplayer_interpolation_ms_ =
+      HasCvar("skate3_multiplayer_local_interpolation_ms")
+          ? float(std::clamp(
+                rex::cvar::Query<int32_t>(
+                    "skate3_multiplayer_local_interpolation_ms"),
+                0, 250))
+          : 50.0f;
+  multiplayer_relevance_radius_ =
+      HasCvar("skate3_multiplayer_relevance_radius")
+          ? float(std::clamp(
+                rex::cvar::Query<double>(
+                    "skate3_multiplayer_relevance_radius"),
+                5.0, 1000.0))
+          : 80.0f;
+  multiplayer_attachment_radius_ =
+      HasCvar("skate3_multiplayer_attachment_radius")
+          ? float(std::clamp(
+                rex::cvar::Query<double>(
+                    "skate3_multiplayer_attachment_radius"),
+                5.0, 250.0))
+          : 35.0f;
+  multiplayer_relevance_players_ =
+      HasCvar("skate3_multiplayer_relevance_players")
+          ? float(std::clamp(
+                rex::cvar::Query<int32_t>(
+                    "skate3_multiplayer_relevance_players"),
+                1, 32))
+          : 12.0f;
+  multiplayer_far_presence_rate_ =
+      HasCvar("skate3_multiplayer_far_presence_rate")
+          ? float(std::clamp(
+                rex::cvar::Query<int32_t>(
+                    "skate3_multiplayer_far_presence_rate"),
+                1, 10))
+          : 2.0f;
 }
 
 bool SimpleSettingsDialog::HasSettingsChanges() const {
@@ -2164,6 +2228,168 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         }
         row.enabled = false;
         rows.push_back(std::move(row));
+      }
+      if (HasCvar("skate3_multiplayer_quality_preset")) {
+        header("Network Quality");
+        {
+          RowSpec row;
+          row.kind = RowSpec::kEnum;
+          row.label = "Quality Preset";
+          row.desc =
+              "Controls how often your skater is sent and how many nearby "
+              "players receive full animation detail. This applies "
+              "immediately and is saved per player.";
+          row.options = {
+              "Auto",
+              "Bandwidth Saver (30 / 10 Hz)",
+              "Balanced (60 / 20 Hz)",
+              "High Fidelity (90 / 30 Hz)",
+              "Custom"};
+          row.index = &multiplayer_quality_index_;
+          switch (multiplayer_quality_index_) {
+            case 0: {
+              const int players = std::max(multiplayer_.players, 1);
+              const char* active =
+                  players <= 4 ? "High Fidelity"
+                               : (players <= 12 ? "Balanced"
+                                                : "Bandwidth Saver");
+              row.desc_extra =
+                  std::string("Currently selects ") + active +
+                  ". Auto uses High Fidelity for 1-4 players, Balanced for "
+                  "5-12, and Bandwidth Saver above 12.";
+              break;
+            }
+            case 1:
+              row.desc_extra =
+                  "30 Hz pose, 10 Hz animation, 100 ms buffer, 6 "
+                  "high-detail players within 50 m.";
+              break;
+            case 3:
+              row.desc_extra =
+                  "90 Hz pose, 30 Hz animation, 35 ms buffer, 16 "
+                  "high-detail players within 120 m.";
+              break;
+            case 4:
+              row.desc_extra =
+                  "Uses the individual controls below. Raising animation "
+                  "rate and high-detail players has the largest upload cost.";
+              break;
+            case 2:
+            default:
+              row.desc_extra =
+                  "60 Hz pose, 20 Hz animation, 50 ms buffer, 12 "
+                  "high-detail players within 80 m. This matches the "
+                  "visually verified multiplayer build.";
+              break;
+          }
+          row.on_enum_change = [this](int value) {
+            multiplayer_quality_index_ = std::clamp(value, 0, 4);
+            rex::cvar::SetFlagByName(
+                "skate3_multiplayer_quality_preset",
+                std::to_string(multiplayer_quality_index_));
+            SaveSimpleSettingsConfig(config_path_);
+          };
+          row.reset = [this] {
+            multiplayer_quality_index_ = 2;
+            rex::cvar::SetFlagByName(
+                "skate3_multiplayer_quality_preset", "2");
+            SaveSimpleSettingsConfig(config_path_);
+          };
+          rows.push_back(std::move(row));
+        }
+
+        if (multiplayer_quality_index_ == 4) {
+          auto add_custom_slider =
+              [this, &rows](
+                  const char* label, const char* desc, const char* cvar,
+                  float* value, float minimum, float maximum, float step,
+                  float default_value, bool integer_value) {
+                if (!HasCvar(cvar)) {
+                  return;
+                }
+                RowSpec row;
+                row.kind = RowSpec::kSlider;
+                row.label = label;
+                row.desc = desc;
+                row.value = value;
+                row.min = minimum;
+                row.max = maximum;
+                row.step = step;
+                row.fmt = "%.0f";
+                row.on_value_change =
+                    [this, cvar, value, minimum, maximum, integer_value] {
+                      *value = std::clamp(*value, minimum, maximum);
+                      rex::cvar::SetFlagByName(
+                          cvar,
+                          integer_value
+                              ? std::to_string(
+                                    static_cast<int>(
+                                        std::lround(*value)))
+                              : std::to_string(*value));
+                      SaveSimpleSettingsConfig(config_path_);
+                    };
+                row.reset =
+                    [this, cvar, value, default_value, integer_value] {
+                      *value = default_value;
+                      rex::cvar::SetFlagByName(
+                          cvar,
+                          integer_value
+                              ? std::to_string(
+                                    static_cast<int>(
+                                        std::lround(default_value)))
+                              : std::to_string(default_value));
+                      SaveSimpleSettingsConfig(config_path_);
+                    };
+                rows.push_back(std::move(row));
+              };
+
+          add_custom_slider(
+              "Pose Rate", "Root position and board orientation updates per second.",
+              "skate3_multiplayer_local_send_rate",
+              &multiplayer_pose_rate_, 10.0f, 120.0f, 10.0f, 60.0f, true);
+          add_custom_slider(
+              "Animation Rate",
+              "Completed skeletal animation frames sent per second. This "
+              "usually has the largest bandwidth impact.",
+              "skate3_multiplayer_local_animation_rate",
+              &multiplayer_animation_rate_, 10.0f, 60.0f, 5.0f, 20.0f,
+              true);
+          add_custom_slider(
+              "Interpolation Buffer",
+              "Minimum receiver buffer in milliseconds. More buffering "
+              "hides jitter but adds visible delay.",
+              "skate3_multiplayer_local_interpolation_ms",
+              &multiplayer_interpolation_ms_, 0.0f, 250.0f, 10.0f, 50.0f,
+              true);
+          add_custom_slider(
+              "High-Detail Distance",
+              "Distance in metres where complete remote skeletal animation "
+              "is routed.",
+              "skate3_multiplayer_relevance_radius",
+              &multiplayer_relevance_radius_, 20.0f, 250.0f, 10.0f, 80.0f,
+              false);
+          add_custom_slider(
+              "Attachment Distance",
+              "Distance in metres where exact hair, hat, board and wheel "
+              "attachment tracks are sent.",
+              "skate3_multiplayer_attachment_radius",
+              &multiplayer_attachment_radius_, 5.0f, 150.0f, 5.0f, 35.0f,
+              false);
+          add_custom_slider(
+              "High-Detail Players",
+              "Maximum nearest players receiving full animation detail. "
+              "Other players retain low-rate presence updates.",
+              "skate3_multiplayer_relevance_players",
+              &multiplayer_relevance_players_, 1.0f, 32.0f, 1.0f, 12.0f,
+              true);
+          add_custom_slider(
+              "Distant Pose Rate",
+              "Root-pose updates per second for players outside the "
+              "high-detail set.",
+              "skate3_multiplayer_far_presence_rate",
+              &multiplayer_far_presence_rate_, 1.0f, 10.0f, 1.0f, 2.0f,
+              true);
+        }
       }
       const bool connected =
           multiplayer_.phase == SimpleMultiplayerPhase::kHosting ||
