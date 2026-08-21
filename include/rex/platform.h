@@ -28,7 +28,15 @@
 #include <TargetConditionals.h>
 #endif
 
-#if defined(TARGET_OS_MAC) && TARGET_OS_MAC
+// TARGET_OS_MAC is 1 on iOS as well, so iOS must be tested first. iOS then
+// *also* sets REX_PLATFORM_MAC: it is Darwin, and nearly everything the macOS
+// paths do (BSD libc, Mach semantics, MoltenVK on a Metal surface) applies
+// unchanged. REX_PLATFORM_IOS exists only to subtract the desktop-only pieces -
+// AppKit windows, native file dialogs, the process-teardown shortcut.
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+#define REX_PLATFORM_IOS 1
+#define REX_PLATFORM_MAC 1
+#elif defined(TARGET_OS_MAC) && TARGET_OS_MAC
 #define REX_PLATFORM_MAC 1
 #elif defined(WIN32) || defined(_WIN32)
 #define REX_PLATFORM_WIN32 1
@@ -46,6 +54,9 @@
 // so they can be used in static_assert and regular expressions.
 #ifndef REX_PLATFORM_MAC
 #define REX_PLATFORM_MAC 0
+#endif
+#ifndef REX_PLATFORM_IOS
+#define REX_PLATFORM_IOS 0
 #endif
 #ifndef REX_PLATFORM_WIN32
 #define REX_PLATFORM_WIN32 0

@@ -14,9 +14,10 @@
 #include <rex/platform.h>
 #include <cstddef>
 
-#if REX_PLATFORM_ANDROID
-// Bionic declares ucontext_t but implements no *context() functions; the
-// Android backend uses its own AArch64 context switch instead.
+#if REX_PLATFORM_ANDROID || REX_PLATFORM_IOS
+// Neither bionic nor the iOS SDK implements the *context() functions, so these
+// use their own AArch64 context switch. iOS must be tested before the MAC
+// branch below, which it also satisfies.
 #include <cstdint>
 #include <vector>
 #elif REX_PLATFORM_LINUX
@@ -59,7 +60,7 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
-#elif REX_PLATFORM_ANDROID
+#elif REX_PLATFORM_ANDROID || REX_PLATFORM_IOS
   // Stack pointer of the suspended context, as produced by
   // rex_fiber_make_context / rex_fiber_switch. Null while this fiber is the
   // one currently running on its thread.

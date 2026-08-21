@@ -14,9 +14,11 @@
 #endif
 
 #include <rex/platform.h>
-// Android also defines REX_PLATFORM_LINUX, but bionic implements none of the
-// *context() functions this backend needs - see fiber_android.cpp.
-#if (REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID) || REX_PLATFORM_MAC
+// Android also defines REX_PLATFORM_LINUX and iOS also defines
+// REX_PLATFORM_MAC, but neither bionic nor the iOS SDK implements the
+// *context() functions this backend needs - see fiber_aarch64.cpp.
+#if (REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID) || \
+    (REX_PLATFORM_MAC && !REX_PLATFORM_IOS)
 
 #include <rex/thread/fiber.h>
 

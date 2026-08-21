@@ -130,6 +130,12 @@ add_compile_options(
     -fno-char8_t
 )
 
+# CMake sets both APPLE and UNIX for iOS, so an explicit flag is needed to tell
+# it apart from macOS everywhere below.
+if(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(REX_IOS TRUE)
+endif()
+
 # Platform detection (supports AMD64 and ARM64)
 if(WIN32)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
@@ -141,12 +147,17 @@ if(WIN32)
     endif()
     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
 elseif(APPLE)
-    if(REX_TARGET_PROCESSOR MATCHES "aarch64|arm64|ARM64")
-        set(REX_PLATFORM "macos-arm64")
-    else()
-        message(FATAL_ERROR "Unsupported macOS architecture: ${REX_TARGET_PROCESSOR}. macOS builds are ARM64-only.")
+    if(NOT REX_TARGET_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        message(FATAL_ERROR "Unsupported Apple architecture: ${REX_TARGET_PROCESSOR}. Apple builds are ARM64-only.")
     endif()
-    add_compile_definitions(REX_PLATFORM_MAC=1)
+    if(REX_IOS)
+        set(REX_PLATFORM "ios-arm64")
+    else()
+        set(REX_PLATFORM "macos-arm64")
+    endif()
+    # platform.h derives REX_PLATFORM_MAC (and REX_PLATFORM_IOS) from
+    # TargetConditionals.h, so nothing is forced here - defining
+    # REX_PLATFORM_MAC=1 on the command line would just collide with it.
 elseif(ANDROID)
     # Must precede the generic UNIX branch: CMake sets UNIX for Android too.
     if(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64")

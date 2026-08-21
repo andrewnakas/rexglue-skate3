@@ -66,13 +66,14 @@ elseif(UNIX)
         system_posix.cpp
         threading_posix.cpp
     )
-    if(ANDROID)
-        # Bionic has no makecontext/swapcontext; fiber_posix.cpp compiles to
-        # nothing on Android and this backend takes over.
+    if(ANDROID OR REX_IOS)
+        # Neither bionic nor the iOS SDK has makecontext/swapcontext;
+        # fiber_posix.cpp compiles to nothing on both and this backend takes
+        # over. The .S assembles for ELF and Mach-O alike.
         enable_language(ASM)
         target_sources(rexcore PRIVATE
-            fiber_android.cpp
-            fiber_android_aarch64.S
+            fiber_aarch64.cpp
+            fiber_aarch64.S
         )
     endif()
 endif()

@@ -1,10 +1,13 @@
 /**
- * @file        rex/core/fiber_android_aarch64.S
+ * @file        rex/core/fiber_aarch64.S
  * @brief       AArch64 cooperative context switch for rex::thread::Fiber
  *
- * Bionic implements neither makecontext() nor swapcontext(), so the POSIX
- * fiber backend cannot be used on Android. This provides the two primitives
- * fiber_android.cpp builds on.
+ * Neither bionic nor the iOS SDK provides makecontext()/swapcontext(), so the
+ * POSIX fiber backend cannot be used on Android or iOS. This provides the two
+ * primitives fiber_aarch64.cpp builds on.
+ *
+ * Assembles for both ELF (Android) and Mach-O (iOS): Apple's assembler needs
+ * underscore-prefixed symbols, .p2align, and has no .type/.size directives.
  *
  * Saves exactly the AAPCS64 callee-saved state: x19-x28, x29 (FP), x30 (LR)
  * and the low 64 bits of v8-v15. Caller-saved registers are, by definition,
@@ -18,7 +21,16 @@
 
 #define FRAME_SIZE 160
 
+// NOTE: no preprocessor macros for the symbol boilerplate. On AArch64 ';' is a
+// comment character, not a statement separator, so a one-line macro silently
+// discards everything after the first directive - the symbol ends up declared
+// but never defined.
+
+#if defined(__APPLE__)
+    .section __TEXT,__text,regular,pure_instructions
+#else
     .text
+#endif
 
 /**
  * void rex_fiber_switch(void** from_sp, void* to_sp);
@@ -28,11 +40,18 @@
  * Returns to whatever pushed to_sp - either a previous rex_fiber_switch, or
  * rex_fiber_make_context for a fiber being entered the first time.
  */
+#if defined(__APPLE__)
+    .globl _rex_fiber_switch
+    .private_extern _rex_fiber_switch
+    .p2align 4
+_rex_fiber_switch:
+#else
     .global rex_fiber_switch
     .hidden rex_fiber_switch
     .type rex_fiber_switch, %function
     .balign 16
 rex_fiber_switch:
+#endif
     .cfi_startproc
     sub     sp,  sp,  #FRAME_SIZE
     .cfi_def_cfa_offset FRAME_SIZE
@@ -67,7 +86,9 @@ rex_fiber_switch:
     .cfi_def_cfa_offset 0
     ret
     .cfi_endproc
+#if !defined(__APPLE__)
     .size rex_fiber_switch, .-rex_fiber_switch
+#endif
 
 /**
  * void* rex_fiber_make_context(void* stack_top, void (*entry)(void));
@@ -77,11 +98,18 @@ rex_fiber_switch:
  * Returns the stack pointer to hand to rex_fiber_switch's to_sp. The first
  * switch into it pops this frame and 'ret's straight into entry.
  */
+#if defined(__APPLE__)
+    .globl _rex_fiber_make_context
+    .private_extern _rex_fiber_make_context
+    .p2align 4
+_rex_fiber_make_context:
+#else
     .global rex_fiber_make_context
     .hidden rex_fiber_make_context
     .type rex_fiber_make_context, %function
     .balign 16
 rex_fiber_make_context:
+#endif
     .cfi_startproc
     and     x0,  x0,  #~15      // AAPCS64 requires 16-byte SP alignment
     sub     x0,  x0,  #FRAME_SIZE
@@ -99,9 +127,13 @@ rex_fiber_make_context:
     stp     d14, d15, [x0, #144]
     ret
     .cfi_endproc
+#if !defined(__APPLE__)
     .size rex_fiber_make_context, .-rex_fiber_make_context
+#endif
 
-// Never need an executable stack for this object.
+#if !defined(__APPLE__)
+// Never need an executable stack for this object. Mach-O has no equivalent.
 .section .note.GNU-stack,"",%progbits
+#endif
 
 #endif  // __aarch64__

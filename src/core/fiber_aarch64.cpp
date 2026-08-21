@@ -1,11 +1,11 @@
 /**
- * @file        rex/core/fiber_android.cpp
- * @brief       Android backend for rex::thread::Fiber
+ * @file        rex/core/fiber_aarch64.cpp
+ * @brief       AArch64 backend for rex::thread::Fiber (Android and iOS)
  *
- * Bionic provides <ucontext.h> but implements none of getcontext/setcontext/
- * makecontext/swapcontext, so fiber_posix.cpp cannot be used. This backend
- * keeps the same semantics on top of the AArch64 primitives in
- * fiber_android_aarch64.S.
+ * Bionic declares <ucontext.h> but implements none of getcontext/setcontext/
+ * makecontext/swapcontext, and the iOS SDK does not provide them at all, so
+ * fiber_posix.cpp cannot be used on either. This backend keeps the same
+ * semantics on top of the AArch64 primitives in fiber_aarch64.S.
  *
  * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
  *              All rights reserved.
@@ -16,7 +16,7 @@
 
 #include <rex/platform.h>
 
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_ANDROID || REX_PLATFORM_IOS
 
 #include <rex/thread/fiber.h>
 
@@ -83,4 +83,4 @@ void Fiber::Destroy() {
 
 }  // namespace rex::thread
 
-#endif  // REX_PLATFORM_ANDROID
+#endif  // REX_PLATFORM_ANDROID || REX_PLATFORM_IOS

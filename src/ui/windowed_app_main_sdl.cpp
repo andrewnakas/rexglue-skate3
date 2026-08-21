@@ -21,6 +21,42 @@
 #include <rex/main_android.h>
 #endif
 
+#if REX_PLATFORM_IOS
+// SDL's iOS entry point also goes through SDL_main.
+#include <SDL3/SDL_main.h>
+#include <filesystem>
+#include <cstdlib>
+
+namespace {
+
+// iOS launches an app with no arguments, and there is no Java shell to build
+// them the way Skate3Activity does on Android, so the paths are derived here.
+// getenv("HOME") is the app sandbox root under iOS, making $HOME/Documents the
+// user-visible directory that files copied in via Finder or iTunes land in.
+std::vector<std::string> BuildIOSArguments() {
+  const char* home = std::getenv("HOME");
+  const std::filesystem::path documents =
+      std::filesystem::path(home ? home : ".") / "Documents";
+  return {
+      "--game_data_root=" + (documents / "game").string(),
+      "--user_data_root=" + (documents / "user").string(),
+      "--log_file=" + (documents / "skate3.log").string(),
+      "--log_flush_interval=1",
+      // The emulated Xenos backend needs geometry shaders, which Metal (and so
+      // MoltenVK) does not expose; the Skate-3 native renderer replaces it.
+      "--skate3_native_render_scene=true",
+      "--vulkan_require_geometry_shader=false",
+      "--vulkan_require_fill_mode_non_solid=false",
+      // The disc is staged into Documents, so never run the install wizard.
+      "--skate3_auto_install_dlc=false",
+      // Mitigation for the WorldPresentation cross-thread use-after-free.
+      "--skate3_instance_free_defer_ms=250",
+  };
+}
+
+}  // namespace
+#endif
+
 int main(int argc, char** argv) {
 #if REX_PLATFORM_ANDROID
   // Must run before anything touches guest memory or names a thread: it latches
@@ -43,6 +79,22 @@ int main(int argc, char** argv) {
       env->DeleteLocalRef(activity);
     }
   }
+#endif
+
+#if REX_PLATFORM_IOS
+  // Splice the derived arguments in ahead of anything the launcher passed.
+  const std::vector<std::string> ios_args = BuildIOSArguments();
+  std::vector<char*> ios_argv;
+  ios_argv.reserve(size_t(argc) + ios_args.size());
+  ios_argv.push_back(argc > 0 ? argv[0] : const_cast<char*>("skate3"));
+  for (const std::string& arg : ios_args) {
+    ios_argv.push_back(const_cast<char*>(arg.c_str()));
+  }
+  for (int i = 1; i < argc; ++i) {
+    ios_argv.push_back(argv[i]);
+  }
+  argc = int(ios_argv.size());
+  argv = ios_argv.data();
 #endif
 
   auto remaining = rex::cvar::Init(argc, argv);
