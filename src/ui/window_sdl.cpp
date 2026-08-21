@@ -12,7 +12,11 @@
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#if REX_PLATFORM_ANDROID
+#include <rex/ui/surface_android.h>
+#else
 #include <rex/ui/surface_sdl.h>
+#endif
 #include <rex/ui/virtual_key.h>
 
 #include <SDL3/SDL_hints.h>
@@ -345,11 +349,13 @@ SDLWindow::~SDLWindow() {
   if (window_) {
     WindowMap().erase(SDL_GetWindowID(window_));
   }
+#if REX_PLATFORM_MAC
   if (metal_view_) {
     SDL_Metal_DestroyView(metal_view_);
     metal_view_ = nullptr;
     metal_layer_ = nullptr;
   }
+#endif
   if (window_) {
     SDL_DestroyWindow(window_);
     window_ = nullptr;
@@ -427,6 +433,13 @@ bool SDLWindow::OpenImpl() {
   if (IsFullscreen()) {
     flags |= SDL_WINDOW_FULLSCREEN;
   }
+#if REX_PLATFORM_ANDROID
+  // The presenter builds a VkSurfaceKHR from this window's ANativeWindow, so
+  // SDL must set the surface up for Vulkan rather than GLES. Android windows
+  // are always full-screen and non-resizable in the desktop sense.
+  flags |= SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN;
+  flags &= ~SDL_WindowFlags(SDL_WINDOW_RESIZABLE);
+#endif
 
   window_ = SDL_CreateWindow(GetTitle().c_str(), int(GetDesiredLogicalWidth()),
                              int(GetDesiredLogicalHeight()), flags);
@@ -437,6 +450,7 @@ bool SDLWindow::OpenImpl() {
 
   WindowMap().emplace(SDL_GetWindowID(window_), this);
 
+#if REX_PLATFORM_MAC
   metal_view_ = SDL_Metal_CreateView(window_);
   if (!metal_view_) {
     REXLOG_ERROR("SDLWindow: Failed to create Metal view: {}", SDL_GetError());
@@ -455,6 +469,7 @@ bool SDLWindow::OpenImpl() {
     window_ = nullptr;
     return false;
   }
+#endif
 
   dpi_ = QueryDpi();
   SDL_ShowWindow(window_);
@@ -477,11 +492,13 @@ void SDLWindow::RequestCloseImpl() {
   OnBeforeClose(destruction_receiver);
   if (!destruction_receiver.IsWindowDestroyed()) {
     RemoveCursorAutoHideTimer();
+#if REX_PLATFORM_MAC
     if (metal_view_) {
       SDL_Metal_DestroyView(metal_view_);
       metal_view_ = nullptr;
       metal_layer_ = nullptr;
     }
+#endif
     if (window_) {
       WindowMap().erase(SDL_GetWindowID(window_));
       SDL_DestroyWindow(window_);
@@ -541,10 +558,25 @@ void SDLWindow::FocusImpl() {
 }
 
 std::unique_ptr<Surface> SDLWindow::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
+#if REX_PLATFORM_ANDROID
+  if (!(allowed_types & Surface::kTypeFlag_AndroidNativeWindow)) {
+    return nullptr;
+  }
+  // SDL owns the Android window; the presenter needs the ANativeWindow behind
+  // it to create a VkAndroidSurfaceKHR.
+  auto* native_window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
+      SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+  if (!native_window) {
+    REXLOG_ERROR("SDLWindow: no ANativeWindow behind the SDL window");
+    return nullptr;
+  }
+  return std::make_unique<AndroidNativeWindowSurface>(native_window);
+#else
   if (!(allowed_types & Surface::kTypeFlag_SDLMetalView)) {
     return nullptr;
   }
   return std::make_unique<SDLMetalViewSurface>(window_, metal_view_, metal_layer_);
+#endif
 }
 
 void SDLWindow::RequestPaintImpl() {

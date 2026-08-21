@@ -22,11 +22,17 @@ function(rexglue_apply_target_settings target_name)
         endif()
     endif()
 
-    if(UNIX AND NOT APPLE)
+    # GTK is the desktop-Linux windowing backend only. Android is also
+    # (UNIX AND NOT APPLE), so it must be excluded explicitly or configure
+    # fails on a missing gtk+-3.0 pkg-config module.
+    if(UNIX AND NOT APPLE AND NOT ANDROID)
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
         target_include_directories(${target_name} PRIVATE ${GTK3_INCLUDE_DIRS})
         target_link_libraries(${target_name} PRIVATE ${GTK3_LIBRARIES})
+    endif()
+
+    if(UNIX AND NOT APPLE)
         # Large executable support
         if(_rexglue_target_processor MATCHES "x86_64|AMD64")
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
@@ -59,7 +65,9 @@ function(rexglue_configure_target target_name)
     if(WIN32)
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
-    elseif(APPLE)
+    elseif(APPLE OR ANDROID)
+        # On Android SDLActivity calls into SDL_main, which <SDL3/SDL_main.h>
+        # maps this main() onto - so the SDL entry point serves both.
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp)
     else()

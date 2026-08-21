@@ -34,8 +34,7 @@
 
 #include <linux/ashmem.h>
 
-// TODO(tomc): Android or maybe na. idk
-// #include "xenia/base/main_android.h"
+#include <rex/main_android.h>
 #endif
 
 #if REX_PLATFORM_MAC

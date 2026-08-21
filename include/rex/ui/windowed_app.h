@@ -24,10 +24,11 @@
 #include <rex/platform.h>
 #include <rex/ui/windowed_app_context.h>
 
-#if REX_PLATFORM_ANDROID
-// Multiple apps in a single library instead of separate executables.
-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
-#endif
+// Xenia enabled this on Android to pack several apps (the emulator, the trace
+// viewer, ...) into one .so and pick between them at runtime. ReXGlue ships a
+// single app per library, and on Android SDL supplies main() through
+// SDL_main.h, so the separate-executable path is the right one there too.
+// Define XE_UI_WINDOWED_APPS_IN_LIBRARY externally to opt back in.
 
 namespace rex {
 namespace ui {

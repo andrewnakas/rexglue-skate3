@@ -13,8 +13,38 @@
 #include <rex/ui/windowed_app_context_sdl.h>
 
 #include <SDL3/SDL.h>
+#if REX_PLATFORM_ANDROID
+// Renames main() to SDL_main, which is what SDLActivity's native loader calls.
+#include <SDL3/SDL_main.h>
+#include <SDL3/SDL_system.h>
+#include <jni.h>
+#include <rex/main_android.h>
+#endif
 
 int main(int argc, char** argv) {
+#if REX_PLATFORM_ANDROID
+  // Must run before anything touches guest memory or names a thread: it latches
+  // the API level that rex::memory/thread::AndroidInitialize gate their
+  // ASharedMemory_create and pthread_getname_np lookups on. SDL's JNI_OnLoad
+  // has already run by this point, so the VM and activity are available.
+  {
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    JavaVM* vm = nullptr;
+    if (env) {
+      env->GetJavaVM(&vm);
+    }
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (!rex::InitializeAndroidAppFromMainThread(vm, activity)) {
+      std::fprintf(stderr, "Failed to initialize Android app state\n");
+      return EXIT_FAILURE;
+    }
+    if (env && activity) {
+      // InitializeAndroidAppFromMainThread took its own global ref.
+      env->DeleteLocalRef(activity);
+    }
+  }
+#endif
+
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();

@@ -57,12 +57,24 @@ elseif(UNIX)
         mapped_memory_posix.cpp
         math_gcc.cpp
         memory_posix.cpp
+        main_android.cpp
+        filesystem_android.cpp
+        execinfo_android.cpp
         seh_posix.cpp
         socket_posix.cpp
         string_posix.cpp
         system_posix.cpp
         threading_posix.cpp
     )
+    if(ANDROID)
+        # Bionic has no makecontext/swapcontext; fiber_posix.cpp compiles to
+        # nothing on Android and this backend takes over.
+        enable_language(ASM)
+        target_sources(rexcore PRIVATE
+            fiber_android.cpp
+            fiber_android_aarch64.S
+        )
+    endif()
 endif()
 
 target_include_directories(rexcore PUBLIC
@@ -77,8 +89,14 @@ target_include_directories(rexcore PRIVATE
 )
 
 if(UNIX)
-    target_link_libraries(rexcore PRIVATE pthread dl)
-    if(NOT APPLE)
+    if(ANDROID)
+        # Bionic folds pthread, rt and dl into libc; there are no separate
+        # libraries to link, and -lpthread/-lrt fail outright.
+        target_link_libraries(rexcore PRIVATE log)
+    else()
+        target_link_libraries(rexcore PRIVATE pthread dl)
+    endif()
+    if(NOT APPLE AND NOT ANDROID)
         target_link_libraries(rexcore PRIVATE rt)
     endif()
 elseif(WIN32)

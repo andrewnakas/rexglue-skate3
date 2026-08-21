@@ -74,6 +74,15 @@ elseif(APPLE)
         window_sdl.cpp
         windowed_app_context_sdl.cpp
     )
+elseif(ANDROID)
+    # Must precede the desktop-Linux fallback: Android is UNIX but has neither
+    # GTK nor XCB. The surface is an ANativeWindow handed to
+    # VK_KHR_android_surface, which vulkan_presenter.cpp already implements.
+    set(REXUI_PLATFORM_SOURCES
+        surface_android.cpp
+        window_sdl.cpp
+        windowed_app_context_sdl.cpp
+    )
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
@@ -156,6 +165,10 @@ if(WIN32)
     )
 elseif(APPLE)
     target_link_libraries(rexui PUBLIC SDL3::SDL3)
+elseif(ANDROID)
+    # SDL3 owns the window and event loop here, same as on macOS.
+    # ANativeWindow_* lives in libandroid; __android_log_* in liblog.
+    target_link_libraries(rexui PUBLIC SDL3::SDL3 android log)
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK3 REQUIRED gtk+-3.0)

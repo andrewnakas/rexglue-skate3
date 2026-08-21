@@ -41,9 +41,15 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
+#if REX_PLATFORM_ANDROID
+#include <rex/main_android.h>
+#endif
 
 #if REX_PLATFORM_LINUX
+#if !REX_PLATFORM_ANDROID
+// bionic is not glibc and ships no <gnu/libc-version.h>.
 #include <gnu/libc-version.h>
+#endif
 #include <sys/utsname.h>
 #endif
 
@@ -162,7 +168,11 @@ void LogLinuxRuntimeDiagnostics() {
   if (uname(&uts) == 0) {
     REXLOG_INFO("  Kernel: {} {} {}", uts.sysname, uts.release, uts.machine);
   }
+#if REX_PLATFORM_ANDROID
+  REXLOG_INFO("  bionic: Android API {}", rex::GetAndroidApiLevel());
+#else
   REXLOG_INFO("  glibc: {}", gnu_get_libc_version());
+#endif
 
 #if defined(__clang__)
   REXLOG_INFO("  Compiler: clang {}", __clang_version__);

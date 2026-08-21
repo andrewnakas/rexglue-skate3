@@ -280,7 +280,13 @@ set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
 
 # Disable unused subsystems
-if(APPLE)
+# Android: SDL's JNI core (SDL_android.c) is entangled with the video
+# subsystem - Android_OnTouch, Android_SendResize and friends are only compiled
+# when SDL_VIDEO is on, so the link fails without it. Keeping video on also
+# gives us SDLActivity as the Java shell, and the ANativeWindow behind
+# SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER is exactly what
+# AndroidNativeWindowSurface wants to hand to VK_KHR_android_surface.
+if(APPLE OR ANDROID)
     set(SDL_VIDEO ON CACHE BOOL "" FORCE)
 else()
     set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
@@ -299,8 +305,15 @@ set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 
 # Disable graphics APIs (unused without video)
 set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
-set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
-set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+if(ANDROID)
+    # SDL's Android video backend requires an EGL/GLES path to build, and we
+    # need its Vulkan support to create the window in Vulkan mode.
+    set(SDL_OPENGLES ON CACHE BOOL "" FORCE)
+    set(SDL_VULKAN ON CACHE BOOL "" FORCE)
+else()
+    set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+    set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+endif()
 if(APPLE)
     set(SDL_METAL ON CACHE BOOL "" FORCE)
 else()
@@ -313,7 +326,7 @@ set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux audio backends
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT ANDROID)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA_SHARED       ON  CACHE BOOL "" FORCE)
     set(SDL_PULSEAUDIO        ON  CACHE BOOL "" FORCE)
@@ -721,3 +734,15 @@ endif()
 
 # IDE folder organization
 set_target_properties(libavutil libavcodec PROPERTIES FOLDER "FFmpeg")
+
+if(ANDROID)
+    # FFmpeg's aarch64 asm reaches its own data tables (ff_cos_*) with a
+    # PC-relative adrp/add pair. Inside a shared library those symbols are
+    # preemptible at default visibility, which makes that pair invalid and
+    # ld.lld rejects it with "recompile with -fPIC" (misleading - the objects
+    # already are PIC). Hiding FFmpeg's symbols makes them non-preemptible,
+    # which is correct anyway: none of them are part of our ABI.
+    set_target_properties(libavutil libavcodec PROPERTIES
+        C_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+endif()

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <tuple>
 
+#include <rex/atomic_ref.h>
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
@@ -490,7 +491,7 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
 
   const auto cas_update = [&](size_t dword_idx, uint32_t mask, uint32_t value) {
     uint32_t* p = reinterpret_cast<uint32_t*>(context_ptr) + dword_idx;
-    std::atomic_ref<uint32_t> ref(*p);
+    rex::AtomicRef<uint32_t> ref(*p);
     uint32_t old_be = ref.load(std::memory_order_relaxed);
     while (true) {
       const uint32_t old_host = rex::byte_swap(old_be);

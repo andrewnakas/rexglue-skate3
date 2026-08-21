@@ -147,6 +147,25 @@ elseif(APPLE)
         message(FATAL_ERROR "Unsupported macOS architecture: ${REX_TARGET_PROCESSOR}. macOS builds are ARM64-only.")
     endif()
     add_compile_definitions(REX_PLATFORM_MAC=1)
+elseif(ANDROID)
+    # Must precede the generic UNIX branch: CMake sets UNIX for Android too.
+    if(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64")
+        set(REX_PLATFORM "android-arm64")
+    else()
+        message(FATAL_ERROR "Unsupported Android architecture: ${REX_TARGET_PROCESSOR}. Android builds are ARM64-only.")
+    endif()
+    # platform.h derives both REX_PLATFORM_ANDROID and REX_PLATFORM_LINUX from
+    # __ANDROID__, so nothing is added here.
+    #
+    # The NDK's libc++ still keeps <stop_token> and std::jthread behind the
+    # experimental flag; timer_queue.cpp needs both. Verified to compile, link
+    # and run on device (Android 14, arm64).
+    add_compile_options(-fexperimental-library)
+    add_link_options(-fexperimental-library)
+    # Android 15+ on arm64 ships 16 KB pages; a shared library whose LOAD
+    # segments are only 4 KB-aligned will not load there. Harmless on 4 KB
+    # devices (the NDK r27 default is still 4 KB).
+    add_link_options(-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384)
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
