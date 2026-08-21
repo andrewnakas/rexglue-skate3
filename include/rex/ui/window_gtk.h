@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <atomic>
 #include <string>
 
 #include <rex/platform.h>
@@ -81,6 +82,10 @@ class GTKWindow : public Window {
   GtkWidget* window_ = nullptr;
   GtkWidget* box_ = nullptr;
   GtkWidget* drawing_area_ = nullptr;
+  // Set while a repaint has been marshalled to the UI thread but not yet run,
+  // so a guest thread producing frames faster than the main loop drains them
+  // does not pile up idle sources. See RequestPaintImpl.
+  std::atomic<bool> paint_request_pending_{false};
   GdkCursor* blank_cursor_ = nullptr;
   guint cursor_auto_hide_timer_ = 0;
   bool cursor_currently_auto_hidden_ = false;

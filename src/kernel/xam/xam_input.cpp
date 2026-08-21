@@ -50,7 +50,23 @@ std::array<SyntheticInputStep, kMaxSyntheticInputSteps> g_synthetic_input_steps{
 size_t g_synthetic_input_step_count = 0;
 size_t g_synthetic_input_step_index = 0;
 uint32_t g_synthetic_input_step_remaining = 0;
-uint16_t g_synthetic_auto_tap_buttons = 0;
+// Auto-tap is a SET of buttons, tapped in rotation, not a single value.
+//
+// It used to be one `uint16_t`, and the two callers that want an auto-tap
+// clobbered each other: the demo path asks for START to get past the title
+// screen, and the XGI dialog handler asks for A to dismiss profile dialogs.
+// Whoever called last won permanently. When A won the race the title screen
+// never saw START again and the boot simply stopped there - `ShowPressStartMode`
+// never reached event=4, no "gameplay reached", the frontend sat on screen 0,
+// and the run burned its whole timeout. Measured at 2 of 62 runs (~3%), with
+// the same map passing on its other runs.
+//
+// Rotating means both intents are served: START still dismisses press-start
+// even after a dialog has asked for A.
+constexpr size_t kMaxAutoTapButtons = 4;
+std::array<uint16_t, kMaxAutoTapButtons> g_synthetic_auto_tap_set{};
+size_t g_synthetic_auto_tap_count = 0;
+size_t g_synthetic_auto_tap_next = 0;
 bool g_synthetic_auto_tap_enabled = false;
 
 void QueueSyntheticInputSequenceLocked(const SyntheticInputStep* steps, size_t step_count) {
@@ -71,14 +87,23 @@ void QueueSyntheticInputSequenceLocked(const SyntheticInputStep* steps, size_t s
 }
 
 void EnsureSyntheticAutoTapLocked() {
-  if (!g_synthetic_auto_tap_enabled || g_synthetic_auto_tap_buttons == 0 ||
+  if (!g_synthetic_auto_tap_enabled || g_synthetic_auto_tap_count == 0 ||
       g_synthetic_input_active.load(std::memory_order_relaxed)) {
     return;
   }
 
+  // Release gap trimmed 15 -> 6 polls (2026-08-13): the boot's profile dialogs
+  // are auto-tapped one after another, and the gap was pure latency between
+  // them. Measured 0.6 s off boot, 3/3 runs still landing the right map with no
+  // double-tap. Press width stays 5 - shortening THAT risks a press the game
+  // does not see at all.
+  const uint16_t buttons =
+      g_synthetic_auto_tap_set[g_synthetic_auto_tap_next % g_synthetic_auto_tap_count];
+  g_synthetic_auto_tap_next =
+      (g_synthetic_auto_tap_next + 1) % g_synthetic_auto_tap_count;
   const SyntheticInputStep auto_tap[] = {
-      {g_synthetic_auto_tap_buttons, 5},
-      {0, 15},
+      {buttons, 5},
+      {0, 6},
   };
   QueueSyntheticInputSequenceLocked(auto_tap, std::size(auto_tap));
 }
@@ -152,8 +177,28 @@ void QueueSyntheticInputSequence(const SyntheticInputStep* steps, size_t step_co
 
 void SetSyntheticAutoTap(uint16_t buttons, bool enabled) {
   std::lock_guard lock(g_synthetic_input_mutex);
-  g_synthetic_auto_tap_buttons = buttons;
-  g_synthetic_auto_tap_enabled = enabled && buttons != 0;
+  if (buttons == 0) {
+    return;
+  }
+  size_t found = kMaxAutoTapButtons;
+  for (size_t i = 0; i < g_synthetic_auto_tap_count; ++i) {
+    if (g_synthetic_auto_tap_set[i] == buttons) {
+      found = i;
+      break;
+    }
+  }
+  if (enabled) {
+    if (found == kMaxAutoTapButtons && g_synthetic_auto_tap_count < kMaxAutoTapButtons) {
+      g_synthetic_auto_tap_set[g_synthetic_auto_tap_count++] = buttons;
+    }
+    g_synthetic_auto_tap_enabled = true;
+  } else if (found != kMaxAutoTapButtons) {
+    for (size_t i = found; i + 1 < g_synthetic_auto_tap_count; ++i) {
+      g_synthetic_auto_tap_set[i] = g_synthetic_auto_tap_set[i + 1];
+    }
+    --g_synthetic_auto_tap_count;
+    g_synthetic_auto_tap_enabled = g_synthetic_auto_tap_count != 0;
+  }
 }
 
 void ClearSyntheticInput() {
@@ -161,7 +206,9 @@ void ClearSyntheticInput() {
   g_synthetic_input_step_count = 0;
   g_synthetic_input_step_index = 0;
   g_synthetic_input_step_remaining = 0;
-  g_synthetic_auto_tap_buttons = 0;
+  g_synthetic_auto_tap_set = {};
+  g_synthetic_auto_tap_count = 0;
+  g_synthetic_auto_tap_next = 0;
   g_synthetic_auto_tap_enabled = false;
   g_synthetic_input_active.store(false, std::memory_order_relaxed);
 }

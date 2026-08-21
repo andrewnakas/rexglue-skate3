@@ -684,7 +684,41 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(Surface::TypeFlags allowed
 }
 
 void GTKWindow::RequestPaintImpl() {
-  gtk_widget_queue_draw(drawing_area_);
+  // ANY thread may ask for a repaint - the guest output thread does it once per
+  // presented frame from VulkanCommandProcessor::IssueSwap via
+  // Presenter::RefreshGuestOutput. GTK and GLib are not thread-safe, and
+  // calling gtk_widget_queue_draw from a non-UI thread corrupts glib's internal
+  // lists; it faults intermittently, minutes apart, like this:
+  //
+  //   g_slist_find+0x10                <- null list, faults at address 0
+  //   gtk_widget_queue_draw_area
+  //   gtk_widget_queue_draw
+  //   rex::ui::Presenter::RefreshGuestOutput
+  //   vulkan::VulkanCommandProcessor::IssueSwap
+  //   CommandProcessor::ExecutePacketType3_XE_SWAP    thread "GPU Commands"
+  //
+  // Note host_present_from_non_ui_thread=false does NOT avoid this: that only
+  // decides who PAINTS, while this is the request itself, and the guest output
+  // thread issues the request in either mode.
+  //
+  // g_idle_add is the thread-safe way in: it takes the main context lock and
+  // the callback runs on the UI thread. Coalesced through a flag because the
+  // guest can present faster than the main loop drains idle sources, and one
+  // pending repaint is as good as ten.
+  if (paint_request_pending_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  g_idle_add(
+      [](gpointer user_data) -> gboolean {
+        auto* gtk_window = reinterpret_cast<GTKWindow*>(user_data);
+        gtk_window->paint_request_pending_.store(false, std::memory_order_release);
+        // The window can be torn down between the request and this callback.
+        if (gtk_window->drawing_area_) {
+          gtk_widget_queue_draw(gtk_window->drawing_area_);
+        }
+        return G_SOURCE_REMOVE;
+      },
+      this);
 }
 
 void GTKWindow::HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver) {

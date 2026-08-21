@@ -99,7 +99,10 @@ X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callba
     return result;
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    const uint32_t delay_ms = rex::system::DeferredOverlappedDelayMillis();
+    if (delay_ms != 0) {
+      rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+    }
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };
@@ -141,7 +144,10 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
     return result;
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    const uint32_t delay_ms = rex::system::DeferredOverlappedDelayMillis();
+    if (delay_ms != 0) {
+      rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+    }
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };
@@ -165,7 +171,10 @@ X_RESULT xeXamDispatchHeadless(std::function<X_RESULT()> run_callback, uint32_t 
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    const uint32_t delay_ms = rex::system::DeferredOverlappedDelayMillis();
+    if (delay_ms != 0) {
+      rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+    }
     REXKRNL_DEBUG("xeXamDispatchHeadless: Broadcasting XN_SYS_UI = false");
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
@@ -188,7 +197,10 @@ X_RESULT xeXamDispatchHeadlessEx(std::function<X_RESULT(uint32_t&, uint32_t&)> r
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    const uint32_t delay_ms = rex::system::DeferredOverlappedDelayMillis();
+    if (delay_ms != 0) {
+      rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+    }
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };

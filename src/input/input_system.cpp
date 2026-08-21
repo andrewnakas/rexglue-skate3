@@ -52,6 +52,8 @@ REXCVAR_DEFINE_STRING(menu_chord, "rb+start", "Input",
                       "Controller chord that toggles the settings menu. Buttons joined by '+': "
                       "a, b, x, y, lb, rb, l3, r3, back, start, dpad_up, dpad_down, dpad_left, "
                       "dpad_right. Empty disables the chord.");
+REXCVAR_DEFINE_STRING(picker_chord, "guide", "Input",
+                      "Controller button or chord that opens the in-game level picker. Same token set as menu_chord, plus 'guide' for the middle Xbox button (which needs guide_button=true to reach us at all). Empty disables it.");
 REXCVAR_DEFINE_BOOL(hid_rumble_enabled, true, "Input", "Enable controller vibration");
 REXCVAR_DEFINE_UINT32(hid_rumble_min_motor_speed, 0x1000, "Input",
                       "Minimum XInput motor speed forwarded to host controllers")
@@ -68,6 +70,7 @@ uint16_t ChordButtonFromToken(std::string_view token) {
   if (token == "rb") return X_INPUT_GAMEPAD_RIGHT_SHOULDER;
   if (token == "l3") return X_INPUT_GAMEPAD_LEFT_THUMB;
   if (token == "r3") return X_INPUT_GAMEPAD_RIGHT_THUMB;
+  if (token == "guide" || token == "home" || token == "xbox") return X_INPUT_GAMEPAD_GUIDE;
   if (token == "back" || token == "select" || token == "view") return X_INPUT_GAMEPAD_BACK;
   if (token == "start" || token == "menu") return X_INPUT_GAMEPAD_START;
   if (token == "dpad_up") return X_INPUT_GAMEPAD_DPAD_UP;
@@ -138,6 +141,10 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
 
 void InputSystem::SetMenuChordCallback(std::function<void()> callback) {
   menu_chord_callback_ = std::move(callback);
+}
+
+void InputSystem::SetPickerChordCallback(std::function<void()> callback) {
+  picker_chord_callback_ = std::move(callback);
 }
 
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
@@ -211,6 +218,19 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     menu_chord_callback_();
   }
   menu_chord_down_ = menu_chord_down;
+
+  // The level picker gets its own button. Defaults to the Guide (middle Xbox)
+  // button, which only reaches us when guide_button is on - the SDL driver
+  // drops it otherwise.
+  const uint16_t picker_chord_buttons = ChordMaskFromSpec(REXCVAR_GET(picker_chord));
+  const bool picker_chord_down =
+      picker_chord_buttons != 0 &&
+      (static_cast<uint16_t>(merged.gamepad.buttons) & picker_chord_buttons) ==
+          picker_chord_buttons;
+  if (picker_chord_down && !picker_chord_down_ && picker_chord_callback_) {
+    picker_chord_callback_();
+  }
+  picker_chord_down_ = picker_chord_down;
 
   if (active_callback_ && !active_callback_()) {
     std::memset(&merged.gamepad, 0, sizeof(merged.gamepad));

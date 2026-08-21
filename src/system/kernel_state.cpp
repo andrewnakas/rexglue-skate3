@@ -20,6 +20,7 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
@@ -40,9 +41,24 @@
 #include <rex/system/xobject.h>
 #include <rex/system/xthread.h>
 
+// Every deferred overlapped completion sleeps this long before running, and the
+// dialog dispatchers sleep it again before broadcasting XN_SYS_UI = false. They
+// exist so a title that only creates its notification listener after the
+// overlapped completes still catches the notification. There is one dispatch
+// thread, so the cost is serial across every overlapped a boot performs -
+// which is why it is worth being able to turn down.
+REXCVAR_DEFINE_UINT32(kernel_overlapped_delay_ms, 100, "Kernel",
+                      "Delay before a deferred overlapped completion runs, and before the "
+                      "XN_SYS_UI notification that follows a system dialog. Serialised on the "
+                      "single kernel dispatch thread, so it is pure boot latency; lower it to "
+                      "boot faster, at the risk of a title missing a notification.")
+    .range(0, 1000);
+
 namespace rex::system {
 
-constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+uint32_t DeferredOverlappedDelayMillis() {
+  return REXCVAR_GET(kernel_overlapped_delay_ms);
+}
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
@@ -1134,9 +1150,16 @@ void KernelState::CompleteOverlappedDeferredEx(
         if (pre_callback) {
           pre_callback();
         }
-        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
-                     kDeferredOverlappedDelayMillis);
-        rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
+        const uint32_t delay_ms = DeferredOverlappedDelayMillis();
+        // Counted at info level: these are rare (dialogs, content enumeration),
+        // they serialise on this one thread, and the running total is how the
+        // delay's share of boot time gets attributed.
+        static std::atomic<uint32_t> s_deferred_count{0};
+        REXSYS_INFO("Deferred overlapped {:08X}: #{} sleeping {}ms", overlapped_ptr,
+                    s_deferred_count.fetch_add(1, std::memory_order_relaxed) + 1, delay_ms);
+        if (delay_ms != 0) {
+          rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+        }
         uint32_t extended_error, length;
         REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
         auto result = completion_callback(extended_error, length);

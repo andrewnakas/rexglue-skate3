@@ -388,6 +388,11 @@ class KernelState {
 // Global kernel state accessor (defined in kernel_state.cpp)
 KernelState* kernel_state();
 
+// How long a deferred overlapped completion waits before running, and how long
+// the dialog dispatchers wait before broadcasting XN_SYS_UI = false. Backed by
+// the `kernel_overlapped_delay_ms` cvar; see kernel_state.cpp.
+uint32_t DeferredOverlappedDelayMillis();
+
 // Convenience accessor for kernel memory
 inline memory::Memory* kernel_memory() {
   return kernel_state()->memory();
