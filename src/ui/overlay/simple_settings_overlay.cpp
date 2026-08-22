@@ -1121,7 +1121,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                 rex::cvar::Query<int32_t>(
                     "skate3_multiplayer_local_animation_rate"),
                 10, 60))
-          : 20.0f;
+          : 60.0f;
   multiplayer_interpolation_ms_ =
       HasCvar("skate3_multiplayer_local_interpolation_ms")
           ? float(std::clamp(
@@ -2242,8 +2242,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
           row.options = {
               "Auto",
               "Bandwidth Saver (30 / 10 Hz)",
-              "Balanced (60 / 20 Hz)",
-              "High Fidelity (90 / 30 Hz)",
+              "Balanced (60 / 60 Hz)",
+              "High Fidelity (90 / 60 Hz)",
               "Custom"};
           row.index = &multiplayer_quality_index_;
           switch (multiplayer_quality_index_) {
@@ -2266,7 +2266,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
               break;
             case 3:
               row.desc_extra =
-                  "90 Hz pose, 30 Hz animation, 35 ms buffer, 16 "
+                  "90 Hz pose, 60 Hz animation, 35 ms buffer, 16 "
                   "high-detail players within 120 m.";
               break;
             case 4:
@@ -2277,7 +2277,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
             case 2:
             default:
               row.desc_extra =
-                  "60 Hz pose, 20 Hz animation, 50 ms buffer, 12 "
+                  "60 Hz pose, 60 Hz animation, 50 ms buffer, 12 "
                   "high-detail players within 80 m. This matches the "
                   "visually verified multiplayer build.";
               break;
@@ -2352,7 +2352,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
               "Completed skeletal animation frames sent per second. This "
               "usually has the largest bandwidth impact.",
               "skate3_multiplayer_local_animation_rate",
-              &multiplayer_animation_rate_, 10.0f, 60.0f, 5.0f, 20.0f,
+              &multiplayer_animation_rate_, 10.0f, 60.0f, 5.0f, 60.0f,
               true);
           add_custom_slider(
               "Interpolation Buffer",
