@@ -17,6 +17,9 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
+#include <atomic>
+
+#include <rex/cvar.h>
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
 #include <rex/runtime.h>
@@ -34,9 +37,37 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 
 }  // namespace
 
+REXCVAR_DEFINE_BOOL(guest_fatal_invalid_call, false, "CPU",
+                    "Abort when guest code calls an invalid or unregistered function "
+                    "instead of logging it and returning");
+
+// A call through a function pointer the table cannot resolve. Aborting made
+// every such call fatal, which is the wrong trade at this stage of the port:
+// the target is usually null or garbage because something upstream handed the
+// guest bad state, and the call that reads it is rarely the one that matters.
+// The recompiled code can survive the return - it just sees whatever r3 already
+// held - so log it and keep going, and let the log say how often it happens.
+//
+// The same condition is already non-fatal everywhere it is detected before the
+// call rather than at it: FunctionDispatcher::Execute, XThread::Execute and
+// DeliverAPCs all log and decline. Set guest_fatal_invalid_call to abort here
+// instead, which is what you want when hunting the cause rather than playing.
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+  if (REXCVAR_GET(guest_fatal_invalid_call)) {
+    REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
+              ctx.last_indirect_target);
+  }
+  // Unbounded logging here would itself be the problem: a caller in a loop can
+  // hit this every frame, and each line is a synchronous write.
+  static std::atomic<uint64_t> s_count{0};
+  const uint64_t n = s_count.fetch_add(1, std::memory_order_relaxed);
+  if (n < 8 || (n & 0xFF) == 0) {
+    REXCPU_ERROR(
+        "Call to invalid or unregistered function at guest address 0x{:08X} "
+        "(occurrence {}, guest lr=0x{:08X}); returning to the caller instead of "
+        "aborting - guest state is already wrong at this point",
+        ctx.last_indirect_target, n + 1, uint32_t(ctx.lr));
+  }
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {

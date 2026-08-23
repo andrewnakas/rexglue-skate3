@@ -30,7 +30,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <string>
@@ -545,12 +547,19 @@ class NrDeviceVulkan : public nrhi::Device {
     } else {
       ring_mapping_ = static_cast<uint8_t*>(ring_result_info.pMappedData);
     }
+
+    InitPipelineCache();
   }
 
   ~NrDeviceVulkan() override {
     // Callers guarantee GPU idle; release everything immediately.
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
     const VkDevice device = vulkan_device_->device();
+    SavePipelineCache(/*force=*/true);
+    if (pipeline_cache_ != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipelineCache(device, pipeline_cache_, nullptr);
+      pipeline_cache_ = VK_NULL_HANDLE;
+    }
     FlushDissolvedViews();
     DrainRetired(~0ull);
     for (auto& entry : set0_sets_) {
@@ -1370,6 +1379,7 @@ class NrDeviceVulkan : public nrhi::Device {
 
   void EndFrame() {
     cmd_.EndFrame();
+    SavePipelineCache(/*force=*/false);
     // Render-thread CPU attribution for slow frames (throttled 8 per 5 s).
     const uint64_t total_us = prof_.Total();
     if (total_us >= 4000) {
@@ -1395,6 +1405,11 @@ class NrDeviceVulkan : public nrhi::Device {
       }
     }
   }
+
+  VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+  std::string pipeline_cache_path_;
+  std::atomic<bool> pipeline_cache_dirty_{false};
+  std::chrono::steady_clock::time_point pipeline_cache_saved_at_{};
 
   NrFrameProf prof_;
 
@@ -1799,18 +1814,30 @@ class NrDeviceVulkan : public nrhi::Device {
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
     const VkDevice device = vulkan_device_->device();
     for (int attempt = 0; attempt < 2; ++attempt) {
-      if (!descriptor_pools_.empty()) {
+      // Every pool, newest first - not just the newest one. Sets are freed
+      // individually (that is what FREE_DESCRIPTOR_SET_BIT is for), so a pool
+      // that filled once has capacity again as its sets retire. Only ever
+      // asking the newest pool stranded all of that: under view churn the
+      // newest pool fills, a fresh one is built, and the cycle repeats. Pool
+      // creation is not cheap on MoltenVK - 4096 sets and 16384 sampled images
+      // of argument-buffer storage - so those rebuilds were landing in the
+      // frame as tens of milliseconds of table_miss, and the dead pools were
+      // never reclaimed.
+      for (size_t i = descriptor_pools_.size(); i-- > 0;) {
         VkDescriptorSetAllocateInfo info = {};
         info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        info.descriptorPool = descriptor_pools_.back();
+        info.descriptorPool = descriptor_pools_[i];
         info.descriptorSetCount = 1;
         info.pSetLayouts = &layout;
         VkDescriptorSet set = VK_NULL_HANDLE;
         if (dfn.vkAllocateDescriptorSets(device, &info, &set) == VK_SUCCESS) {
           out->set = set;
-          out->pool = descriptor_pools_.back();
+          out->pool = descriptor_pools_[i];
           return true;
         }
+      }
+      if (attempt != 0) {
+        break;
       }
       // Grow: sets are freed individually on retirement, so pools need the
       // free-descriptor-set flag. Immutable-sampler bindings still consume
@@ -1833,6 +1860,8 @@ class NrDeviceVulkan : public nrhi::Device {
         return false;
       }
       descriptor_pools_.push_back(pool);
+      REXLOG_WARN("nrhi-vulkan: grew descriptor pools to {} (every existing pool was full)",
+                  descriptor_pools_.size());
     }
     REXLOG_ERROR("nrhi-vulkan: descriptor set allocation failed");
     return false;
@@ -1954,6 +1983,108 @@ class NrDeviceVulkan : public nrhi::Device {
       REXLOG_ERROR("nrhi-vulkan: white fallback view creation failed");
       white_view_ = VK_NULL_HANDLE;
     }
+  }
+
+  // Pipeline creation on MoltenVK means translating SPIR-V to MSL and handing
+  // it to the Metal compiler: measured here at 362-686 ms for a single shader,
+  // and the scene rebuilds a ~80-pipeline family whenever a variant flips.
+  // Vulkan's own cache is the supported way to keep that work between runs -
+  // MoltenVK serialises the compiled MSL into it - and nothing was creating
+  // one, so every launch recompiled everything from scratch.
+  void InitPipelineCache() {
+    const char* dir = nrhi::GetShaderBytecodeCacheDirectory();
+    if (dir != nullptr && *dir != '\0') {
+      std::error_code ec;
+      std::filesystem::create_directories(dir, ec);
+      pipeline_cache_path_ = (std::filesystem::path(dir) / "vk_pipeline_cache.bin").string();
+    }
+
+    std::vector<uint8_t> initial;
+    if (!pipeline_cache_path_.empty()) {
+      if (std::FILE* f = std::fopen(pipeline_cache_path_.c_str(), "rb")) {
+        std::fseek(f, 0, SEEK_END);
+        const long size = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (size > 0) {
+          initial.resize(size_t(size));
+          if (std::fread(initial.data(), 1, initial.size(), f) != initial.size()) {
+            initial.clear();
+          }
+        }
+        std::fclose(f);
+      }
+    }
+
+    VkPipelineCacheCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    // A cache written by another device or driver version is rejected by the
+    // header check rather than trusted, so feeding it back is safe.
+    info.initialDataSize = initial.size();
+    info.pInitialData = initial.empty() ? nullptr : initial.data();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
+    if (dfn.vkCreatePipelineCache(vulkan_device_->device(), &info, nullptr, &pipeline_cache_) !=
+        VK_SUCCESS) {
+      pipeline_cache_ = VK_NULL_HANDLE;
+      REXLOG_WARN("nrhi-vulkan: pipeline cache creation failed; shaders will compile every run");
+      return;
+    }
+    REXLOG_INFO("nrhi-vulkan: pipeline cache {} ({} bytes) from '{}'",
+                initial.empty() ? "created empty" : "loaded", initial.size(),
+                pipeline_cache_path_.empty() ? "<no cache dir>" : pipeline_cache_path_);
+  }
+
+  // iOS tears the process down with _Exit and the app is far more likely to be
+  // killed in the background than to shut down cleanly, so a save that only
+  // ran at destruction would essentially never run. Persist on a timer during
+  // play instead, and only when something was actually added.
+  void SavePipelineCache(bool force) {
+    if (pipeline_cache_ == VK_NULL_HANDLE || pipeline_cache_path_.empty()) {
+      return;
+    }
+    if (!pipeline_cache_dirty_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - pipeline_cache_saved_at_ < std::chrono::seconds(30)) {
+      return;
+    }
+    pipeline_cache_saved_at_ = now;
+
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
+    const VkDevice device = vulkan_device_->device();
+    size_t size = 0;
+    if (dfn.vkGetPipelineCacheData(device, pipeline_cache_, &size, nullptr) != VK_SUCCESS ||
+        size == 0) {
+      return;
+    }
+    std::vector<uint8_t> data(size);
+    if (dfn.vkGetPipelineCacheData(device, pipeline_cache_, &size, data.data()) != VK_SUCCESS) {
+      return;
+    }
+    data.resize(size);
+    pipeline_cache_dirty_.store(false, std::memory_order_relaxed);
+
+    // Write beside the target and rename: a cache truncated by a kill midway
+    // through the write would be rejected on load, throwing away every shader
+    // compiled so far.
+    const std::string tmp = pipeline_cache_path_ + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+      return;
+    }
+    const bool wrote = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    std::fclose(f);
+    std::error_code ec;
+    if (!wrote) {
+      std::filesystem::remove(tmp, ec);
+      return;
+    }
+    std::filesystem::rename(tmp, pipeline_cache_path_, ec);
+    if (ec) {
+      std::filesystem::remove(tmp, ec);
+      return;
+    }
+    REXLOG_INFO("nrhi-vulkan: pipeline cache saved ({} bytes)", data.size());
   }
 
   VkPipeline BuildPipeline(const NrPipelineVulkan& p, VkPrimitiveTopology topology) {
@@ -2084,8 +2215,11 @@ class NrDeviceVulkan : public nrhi::Device {
     info.renderPass = render_pass;
     info.subpass = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult result = dfn.vkCreateGraphicsPipelines(vulkan_device_->device(), VK_NULL_HANDLE, 1,
+    VkResult result = dfn.vkCreateGraphicsPipelines(vulkan_device_->device(), pipeline_cache_, 1,
                                                     &info, nullptr, &pipeline);
+    // MoltenVK stores the generated MSL in the cache, so this is what turns a
+    // second run's shader compilation into a file read.
+    pipeline_cache_dirty_.store(true, std::memory_order_relaxed);
     if (result != VK_SUCCESS) {
       REXLOG_ERROR("nrhi-vulkan: vkCreateGraphicsPipelines failed ({}, vs '{}' ps '{}')",
                    int32_t(result), p.vs_entry, p.ps_entry);
