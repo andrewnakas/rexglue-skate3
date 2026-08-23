@@ -64,6 +64,19 @@ std::vector<std::string> BuildIOSArguments() {
       // Mitigation for the WorldPresentation cross-thread use-after-free.
       "--skate3_instance_free_defer_ms=250",
 
+      // ---- Frame pacing ---------------------------------------------------
+      // Lock to 30. The automatic cap derives from the display, which on this
+      // phone means asking for ~56 fps - a target the device cannot hold, so
+      // frames land whenever they are ready and the result reads as judder
+      // even when the average looks respectable. A 30 Hz cap on a 60 Hz panel
+      // is an exact 2:1 cadence: every frame is shown for exactly two
+      // refreshes, which is what makes it look locked rather than merely fast.
+      // It also caps the work the guest asks for, which is the difference
+      // between coasting and running flat out into the memory pressure that
+      // has been killing long sessions.
+      "--skate3_guest_fps_cap=30",
+      "--skate3_guest_fps_cap_auto=false",
+
       // ---- Cache budgets --------------------------------------------------
       // These default to 1280 and 1024 MB, which is 2.3 GB of caches before
       // either LRU evicts anything. That is a desktop budget: on device the
@@ -185,14 +198,23 @@ int main(int argc, char** argv) {
   setenv("MVK_CONFIG_LOG_LEVEL", "1", 0);
   setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "0", 0);
 
+  // Left synchronous deliberately, having measured the alternative.
+  //
   // Encoding a VkCommandBuffer into a MTLCommandBuffer costs 13-16 ms a frame
-  // here, and by default MoltenVK does it inline in vkQueueSubmit - on the
-  // command-processor thread, which is the one thread that must keep feeding
-  // the emulated GPU. Asynchronous submits hand the encode to MoltenVK's own
-  // queue, where it overlaps the next frame's command building instead of
-  // standing in front of it. The GPU is idle at ~1.2 ms a frame; the cost this
-  // moves is entirely CPU.
-  setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+  // here and MoltenVK does it inline in vkQueueSubmit, on the thread that must
+  // keep feeding the emulated GPU - so moving it to MoltenVK's own queue looks
+  // like the obvious win. It is not: MoltenVK holds a device-level lock across
+  // the encode, so creating any resource on the render thread then blocks for
+  // as long as the encode takes. On device that turned a descriptor-set
+  // allocation, normally microseconds, into a 16 ms stall - one whole encode -
+  // landing at random inside frames. Average throughput improved slightly and
+  // frame-to-frame consistency, which is what a locked frame rate is made of,
+  // got much worse.
+  //
+  // Encode on the critical path is a known, even cost that fits the budget.
+  // Revisit if the resource creation that collides with it moves off the
+  // render thread.
+  setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "1", 0);
 
   // MoltenVK reports through stderr, which iOS simply discards for a GUI app,
   // so its diagnostics are invisible unless stderr is given somewhere to go.
