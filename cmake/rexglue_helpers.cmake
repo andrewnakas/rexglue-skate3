@@ -42,6 +42,18 @@ function(rexglue_apply_target_settings target_name)
         endif()
     endif()
 
+    # Apple arm64 got nothing at all here, so the recompiled guest code - which
+    # is the bulk of this binary and the bulk of the frame - was built for the
+    # baseline armv8.0-a that the iOS toolchain defaults to. The A15 in an
+    # iPhone 13 is armv8.5-a: it has LSE atomics, FEAT_LSE2 for unaligned
+    # atomicity, FP16 and dot product, and (the part that matters most for
+    # translated code, which is enormous and branchy) a scheduling model clang
+    # can actually target.
+    if(APPLE AND _rexglue_target_processor MATCHES "aarch64|arm64|ARM64")
+        target_compile_options(${target_name} PRIVATE
+            $<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=apple-a15>)
+    endif()
+
     if(NOT MSVC AND NOT APPLE)
         if(_rexglue_target_processor MATCHES "x86_64|AMD64")
             target_compile_options(${target_name} PRIVATE -msse4.1)
