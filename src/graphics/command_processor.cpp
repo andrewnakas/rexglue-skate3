@@ -38,10 +38,6 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
-#if REX_PLATFORM_MAC
-#include <pthread/qos.h>
-#endif
-
 REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 
 // WAIT_REG_MEM blocks the command processor until a memory location or
@@ -445,20 +441,18 @@ void CommandProcessor::ReportCpSummary() {
 }
 
 void CommandProcessor::WorkerThreadMain() {
-#if REX_PLATFORM_MAC
-  // Darwin schedules by quality of service, and nothing in this process ever
-  // declares one except the texture decode workers, which ask for UTILITY. So
-  // the only thing the scheduler had been told is which threads matter least,
-  // and this one - which interprets every PM4 packet and, on Metal, encodes
-  // the command buffer as well - was left indistinguishable from the rest.
+  // No quality-of-service declaration here, and this is deliberate.
   //
-  // Set on this thread, for this thread, by what it does. An earlier attempt
-  // derived the class from the priority number passed to set_priority instead,
-  // which reads a Win32-scale value on one path and a POSIX-scale value on
-  // another; it mapped ordinary guest threads to BACKGROUND and hung the app
-  // on load. Do not reintroduce that translation.
-  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
+  // Raising this thread to USER_INTERACTIVE is the obvious move - it is the
+  // frame's critical path - and it hung the game on the way into the map.
+  // The reason is that this thread does not merely work, it *spins*: the
+  // WAIT_REG_MEM poll below busy-waits on a fence the guest is supposed to
+  // clear. On a phone with two performance cores, promoting the spinner
+  // starves the guest thread that would publish the value, so a scheduling
+  // change meant to speed the frame up instead deepened the stall it was
+  // waiting on. Fix the fence first (see gpu_system_cmdbuf_writeback); a
+  // thread that blocks properly can be promoted safely, one that spins
+  // cannot.
 
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
