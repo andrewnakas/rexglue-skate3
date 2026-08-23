@@ -36,6 +36,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -46,6 +47,10 @@
 #include <rex/ui/vulkan/mem_alloc.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
+
+#if REX_PLATFORM_MAC
+#include <pthread/qos.h>
+#endif
 
 namespace rex::graphics::vulkan {
 namespace {
@@ -1449,6 +1454,9 @@ class NrDeviceVulkan : public nrhi::Device {
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::string pipeline_cache_path_;
   std::atomic<bool> pipeline_cache_dirty_{false};
+  // One background write at a time; a save that arrives while one is in
+  // flight leaves the cache dirty for the next interval instead of queueing.
+  std::atomic<bool> pipeline_cache_write_in_flight_{false};
   std::chrono::steady_clock::time_point pipeline_cache_saved_at_{};
 
   NrFrameProf prof_;
@@ -1766,10 +1774,14 @@ class NrDeviceVulkan : public nrhi::Device {
     for (uint32_t i = 0; i < count; ++i) {
       NrTextureViewVulkan* v = views[i];
       if (v == nullptr) continue;
-      auto& keys = view_tables_[v];
-      if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
-        keys.push_back(key);
-      }
+      // No duplicate check. This runs only on a cache miss, so the key is one
+      // table_sets_ did not hold - and FlushDissolvedViews erases a key from
+      // every view that names it at the same time it erases the set, so a key
+      // absent from table_sets_ is absent here too. The scan it replaces was
+      // linear in how many sets a view takes part in, comparing keys that are
+      // eight view pointers wide, and the popular views (the white fallback,
+      // a shared lightmap) are in nearly every set.
+      view_tables_[v].push_back(key);
     }
     return entry.set;
   }
@@ -2121,9 +2133,34 @@ class NrDeviceVulkan : public nrhi::Device {
     data.resize(size);
     pipeline_cache_dirty_.store(false, std::memory_order_relaxed);
 
-    // Write beside the target and rename: a cache truncated by a kill midway
-    // through the write would be rejected on load, throwing away every shader
-    // compiled so far.
+    // The blob is several megabytes and this is called from EndFrame, on the
+    // thread driving the emulated GPU. Writing it there bills the frame for a
+    // synchronous flash write, and because the call sits outside the frame
+    // profiler's buckets the cost did not even show up in the SLOW frame line.
+    // Hand the bytes to a writer and return.
+    if (force) {
+      WritePipelineCacheBlob(std::move(data));
+      return;
+    }
+    if (pipeline_cache_write_in_flight_.exchange(true)) {
+      // A previous save is still writing. Nothing is lost: the cache stays
+      // marked dirty below and the next interval picks it up.
+      pipeline_cache_dirty_.store(true, std::memory_order_relaxed);
+      return;
+    }
+    std::thread([this, data = std::move(data)]() mutable {
+#if REX_PLATFORM_MAC
+      pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+      WritePipelineCacheBlob(std::move(data));
+      pipeline_cache_write_in_flight_.store(false);
+    }).detach();
+  }
+
+  // Write beside the target and rename: a cache truncated by a kill midway
+  // through the write would be rejected on load, throwing away every shader
+  // compiled so far.
+  void WritePipelineCacheBlob(std::vector<uint8_t> data) {
     const std::string tmp = pipeline_cache_path_ + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (f == nullptr) {

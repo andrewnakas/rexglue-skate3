@@ -69,16 +69,18 @@ std::vector<std::string> BuildIOSArguments() {
       "--skate3_instance_free_defer_ms=250",
 
       // ---- Frame pacing ---------------------------------------------------
-      // Lock to 30. The automatic cap derives from the display, which on this
-      // phone means asking for ~56 fps - a target the device cannot hold, so
-      // frames land whenever they are ready and the result reads as judder
-      // even when the average looks respectable. A 30 Hz cap on a 60 Hz panel
-      // is an exact 2:1 cadence: every frame is shown for exactly two
-      // refreshes, which is what makes it look locked rather than merely fast.
-      // It also caps the work the guest asks for, which is the difference
-      // between coasting and running flat out into the memory pressure that
-      // has been killing long sessions.
-      "--skate3_guest_fps_cap=30",
+      // 60, matching the panel. This was 30, for a good reason at the time: a
+      // 30 Hz cap on a 60 Hz panel is an exact 2:1 cadence, every frame shown
+      // for exactly two refreshes, and that reads as locked where an unstable
+      // 40 reads as judder. But a cap is a ceiling, not a floor - it cannot
+      // make a frame arrive sooner, and with the frame cost now being attacked
+      // directly the 30 was the only thing standing between the game and the
+      // refresh rate.
+      //
+      // If this needs to go back to 30, note that it has to happen here: an
+      // argument set in this list beats settings.toml, so the file cannot
+      // override it.
+      "--skate3_guest_fps_cap=60",
       "--skate3_guest_fps_cap_auto=false",
 
       // ---- Cache budgets --------------------------------------------------
