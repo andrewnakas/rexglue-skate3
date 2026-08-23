@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -70,6 +71,32 @@ REXCVAR_DEFINE_BOOL(gpu_wait_reg_mem_publish_on_abandon, true, "GPU",
                     "When a WAIT_REG_MEM poll on guest memory is abandoned, write the value "
                     "the guest is waiting for, so the next poll of that fence is satisfied "
                     "instead of stalling for another full timeout");
+
+// The guest registers a system command buffer identifier address with
+// VdSetSystemCommandBufferGpuIdentifierAddress and expects the GPU to publish
+// progress into it. That entry point was an empty stub, so the location never
+// changed - and the address Skate 3 then parks a WAIT_REG_MEM poll on lives in
+// that same region.
+//
+// Off by default deliberately. Publishing a value the guest did not actually
+// produce trades a visible stall for invisible corruption, so confirm the
+// correlation first: the log reports the registered address once at
+// registration, and reports the first abandoned poll that falls inside it.
+// Only then is it worth turning this on - and it can be turned on from
+// settings.toml, without a rebuild, because the iOS argument list does not
+// set it.
+REXCVAR_DEFINE_BOOL(gpu_system_cmdbuf_writeback, false, "GPU",
+                    "Publish command buffer progress into the address the guest registered "
+                    "with VdSetSystemCommandBufferGpuIdentifierAddress. See the correlation "
+                    "reported in the log before enabling this.");
+
+// The ring read pointer told the guest where the command processor had got to
+// only once per batch, so while the processor was parked on a fence the guest
+// saw no progress at all for the whole of it. CP_RB_CNTL carries the update
+// frequency the guest asked for; it was computed and then never used.
+REXCVAR_DEFINE_BOOL(gpu_rptr_writeback_mid_batch, true, "GPU",
+                    "Write the ring read pointer back at the frequency the guest requested "
+                    "rather than once per batch.");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -871,6 +898,14 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+  // The guest asked, via CP_RB_CNTL, to be told where the read pointer had got
+  // to every so many indices. It was only ever told once the whole batch had
+  // finished, so a batch that parks on a fence leaves the guest watching a
+  // frozen pointer for the entire stall - and guest code waiting on that
+  // progress is exactly what the fence is waiting for.
+  const bool mid_batch_rptr = read_ptr_writeback_ptr_ && read_ptr_update_freq_ &&
+                              REXCVAR_GET(gpu_rptr_writeback_mid_batch);
+  uint32_t last_written_index = read_index;
   do {
     if (!ExecutePacket(&reader)) {
       // This probably should be fatal - but we're going to continue anyways.
@@ -878,9 +913,29 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
       assert_always();
       break;
     }
+    if (mid_batch_rptr) {
+      const uint32_t current_index = uint32_t(reader.read_offset() / sizeof(uint32_t));
+      const uint32_t advanced = (current_index - last_written_index) &
+                                (uint32_t(reader.capacity() / sizeof(uint32_t)) - 1);
+      if (advanced >= read_ptr_update_freq_) {
+        memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                         current_index);
+        last_written_index = current_index;
+      }
+    }
   } while (reader.read_count());
 
   OnPrimaryBufferEnd();
+
+  // Publish command buffer progress where the guest asked for it. The value is
+  // the ring index the processor has reached, which is what "how far has the
+  // GPU got" means here; the guest's fences compare for equality against a
+  // value it chose, so this only helps once the correlation above is confirmed
+  // - hence the cvar, and hence off by default.
+  if (system_cmdbuf_gpu_id_ptr_ && REXCVAR_GET(gpu_system_cmdbuf_writeback)) {
+    memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(system_cmdbuf_gpu_id_ptr_),
+                                     write_index);
+  }
 
   trace_writer_.WritePrimaryBufferEnd();
 
@@ -1409,8 +1464,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   do {
     uint32_t value = 0;
     if (is_memory) {
-      value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      // Acquire, and through an atomic reference: this is a spin loop reading
+      // memory another thread publishes into, and a plain load gives the
+      // compiler every right to hoist it out of the loop and the CPU no reason
+      // to observe the other thread's store. SyncMemory() only ever ran on the
+      // sleeping branch below, so the busy-wait branch had no barrier at all.
+      value = std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(
+                                            memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3))))
+                  .load(std::memory_order_acquire);
       trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr & ~uint32_t(0x3)), sizeof(uint32_t));
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
@@ -1480,6 +1541,25 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // something to the guest, so carry them across untouched.
           const uint32_t published = (value & ~mask) | (ref & mask);
           *slot = xenos::GpuSwap(published, endian);
+        }
+        // Say whether this fence lives in the region the guest handed to
+        // VdSetSystemCommandBufferGpuIdentifierAddress. That entry point was a
+        // stub, so if the answer is yes, the reason this poll never clears is
+        // that nothing has ever written there - which is a fix, not a
+        // mitigation. Reported once; the address alone is the finding.
+        static bool s_correlated = false;
+        if (!s_correlated && is_memory && system_cmdbuf_gpu_id_ptr_) {
+          const uint32_t id_phys = system_cmdbuf_gpu_id_ptr_ & 0x1FFFFFFF;
+          const uint32_t poll_phys = poll_reg_addr & 0x1FFFFFFF;
+          const uint32_t delta = poll_phys > id_phys ? poll_phys - id_phys : id_phys - poll_phys;
+          if (delta <= 0x1000) {
+            s_correlated = true;
+            REXLOG_WARN(
+                "WAIT_REG_MEM: the abandoned poll at {:08X} is {} bytes from the system "
+                "command buffer identifier address {:08X} registered by the guest. Nothing "
+                "writes there; set gpu_system_cmdbuf_writeback=true to publish it.",
+                poll_reg_addr, delta, system_cmdbuf_gpu_id_ptr_);
+          }
         }
         const uint64_t n = s_abandon_count++;
         if (n < 8 || (n & 0xFF) == 0) {
@@ -1666,9 +1746,30 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
   if (count == 1) {
     // Just an event flag? Where does this write?
+  } else if (count == 3) {
+    // Write to an address. Same payload as EVENT_WRITE_SHD: the address (with
+    // the endian mode in its low bits) and the value, with bit 31 of the
+    // initiator selecting the GPU counter instead. This was an assert and a
+    // skip, so the write the guest asked for never landed and anything waiting
+    // on it - a WAIT_REG_MEM fence, typically - waited forever.
+    uint32_t address = reader->ReadAndSwap<uint32_t>();
+    uint32_t value = reader->ReadAndSwap<uint32_t>();
+    uint32_t data_value = ((initiator >> 31) & 0x1) ? counter_ : value;
+    auto endianness = static_cast<xenos::Endian>(address & 0x3);
+    address &= ~0x3;
+    data_value = GpuSwap(data_value, endianness);
+    memory::store(memory_->TranslatePhysical(address), data_value);
+    trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   } else {
-    // Write to an address.
-    assert_always();
+    // Some other payload shape. Skipping it is what this always did; say so
+    // once rather than asserting, so an unexpected packet is diagnosable
+    // instead of fatal.
+    static bool s_reported = false;
+    if (!s_reported) {
+      s_reported = true;
+      REXGPU_WARN("EVENT_WRITE with unhandled count {} (initiator {:08X}); skipping payload",
+                  count, initiator);
+    }
     reader->AdvanceRead((count - 1) * sizeof(uint32_t));
   }
   return true;
