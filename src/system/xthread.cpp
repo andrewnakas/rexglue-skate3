@@ -279,7 +279,25 @@ bool XThread::AllocateStack(uint32_t size) {
   auto alignment = heap->page_size();
   auto padding = heap->page_size() * 2;  // Guard page size * 2
   size = rex::round_up(size, alignment);
-  auto actual_size = size + padding;
+
+  // One page of readable, writable memory sits between the top of the stack
+  // and the upper guard page.
+  //
+  // A thread starts with r1 exactly at stack_base, which is the first byte the
+  // guard page covers, so the outermost guest frame has no caller above it -
+  // and the PowerPC frame layout puts things there: the link and parameter
+  // save areas a callee writes belong to its caller's frame, and a buffer at
+  // the top of the outermost frame lands on the same address. On the console
+  // the kernel hands the thread a stack whose top is real memory, so this is
+  // ordinary code doing an ordinary thing.
+  //
+  // Here it faulted. Skate 3's render_thread reads and writes 0x706A0000 - its
+  // own stack_base to the byte - from several call paths, and each one was an
+  // unhandled access violation that ended the run. The lower guard page still
+  // catches the overflow that matters; this one only ever caught the caller
+  // frame the console would have provided.
+  auto stack_top_reserve = heap->page_size();
+  auto actual_size = size + padding + stack_top_reserve;
 
   uint32_t address = 0;
   if (!heap->AllocRange(kStackAddressRangeBegin, kStackAddressRangeEnd, actual_size, alignment,
@@ -297,9 +315,11 @@ bool XThread::AllocateStack(uint32_t size) {
   // Initialize the stack with junk
   memory()->Fill(stack_alloc_base_, actual_size, 0xBE);
 
-  // Setup the guard pages
+  // Setup the guard pages. The upper one moves above the reserve, which stays
+  // readable and writable as the caller frame the outermost guest function
+  // expects to find there.
   heap->Protect(stack_alloc_base_, padding / 2, memory::kMemoryProtectNoAccess);
-  heap->Protect(stack_base_, padding / 2, memory::kMemoryProtectNoAccess);
+  heap->Protect(stack_base_ + stack_top_reserve, padding / 2, memory::kMemoryProtectNoAccess);
 
   return true;
 }
