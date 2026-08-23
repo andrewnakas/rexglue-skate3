@@ -13,6 +13,22 @@
 #include <rex/ui/windowed_app_context_sdl.h>
 
 #include <SDL3/SDL.h>
+
+#if REX_PLATFORM_IOS
+REXCVAR_DEFINE_BOOL(vulkan_mvk_synchronous_queue_submits, true, "GPU/Vulkan",
+                    "Encode Metal command buffers on the thread that submits them. On means the "
+                    "encode is a known cost on the critical path; off moves it to MoltenVK's own "
+                    "queue thread, which also moves the blocking wait for a drawable off the "
+                    "submitting thread - see the note at the setenv call.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(vulkan_mvk_log_level, 1, "GPU/Vulkan",
+                     "MoltenVK log level: 0 none, 1 errors, 2 warnings, 3 info. Above 1 is "
+                     "expensive - every line is a synchronous write to flash on whichever "
+                     "thread logged it.")
+    .range(0, 4)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 #if REX_PLATFORM_ANDROID
 // Renames main() to SDL_main, which is what SDLActivity's native loader calls.
 #include <SDL3/SDL_main.h>
@@ -276,7 +292,6 @@ int main(int argc, char** argv) {
   // block every 30 frames - twice a second - through a line-buffered stderr
   // pointed at a file on flash, so each of those lines is its own synchronous
   // write on the render path. Errors still come through at level 1.
-  setenv("MVK_CONFIG_LOG_LEVEL", "1", 0);
   setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "0", 0);
 
   // Left synchronous deliberately, having measured the alternative.
@@ -295,7 +310,22 @@ int main(int argc, char** argv) {
   // Encode on the critical path is a known, even cost that fits the budget.
   // Revisit if the resource creation that collides with it moves off the
   // render thread.
-  setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "1", 0);
+  //
+  // There is now a reason to revisit it that has nothing to do with throughput.
+  // Encoding on the submitting thread means beginning a render pass on the
+  // swapchain image calls getCAMetalDrawable() there, and when every drawable
+  // is in flight that blocks - about a second, and then fails. Caught in the
+  // act by the hang watchdog, main thread parked in __semwait_signal under
+  // MVKPresentableSwapchainImage::getCAMetalDrawable() inside MVKQueue::submit,
+  // and the run ended "Failed to submit a Vulkan command buffer" followed by
+  // the device reported lost. It is not a lost device; it is a wait that
+  // expired, on the one thread that must not wait.
+  //
+  // Both of these are set below rather than here, so that they can be changed
+  // from Documents/user/ios_args.txt without a rebuild - the answer to which
+  // setting is right is measured on device, and the measurement costs half an
+  // hour if it needs a build. MoltenVK reads its configuration when the
+  // instance is created, which is long after the arguments are parsed.
 
   // MoltenVK reports through stderr, which iOS simply discards for a GUI app,
   // so its diagnostics are invisible unless stderr is given somewhere to go.
@@ -325,6 +355,15 @@ int main(int argc, char** argv) {
 #endif
 
   auto remaining = rex::cvar::Init(argc, argv);
+
+#if REX_PLATFORM_IOS
+  // MoltenVK is configured through the environment and reads it when the
+  // instance is created, which has not happened yet. Setting these here rather
+  // than before the arguments are parsed is what lets ios_args.txt reach them.
+  setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS",
+         REXCVAR_GET(vulkan_mvk_synchronous_queue_submits) ? "1" : "0", 1);
+  setenv("MVK_CONFIG_LOG_LEVEL", std::to_string(REXCVAR_GET(vulkan_mvk_log_level)).c_str(), 1);
+#endif
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
 
