@@ -1305,7 +1305,9 @@ class NrDeviceVulkan : public nrhi::Device {
       DrainRetired(cp_->GetCompletedSubmission(), 256);
     }
     ++frame_index_;
-    if ((frame_index_ % 600) == 0) {
+    // Every 600 frames is a long time when a frame can take half a second -
+    // the window that mattered most on device produced two samples.
+    if ((frame_index_ % 180) == 0) {
       // Periodic VRAM budget attribution (bimodal-FPS diagnosis): log every
       // heap's VMA usage vs the driver-reported budget, flagging device-local.
       VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};

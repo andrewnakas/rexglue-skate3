@@ -64,6 +64,18 @@ std::vector<std::string> BuildIOSArguments() {
       // Mitigation for the WorldPresentation cross-thread use-after-free.
       "--skate3_instance_free_defer_ms=250",
 
+      // ---- Cache budgets --------------------------------------------------
+      // These default to 1280 and 1024 MB, which is 2.3 GB of caches before
+      // either LRU evicts anything. That is a desktop budget: on device the
+      // measured growth was ~18 MB a second with neither LRU ever starting,
+      // reaching 1382 MB of the 2730 MB heap in about half a minute and dying
+      // shortly after - and iOS kills the app well before the heap budget is
+      // the binding constraint. Textures cost more here than the numbers
+      // suggest, too, since Metal exposes no BC formats and every DXT surface
+      // is expanded to RGBA8 on upload (8x for DXT1).
+      "--skate3_native_render_scene_tex_store_mb=512",
+      "--skate3_native_render_scene_mesh_store_mb=384",
+
       // ---- Memory budget -------------------------------------------------
       // A 4 GB iPhone allows roughly 2 GB resident, near 3 GB with the
       // increased-memory-limit entitlement, and jetsam kills rather than
