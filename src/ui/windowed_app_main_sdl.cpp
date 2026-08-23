@@ -69,18 +69,19 @@ std::vector<std::string> BuildIOSArguments() {
       "--skate3_instance_free_defer_ms=250",
 
       // ---- Frame pacing ---------------------------------------------------
-      // 60, matching the panel. This was 30, for a good reason at the time: a
-      // 30 Hz cap on a 60 Hz panel is an exact 2:1 cadence, every frame shown
-      // for exactly two refreshes, and that reads as locked where an unstable
-      // 40 reads as judder. But a cap is a ceiling, not a floor - it cannot
-      // make a frame arrive sooner, and with the frame cost now being attacked
-      // directly the 30 was the only thing standing between the game and the
-      // refresh rate.
+      // 60, matching the panel. This was 30, for a good reason at the time: an
+      // exact 2:1 cadence on a 60 Hz panel reads as locked where an unstable 40
+      // reads as judder, and the device could not hold more anyway.
+      //
+      // It can now. With the system command buffer fence acknowledged rather
+      // than timed out, the median frame measured 33.3ms - which is the cap to
+      // three significant figures, not a coincidence. The frame was no longer
+      // the constraint; this number was.
       //
       // If this needs to go back to 30, note that it has to happen here: an
       // argument set in this list beats settings.toml, so the file cannot
       // override it.
-      "--skate3_guest_fps_cap=30",
+      "--skate3_guest_fps_cap=60",
       "--skate3_guest_fps_cap_auto=false",
 
       // ---- Cache budgets --------------------------------------------------
@@ -119,9 +120,12 @@ std::vector<std::string> BuildIOSArguments() {
       "--skate3_native_render_scene_bloom=false",
       "--skate3_native_render_scene_shafts=false",
       // Draw and LOD distance drive how much of the world is resident at
-      // once, which is guest-heap pressure rather than GPU memory.
-      "--skate3_draw_distance_scale=1.0",
-      "--skate3_lod_distance_scale=1.0",
+      // once, which is guest-heap pressure rather than GPU memory. Deliberately
+      // NOT set here any more: these were pinned to 1.0, which beats
+      // settings.toml, so a player who had asked for 0.75 was silently given
+      // the full distance - and the extra residency shows up as texture store
+      // above its budget, continuous eviction, and multi-millisecond frames
+      // spent destroying what was evicted. Let the file decide.
 
       // ---- Command processor stalls --------------------------------------
       // Skate 3 parks the command processor on a WAIT_REG_MEM poll that never

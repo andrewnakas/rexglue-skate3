@@ -81,10 +81,11 @@ REXCVAR_DEFINE_BOOL(gpu_wait_reg_mem_publish_on_abandon, true, "GPU",
 // Only then is it worth turning this on - and it can be turned on from
 // settings.toml, without a rebuild, because the iOS argument list does not
 // set it.
-REXCVAR_DEFINE_BOOL(gpu_system_cmdbuf_writeback, false, "GPU",
-                    "Publish command buffer progress into the address the guest registered "
-                    "with VdSetSystemCommandBufferGpuIdentifierAddress. See the correlation "
-                    "reported in the log before enabling this.");
+REXCVAR_DEFINE_BOOL(gpu_system_cmdbuf_writeback, true, "GPU",
+                    "Satisfy a WAIT_REG_MEM on the system command buffer busy flag at the "
+                    "wait itself, rather than letting it time out. Measured on device: this "
+                    "was one abandoned wait per frame at 20ms each, 40% of the frame; with "
+                    "it on, zero abandons and 50ms/frame became 33ms.");
 
 // The ring read pointer told the guest where the command processor had got to
 // only once per batch, so while the processor was parked on a fence the guest
