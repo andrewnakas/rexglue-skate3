@@ -36,6 +36,16 @@ REXCVAR_DEFINE_STRING(log_level, "info", "Log",
                       "Global log level: trace, debug, info, warn, error, critical, off")
     .allowed({"trace", "debug", "info", "warn", "error", "critical", "off"});
 
+// Separate from log_level: what gets written, versus what forces the write to
+// reach the disk immediately. A flush is synchronous on whichever thread logged,
+// so on a platform whose log lives on flash, flushing per info line bills the
+// render thread for the storage. Lower it and let log_flush_interval carry
+// durability instead.
+REXCVAR_DEFINE_STRING(log_flush_level, "info", "Log",
+                      "Messages at or above this level flush immediately: trace, debug, "
+                      "info, warn, error, critical, off")
+    .allowed({"trace", "debug", "info", "warn", "error", "critical", "off"});
+
 REXCVAR_DEFINE_STRING(log_file, "", "Log", "Log file path (empty = auto sequential naming)");
 
 REXCVAR_DEFINE_BOOL(log_verbose, false, "Log", "Enable verbose logging (sets level to trace)")
@@ -549,6 +559,10 @@ LogConfig BuildLogConfig(const char* log_file, const std::string& cli_level,
   if (!cli_level.empty()) {
     if (auto level = ParseLogLevel(cli_level))
       config.default_level = *level;
+  }
+
+  if (auto level = ParseLogLevel(REXCVAR_GET(log_flush_level))) {
+    config.flush_level = *level;
   }
 
   // Per-category CLI levels (string-keyed)

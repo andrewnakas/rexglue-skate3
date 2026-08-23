@@ -43,14 +43,22 @@ std::vector<std::string> BuildIOSArguments() {
       "--user_data_root=" + (documents / "user").string(),
       "--log_file=" + (documents / "skate3.log").string(),
       "--log_flush_interval=1",
+      // Every flush is a synchronous write to flash on whichever thread logged,
+      // and the command-processor and render threads log routinely. Flush on
+      // trouble; the one-second interval above carries everything else, so a
+      // crash still loses at most a second of history.
+      "--log_flush_level=warn",
       // The emulated Xenos backend needs geometry shaders, which Metal (and so
       // MoltenVK) does not expose; the Skate-3 native renderer replaces it.
       "--skate3_native_render_scene=true",
       "--vulkan_require_geometry_shader=false",
       "--vulkan_require_fill_mode_non_solid=false",
-      // Routes MoltenVK's own reports through the debug messenger into the
-      // normal log, where they sit next to the frame they belong to.
-      "--vulkan_log_debug_messages=true",
+      // Left off deliberately. The messenger mirrors MoltenVK's own reports
+      // into the log at whatever severity the gpu category is set to, and the
+      // logger flushes to flash inline on the thread that logged - so on a
+      // chatty frame this bills the render path for a synchronous write per
+      // message. Turn it back on when debugging the renderer, not to play.
+      "--vulkan_log_debug_messages=false",
       // The disc is staged into Documents, so never run the install wizard.
       "--skate3_auto_install_dlc=false",
       // Mitigation for the WorldPresentation cross-thread use-after-free.
@@ -99,6 +107,26 @@ std::vector<std::string> BuildIOSArguments() {
       // clears in microseconds, so 20 ms is still thousands of polls of grace
       // while cutting the cost of the chronic case by 25x.
       "--gpu_wait_reg_mem_timeout_ms=20",
+
+      // ---- Vblank cadence ------------------------------------------------
+      // With vsync off the vblank worker does not idle at the display rate, it
+      // free-runs at 1000 Hz, and every one of those ticks runs the guest's
+      // graphics interrupt handler while holding the global lock. That is ~940
+      // dispatches a second of pure contention against the command processor
+      // and every guest thread, for a phone that cannot present faster than 60.
+      //
+      // It also decides how a WAIT_REG_MEM poll waits: with vsync off the poll
+      // takes the busy-spin branch and burns a core, with it on the poll sleeps.
+      // This lived in settings.toml, where a rewrite of the file could silently
+      // drop it - and a command-line argument beats the file anyway.
+      "--vsync=true",
+
+      // MoltenVK advertises IMMEDIATE, but a CAMetalLayer on iOS has no
+      // equivalent of displaySyncEnabled, so what actually happens is FIFO
+      // while the presenter believes it is unsynchronised and paces against a
+      // tear that never comes. Ask for what the platform really does.
+      "--vulkan_allow_present_mode_immediate=false",
+      "--vulkan_allow_present_mode_mailbox=false",
   };
 }
 
@@ -145,6 +173,15 @@ int main(int argc, char** argv) {
   setenv("MVK_CONFIG_LOG_LEVEL", "1", 0);
   setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "0", 0);
 
+  // Encoding a VkCommandBuffer into a MTLCommandBuffer costs 13-16 ms a frame
+  // here, and by default MoltenVK does it inline in vkQueueSubmit - on the
+  // command-processor thread, which is the one thread that must keep feeding
+  // the emulated GPU. Asynchronous submits hand the encode to MoltenVK's own
+  // queue, where it overlaps the next frame's command building instead of
+  // standing in front of it. The GPU is idle at ~1.2 ms a frame; the cost this
+  // moves is entirely CPU.
+  setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+
   // MoltenVK reports through stderr, which iOS simply discards for a GUI app,
   // so its diagnostics are invisible unless stderr is given somewhere to go.
   // The crash reporter writes here too, which is why this happens before any
@@ -187,6 +224,13 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "Failed to initialize SDL video: %s\n", SDL_GetError());
     return EXIT_FAILURE;
   }
+
+#if REX_PLATFORM_IOS
+  // A controller-driven game sends no touch events, so iOS sees an idle screen
+  // and dims, locks, and backgrounds the app out from under a live run. SDL
+  // routes this to UIApplication.idleTimerDisabled.
+  SDL_DisableScreenSaver();
+#endif
 
   int result = EXIT_FAILURE;
   {
