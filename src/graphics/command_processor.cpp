@@ -940,24 +940,6 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
   OnPrimaryBufferEnd();
 
-  // Acknowledge the system command buffer.
-  //
-  // Measured on device: the guest registers identifier address 0xFFCA3008 and
-  // then parks a WAIT_REG_MEM on 0x1FCA3004 - the word four bytes below it -
-  // polling for equality with zero, while the word sits at one. That is a busy
-  // flag: the guest writes 1 when it hands the buffer over and waits for the
-  // GPU to write 0 when it has consumed it. Nothing ever did, because the
-  // entry point that registers the address was a stub, so the wait could only
-  // ever end by being abandoned.
-  //
-  // The offset is what the device reported rather than something documented,
-  // so it is a cvar, and this is off until it has been shown to help.
-  if (system_cmdbuf_gpu_id_ptr_ && REXCVAR_GET(gpu_system_cmdbuf_writeback)) {
-    const uint32_t busy_ptr =
-        system_cmdbuf_gpu_id_ptr_ + uint32_t(REXCVAR_GET(gpu_system_cmdbuf_busy_offset));
-    memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(busy_ptr), 0u);
-  }
-
   trace_writer_.WritePrimaryBufferEnd();
 
   return write_index;
@@ -1479,6 +1461,52 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   if (timeout_ms > 0 && poll_reg_addr == s_hopeless_addr &&
       s_hopeless_streak >= kHopelessStreak) {
     timeout_ms = 1;
+  }
+
+  // The system command buffer fence, satisfied immediately.
+  //
+  // The guest writes 1 to a busy flag, hands over a system command buffer, and
+  // waits for the GPU to write 0 when it has consumed it. On hardware a
+  // separate engine does that. Here there is no separate engine: the wait
+  // packet is inside the ring buffer this very thread is executing, so nothing
+  // can clear the flag while the thread is parked on it, and the wait can only
+  // ever end by timing out. Measured on device: one abandon per frame, twenty
+  // milliseconds each, forty per cent of the frame.
+  //
+  // Writing the acknowledgement at the end of the batch does not help, for the
+  // same reason - the batch cannot finish while it is parked mid-way through.
+  // The acknowledgement has to happen here, at the wait itself: by the time the
+  // guest is asking, the buffer it handed over has been consumed, because this
+  // thread consumed it on the way to reading this packet.
+  //
+  // Deliberately narrow: memory waits, equality only, and only for an address
+  // inside the region the guest registered for exactly this purpose.
+  if (is_memory && (wait_info & 0x7) == 0x3 && system_cmdbuf_gpu_id_ptr_ &&
+      REXCVAR_GET(gpu_system_cmdbuf_writeback)) {
+    const uint32_t id_phys = system_cmdbuf_gpu_id_ptr_ & 0x1FFFFFFF;
+    const uint32_t poll_phys = poll_reg_addr & 0x1FFFFFFF;
+    const uint32_t delta = poll_phys > id_phys ? poll_phys - id_phys : id_phys - poll_phys;
+    if (delta <= 0x40) {
+      auto* slot =
+          reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      const uint32_t current = xenos::GpuSwap(
+          std::atomic_ref<uint32_t>(*slot).load(std::memory_order_acquire),
+          static_cast<xenos::Endian>(poll_reg_addr & 0x3));
+      if ((current & mask) != ref) {
+        const uint32_t published = (current & ~mask) | (ref & mask);
+        std::atomic_ref<uint32_t>(*slot).store(
+            xenos::GpuSwap(published, static_cast<xenos::Endian>(poll_reg_addr & 0x3)),
+            std::memory_order_release);
+        static uint64_t s_acked = 0;
+        const uint64_t n = s_acked++;
+        if (n < 4 || (n & 0x3FF) == 0) {
+          REXLOG_INFO(
+              "WAIT_REG_MEM: acknowledged the system command buffer at {:08X} (occurrence {})",
+              poll_reg_addr, n + 1);
+        }
+      }
+      return true;
+    }
   }
 
   bool matched = false;
