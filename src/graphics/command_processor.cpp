@@ -94,7 +94,20 @@ REXCVAR_DEFINE_BOOL(gpu_system_cmdbuf_writeback, false, "GPU",
 // only once per batch, so while the processor was parked on a fence the guest
 // saw no progress at all for the whole of it. CP_RB_CNTL carries the update
 // frequency the guest asked for; it was computed and then never used.
-REXCVAR_DEFINE_BOOL(gpu_rptr_writeback_mid_batch, true, "GPU",
+// EVENT_WRITE naming an address was an assert and a skip, so the write the
+// guest asked for never landed. Implementing it is spec-correct, but it makes
+// the emulator write to guest memory it previously left alone, which is a real
+// behaviour change on a title that was tuned around the old behaviour - so it
+// is switchable, and off until it has been shown to help rather than hang.
+REXCVAR_DEFINE_INT32(gpu_system_cmdbuf_busy_offset, -4, "GPU",
+                     "Byte offset from the registered system command buffer identifier "
+                     "address to the word the guest polls for zero. Measured as -4.");
+
+REXCVAR_DEFINE_BOOL(gpu_event_write_payload, false, "GPU",
+                    "Honour the address/value payload of PM4 EVENT_WRITE instead of "
+                    "skipping it.");
+
+REXCVAR_DEFINE_BOOL(gpu_rptr_writeback_mid_batch, false, "GPU",
                     "Write the ring read pointer back at the frequency the guest requested "
                     "rather than once per batch.");
 
@@ -927,14 +940,22 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
   OnPrimaryBufferEnd();
 
-  // Publish command buffer progress where the guest asked for it. The value is
-  // the ring index the processor has reached, which is what "how far has the
-  // GPU got" means here; the guest's fences compare for equality against a
-  // value it chose, so this only helps once the correlation above is confirmed
-  // - hence the cvar, and hence off by default.
+  // Acknowledge the system command buffer.
+  //
+  // Measured on device: the guest registers identifier address 0xFFCA3008 and
+  // then parks a WAIT_REG_MEM on 0x1FCA3004 - the word four bytes below it -
+  // polling for equality with zero, while the word sits at one. That is a busy
+  // flag: the guest writes 1 when it hands the buffer over and waits for the
+  // GPU to write 0 when it has consumed it. Nothing ever did, because the
+  // entry point that registers the address was a stub, so the wait could only
+  // ever end by being abandoned.
+  //
+  // The offset is what the device reported rather than something documented,
+  // so it is a cvar, and this is off until it has been shown to help.
   if (system_cmdbuf_gpu_id_ptr_ && REXCVAR_GET(gpu_system_cmdbuf_writeback)) {
-    memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(system_cmdbuf_gpu_id_ptr_),
-                                     write_index);
+    const uint32_t busy_ptr =
+        system_cmdbuf_gpu_id_ptr_ + uint32_t(REXCVAR_GET(gpu_system_cmdbuf_busy_offset));
+    memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(busy_ptr), 0u);
   }
 
   trace_writer_.WritePrimaryBufferEnd();
@@ -1746,7 +1767,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
   if (count == 1) {
     // Just an event flag? Where does this write?
-  } else if (count == 3) {
+  } else if (count == 3 && REXCVAR_GET(gpu_event_write_payload)) {
     // Write to an address. Same payload as EVENT_WRITE_SHD: the address (with
     // the endian mode in its low bits) and the value, with bit 31 of the
     // initiator selecting the GPU counter instead. This was an assert and a
