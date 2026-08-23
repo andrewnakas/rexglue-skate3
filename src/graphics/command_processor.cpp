@@ -38,6 +38,10 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#if REX_PLATFORM_MAC
+#include <pthread/qos.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 
 // WAIT_REG_MEM blocks the command processor until a memory location or
@@ -441,6 +445,21 @@ void CommandProcessor::ReportCpSummary() {
 }
 
 void CommandProcessor::WorkerThreadMain() {
+#if REX_PLATFORM_MAC
+  // Darwin schedules by quality of service, and nothing in this process ever
+  // declares one except the texture decode workers, which ask for UTILITY. So
+  // the only thing the scheduler had been told is which threads matter least,
+  // and this one - which interprets every PM4 packet and, on Metal, encodes
+  // the command buffer as well - was left indistinguishable from the rest.
+  //
+  // Set on this thread, for this thread, by what it does. An earlier attempt
+  // derived the class from the priority number passed to set_priority instead,
+  // which reads a Win32-scale value on one path and a POSIX-scale value on
+  // another; it mapped ordinary guest threads to BACKGROUND and hung the app
+  // on load. Do not reintroduce that translation.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
