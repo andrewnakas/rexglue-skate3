@@ -199,6 +199,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (get_physical_device_properties2_supported) {
     // #238.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_memory_budget)
+    // #180. Lets a buffer be backed by memory the application already owns,
+    // which is how the shared memory emulation avoids keeping a second copy of
+    // guest physical memory on a unified-memory device.
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_external_memory_host)
   }
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     // #414.

@@ -27,6 +27,20 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vulkan_alias_guest_shared_memory, true, "GPU/Vulkan",
+                    "Back the shared memory buffer with the guest's own physical memory pages "
+                    "instead of a separate device allocation, where the driver supports importing "
+                    "host memory. Saves a full copy of guest RAM and removes the per-frame upload "
+                    "of dirty ranges. Falls back automatically when unsupported.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// VK_NO_PROTOTYPES is set for the whole build, and on iOS MoltenVK is linked
+// into this library statically, so the import entry point is an ordinary symbol
+// rather than something to fetch through the device function table.
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkGetMemoryHostPointerPropertiesEXT(
+    VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType, const void* pHostPointer,
+    VkMemoryHostPointerPropertiesEXT* pMemoryHostPointerProperties);
+
 namespace rex::graphics::vulkan {
 
 VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
@@ -41,6 +55,97 @@ VulkanSharedMemory::~VulkanSharedMemory() {
   Shutdown(true);
 }
 
+bool VulkanSharedMemory::TryCreateImportedBuffer() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // The whole of guest physical memory, contiguous, from its base. An import
+  // has to start on a page boundary; the guest mapping is page-aligned already,
+  // but check rather than assume, because the failure mode otherwise is a
+  // driver-side one far from here.
+  void* const host_pointer = memory().physical_membase();
+  if (host_pointer == nullptr || (reinterpret_cast<uintptr_t>(host_pointer) & 0x3FFF) != 0) {
+    REXGPU_INFO("Shared memory: guest physical memory is not page-aligned for import");
+    return false;
+  }
+
+  VkMemoryHostPointerPropertiesEXT host_pointer_properties;
+  host_pointer_properties.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+  host_pointer_properties.pNext = nullptr;
+  host_pointer_properties.memoryTypeBits = 0;
+  if (vkGetMemoryHostPointerPropertiesEXT(
+          device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host_pointer,
+          &host_pointer_properties) != VK_SUCCESS ||
+      !host_pointer_properties.memoryTypeBits) {
+    REXGPU_INFO("Shared memory: the driver will not import guest physical memory");
+    return false;
+  }
+
+  // Imported host memory is host-visible by construction; prefer a coherent
+  // type so guest writes need no explicit flush.
+  uint32_t memory_type;
+  if (!rex::bit_scan_forward(
+          host_pointer_properties.memoryTypeBits & vulkan_device->memory_types().host_coherent,
+          &memory_type) &&
+      !rex::bit_scan_forward(
+          host_pointer_properties.memoryTypeBits & vulkan_device->memory_types().host_visible,
+          &memory_type)) {
+    REXGPU_INFO("Shared memory: no host-visible memory type accepts the guest pages");
+    return false;
+  }
+
+  VkExternalMemoryBufferCreateInfo external_buffer_create_info;
+  external_buffer_create_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+  external_buffer_create_info.pNext = nullptr;
+  external_buffer_create_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+
+  VkBufferCreateInfo buffer_create_info;
+  buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_create_info.pNext = &external_buffer_create_info;
+  buffer_create_info.flags = 0;
+  buffer_create_info.size = kBufferSize;
+  buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+  buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  buffer_create_info.queueFamilyIndexCount = 0;
+  buffer_create_info.pQueueFamilyIndices = nullptr;
+  VkBuffer buffer;
+  if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer) != VK_SUCCESS) {
+    REXGPU_INFO("Shared memory: failed to create the importable buffer");
+    return false;
+  }
+
+  VkImportMemoryHostPointerInfoEXT import_info;
+  import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+  import_info.pNext = nullptr;
+  import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  import_info.pHostPointer = host_pointer;
+
+  VkMemoryAllocateInfo memory_allocate_info;
+  memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  memory_allocate_info.pNext = &import_info;
+  memory_allocate_info.allocationSize = kBufferSize;
+  memory_allocate_info.memoryTypeIndex = memory_type;
+  VkDeviceMemory buffer_memory;
+  if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &buffer_memory) != VK_SUCCESS) {
+    REXGPU_INFO("Shared memory: the driver refused the guest pages at allocation");
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    return false;
+  }
+  if (dfn.vkBindBufferMemory(device, buffer, buffer_memory, 0) != VK_SUCCESS) {
+    REXGPU_INFO("Shared memory: failed to bind the imported guest pages");
+    dfn.vkFreeMemory(device, buffer_memory, nullptr);
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    return false;
+  }
+
+  buffer_ = buffer;
+  buffer_memory_type_ = memory_type;
+  buffer_memory_.push_back(buffer_memory);
+  return true;
+}
+
 bool VulkanSharedMemory::Initialize() {
   InitializeCommon();
 
@@ -50,6 +155,33 @@ bool VulkanSharedMemory::Initialize() {
 
   const VkBufferCreateFlags sparse_flags =
       VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
+
+  // Try first to back the buffer with the guest's own physical memory.
+  //
+  // The buffer is a byte-for-byte mirror of guest physical memory: UploadRanges
+  // memcpys from TranslatePhysical into a staging buffer and copies it to the
+  // same offset, with no transformation anywhere. On a discrete GPU keeping that
+  // second copy in device-local memory is worth what it costs. On a unified
+  // memory device it is a second copy of the same bytes in the same RAM - and
+  // where sparse binding is unavailable, as it is on Metal, the whole 512 MB is
+  // committed at startup whether the title touches it or not. Measured on the
+  // iPhone 13 mini that is about a third of the process footprint.
+  //
+  // VK_EXT_external_memory_host lets the driver wrap pages the application
+  // already owns (MTLDevice newBufferWithBytesNoCopy: underneath), so the buffer
+  // becomes the guest's memory rather than a copy of it, and every upload turns
+  // into a no-op. Guest physical memory is one contiguous host range starting at
+  // physical_membase(), which is exactly the shape an import needs.
+  if (REXCVAR_GET(vulkan_alias_guest_shared_memory) &&
+      vulkan_device->extensions().ext_EXT_external_memory_host) {
+    if (TryCreateImportedBuffer()) {
+      REXGPU_INFO(
+          "Shared memory: the {} MB buffer is the guest's own physical memory - no separate "
+          "allocation, and no per-frame upload of dirty ranges",
+          kBufferSize >> 20);
+      buffer_aliases_guest_memory_ = true;
+    }
+  }
 
   // Try to create a sparse buffer.
   VkBufferCreateInfo buffer_create_info;
@@ -62,7 +194,7 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
-  if (REXCVAR_GET(vulkan_sparse_shared_memory) &&
+  if (buffer_ == VK_NULL_HANDLE && REXCVAR_GET(vulkan_sparse_shared_memory) &&
       vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) == VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;
@@ -343,6 +475,18 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
 bool VulkanSharedMemory::UploadRanges(
     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   if (upload_page_ranges.empty()) {
+    return true;
+  }
+  if (buffer_aliases_guest_memory_) {
+    // The buffer is the guest's memory, so the "upload" already happened when
+    // the guest wrote. Only the bookkeeping is left: mark the ranges valid so
+    // the watches re-arm, and record the read for traces.
+    for (const auto& upload_range : upload_page_ranges) {
+      const uint32_t range_start = upload_range.first << page_size_log2();
+      const uint32_t range_length = upload_range.second << page_size_log2();
+      trace_writer_.WriteMemoryRead(range_start, range_length);
+      MakeRangeValid(range_start, range_length, false);
+    }
     return true;
   }
   // Attribute the GPU time of the upload copies (and the barriers around
