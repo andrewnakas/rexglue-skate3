@@ -196,6 +196,17 @@ class FunctionGraph {
  private:
   std::vector<CodeBuffer> codeBuffers_;
   std::unordered_map<uint32_t, std::unique_ptr<FunctionNode>> functions_;
+  // Superseded nodes are retained rather than destroyed. Raw FunctionNode*
+  // values are published into CallTarget edges (CallTarget::ToFunction holds a
+  // bare pointer with no address to re-resolve from), into functionsByBase_,
+  // and into pending-notification lists. Destroying a node when a
+  // higher-authority add replaced it left every one of those dangling, and the
+  // Write phase then read recycled memory - observed as a heap-buffer-overflow
+  // in BuilderContext::emit_function_call. A replacement always shares the
+  // superseded node's base address and the symbol name is derived solely from
+  // that address, so an edge that still refers to the old node emits exactly
+  // the same call. These are freed with the graph.
+  std::vector<std::unique_ptr<FunctionNode>> retiredFunctions_;
   std::map<uint32_t, FunctionNode*>
       functionsByBase_;  // sorted by base for O(log f) interval lookup
   std::unordered_map<uint32_t, bool> functionHasXrefs_;  // entry -> hasXrefs
