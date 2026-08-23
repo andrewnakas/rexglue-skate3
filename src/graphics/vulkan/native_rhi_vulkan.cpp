@@ -1328,6 +1328,29 @@ class NrDeviceVulkan : public nrhi::Device {
         std::lock_guard<std::mutex> lock(mutex_);
         retired_backlog = retired_.size();
       }
+      // Blocks allocated versus bytes actually live in them. The heap "use"
+      // above is device memory VMA has taken from the driver, which stays high
+      // when live allocations are scattered across blocks that cannot be
+      // released - so on its own it cannot tell growth from fragmentation.
+      // live_images/live_buffers say whether anything is simply not being freed.
+      VmaTotalStatistics vma_stats = {};
+      vmaCalculateStatistics(allocator_, &vma_stats);
+      size_t live_textures = 0, live_buffers = 0, live_views = 0;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        live_textures = live_textures_.size();
+        live_buffers = live_buffers_.size();
+        live_views = live_views_.size();
+      }
+      REXLOG_INFO(
+          "nrhi-vulkan vma: blocks={} ({}MB) allocs={} ({}MB) unused={}MB | live tex={} buf={} "
+          "view={}",
+          vma_stats.total.statistics.blockCount, vma_stats.total.statistics.blockBytes >> 20,
+          vma_stats.total.statistics.allocationCount,
+          vma_stats.total.statistics.allocationBytes >> 20,
+          (vma_stats.total.statistics.blockBytes - vma_stats.total.statistics.allocationBytes) >>
+              20,
+          live_textures, live_buffers, live_views);
       REXLOG_INFO(
           "nrhi-vulkan mem: {} | bufs upload dl={}MB host={}MB, default dl={}MB host={}MB | "
           "retired={} | ring peak={}KB ovf={}",
@@ -2573,8 +2596,17 @@ void NrCmdVulkan::SetRootConstants(uint32_t param, uint32_t count, const void* v
                                    uint32_t dest_offset_in_values) {
   (void)param;
   if (dest_offset_in_values + count > 64) return;
-  std::memcpy(constants_shadow_ + dest_offset_in_values, values, count * sizeof(uint32_t));
-  constants_dirty_ = true;
+  const size_t bytes = count * sizeof(uint32_t);
+  uint32_t* dst = constants_shadow_ + dest_offset_in_values;
+  // A write that changes nothing is not a new constant block. Without this
+  // check every draw took a fresh 256-byte ring slice and a descriptor rebind
+  // even when it had set exactly the values already there, and the scene issues
+  // 600-900 of these a frame. The texture tables next door already dedupe for
+  // the same reason.
+  if (constants_dirty_ || std::memcmp(dst, values, bytes) != 0) {
+    std::memcpy(dst, values, bytes);
+    constants_dirty_ = true;
+  }
 }
 
 void NrCmdVulkan::SetConstantBuffer(uint32_t param, nrhi::Buffer* buffer, uint64_t offset) {
