@@ -118,18 +118,46 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
 #endif
 
 #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
+//
+// Guest RAM is ordinary memory, not device registers. It was nevertheless
+// accessed through `volatile` at all 964,158 load and store sites, which tells
+// the compiler it may not cache a value in a register, may not common two
+// reads of the same field, may not hoist a load out of a loop, and may not
+// vectorise - across the whole of the recompiled game. Almost none of that is
+// needed: guest memory has no side effects on access (MMIO goes through the
+// separate REX_MM_* path, all 31 of them), and the ordering the guest actually
+// relies on comes from its own sync/lwsync instructions, which are emitted as
+// std::atomic_thread_fence and are full compiler barriers, and from the
+// lwarx/stwcx reservation path, which keeps its own volatile access.
+//
+// The risk this leaves is narrow and specific: a guest busy-wait loop that
+// polls a plain word with no fence, no lwarx and no call in the loop body
+// could have its load hoisted and spin forever. Waits on this console
+// generally go through kernel imports (opaque calls, which force a reload) or
+// carry a sync, so the shape is rare - but if a hang appears after this
+// change, that is what it will be, and REX_GUEST_MEM_VOLATILE=1 restores the
+// old behaviour for the whole build in one flip.
+#ifndef REX_GUEST_MEM_VOLATILE
+#define REX_GUEST_MEM_VOLATILE 0
+#endif
+#if REX_GUEST_MEM_VOLATILE
+#define REX_GUEST_MEM_QUAL volatile
+#else
+#define REX_GUEST_MEM_QUAL
+#endif
 
-#define REX_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_LOAD_U32(x) __builtin_bswap32(*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_LOAD_U64(x) __builtin_bswap64(*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+
+#define REX_LOAD_U8(x) (*(REX_GUEST_MEM_QUAL u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+#define REX_LOAD_U16(x) __builtin_bswap16(*(REX_GUEST_MEM_QUAL u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+#define REX_LOAD_U32(x) __builtin_bswap32(*(REX_GUEST_MEM_QUAL u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+#define REX_LOAD_U64(x) __builtin_bswap64(*(REX_GUEST_MEM_QUAL u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
 #define REX_LOAD_STRING(x, len) \
   std::string_view(reinterpret_cast<const char*>(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (len))
 
-#define REX_STORE_U8(x, y)  (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = (y))
-#define REX_STORE_U16(x, y) (*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap16(y))
-#define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
-#define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
+#define REX_STORE_U8(x, y)  (*(REX_GUEST_MEM_QUAL u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = (y))
+#define REX_STORE_U16(x, y) (*(REX_GUEST_MEM_QUAL u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap16(y))
+#define REX_STORE_U32(x, y) (*(REX_GUEST_MEM_QUAL u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
+#define REX_STORE_U64(x, y) (*(REX_GUEST_MEM_QUAL u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
 
 #define REX_MEMORY_SIZE 0x100000000ull
 
@@ -146,7 +174,7 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
       rex::runtime::MMIOHandler::global_handler()->CheckStore(_mmio_addr,                  \
                                                               static_cast<u32>(val));      \
     } else {                                                                               \
-      *(volatile u8*)(base + _mmio_addr + REX_PHYS_HOST_OFFSET(_mmio_addr)) = (val);       \
+      *(REX_GUEST_MEM_QUAL u8*)(base + _mmio_addr + REX_PHYS_HOST_OFFSET(_mmio_addr)) = (val);       \
     }                                                                                      \
   } while (0)
 
@@ -157,7 +185,7 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
       rex::runtime::MMIOHandler::global_handler()->CheckStore(_mmio_addr,                  \
                                                               static_cast<u32>(val));      \
     } else {                                                                               \
-      *(volatile u16*)(base + _mmio_addr + REX_PHYS_HOST_OFFSET(_mmio_addr)) =             \
+      *(REX_GUEST_MEM_QUAL u16*)(base + _mmio_addr + REX_PHYS_HOST_OFFSET(_mmio_addr)) =             \
           __builtin_bswap16(val);                                                          \
     }                                                                                      \
   } while (0)
@@ -169,7 +197,7 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
       rex::runtime::MMIOHandler::global_handler()->CheckStore(_mmio_addr,                  \
                                                               static_cast<u32>(val));      \
     } else {                                                                               \
-      *(volatile u32*)(base + _mmio_addr + REX_PHYS_HOST_OFFSET(_mmio_addr)) =             \
+      *(REX_GUEST_MEM_QUAL u32*)(base + _mmio_addr + REX_PHYS_HOST_OFFSET(_mmio_addr)) =             \
           __builtin_bswap32(val);                                                          \
     }                                                                                      \
   } while (0)
@@ -184,7 +212,7 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
       rex::runtime::MMIOHandler::global_handler()->CheckStore(_mmio_addr + 4,                     \
                                                               static_cast<u32>(_v64));            \
     } else {                                                                                      \
-      *(volatile u64*)(base + _mmio_addr + REX_PHYS_HOST_OFFSET(_mmio_addr)) =                    \
+      *(REX_GUEST_MEM_QUAL u64*)(base + _mmio_addr + REX_PHYS_HOST_OFFSET(_mmio_addr)) =                    \
           __builtin_bswap64(val);                                                                 \
     }                                                                                             \
   } while (0)
@@ -195,7 +223,7 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
     rex::runtime::MMIOHandler::global_handler()->CheckLoad(addr, &_v); \
     static_cast<u8>(_v);                                               \
   })                                                                   \
-                          : *(volatile u8*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr)))
+                          : *(REX_GUEST_MEM_QUAL u8*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr)))
 
 #define REX_MM_LOAD_U16(addr)                                                 \
   (REX_IS_MMIO_ADDR(addr)                                                     \
@@ -204,7 +232,7 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
            rex::runtime::MMIOHandler::global_handler()->CheckLoad(addr, &_v); \
            static_cast<u16>(_v);                                              \
          })                                                                   \
-       : __builtin_bswap16(*(volatile u16*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr))))
+       : __builtin_bswap16(*(REX_GUEST_MEM_QUAL u16*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr))))
 
 #define REX_MM_LOAD_U32(addr)                                                 \
   (REX_IS_MMIO_ADDR(addr)                                                     \
@@ -213,7 +241,7 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
            rex::runtime::MMIOHandler::global_handler()->CheckLoad(addr, &_v); \
            _v;                                                                \
          })                                                                   \
-       : __builtin_bswap32(*(volatile u32*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr))))
+       : __builtin_bswap32(*(REX_GUEST_MEM_QUAL u32*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr))))
 
 #define REX_MM_LOAD_U64(addr)                                                        \
   (REX_IS_MMIO_ADDR(addr)                                                            \
@@ -223,7 +251,7 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
            rex::runtime::MMIOHandler::global_handler()->CheckLoad((addr) + 4, &_lo); \
            (static_cast<u64>(_hi) << 32) | _lo;                                      \
          })                                                                          \
-       : __builtin_bswap64(*(volatile u64*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr))))
+       : __builtin_bswap64(*(REX_GUEST_MEM_QUAL u64*)(base + (addr) + REX_PHYS_HOST_OFFSET(addr))))
 
 //=============================================================================
 // Function Dispatch
