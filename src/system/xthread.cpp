@@ -36,6 +36,10 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 
+#if REX_PLATFORM_MAC
+#include <pthread/qos.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                     "Ignores game-specified thread priorities");
 
@@ -424,6 +428,15 @@ X_STATUS XThread::Create() {
   params.create_suspended = true;
   thread_ = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
+#if REX_PLATFORM_MAC
+    // Guest threads run the game: simulation, animation, and the render
+    // thread that feeds the command processor. Darwin schedules by quality of
+    // service and the priorities the guest asks for never reach it (SCHED_FIFO
+    // needs a privilege the sandbox withholds), so without this every guest
+    // thread is indistinguishable from a background worker and competes for
+    // the efficiency cores instead of the two performance ones.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     runtime::ThreadState::Bind(thread_state_.get());
 
     // Set thread ID override. This is used by logging.

@@ -447,6 +447,10 @@ void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_siz
   command_processor_->EnableReadPointerWriteBack(ptr, block_size_log2);
 }
 
+void GraphicsSystem::SetSystemCommandBufferGpuIdentifierAddress(uint32_t ptr) {
+  command_processor_->SetSystemCommandBufferGpuIdentifierAddress(ptr);
+}
+
 void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data) {
   interrupt_callback_ = callback;
   interrupt_callback_data_ = user_data;

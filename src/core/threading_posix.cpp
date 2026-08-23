@@ -33,6 +33,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <sys/syscall.h>
 #endif
 
+#if REX_PLATFORM_MAC
+#include <pthread/qos.h>
+#endif
+
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/logging.h>
@@ -810,6 +814,34 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_priority(int new_priority) {
     WaitStarted();
+#if REX_PLATFORM_MAC
+    // SCHED_FIFO needs a privilege a sandboxed app does not have, so the
+    // POSIX path below fails with EPERM on iOS and every priority the guest
+    // asks for is silently discarded. Darwin's scheduler is driven by quality
+    // of service instead, and on a two-performance-core phone the difference
+    // between a thread that is allowed on a P-core and one parked on the
+    // efficiency cores is the whole frame budget.
+    pthread_override_t previous = qos_override_.exchange(nullptr);
+    if (previous) {
+      pthread_override_qos_class_end_np(previous);
+    }
+    qos_class_t qos = QOS_CLASS_DEFAULT;
+    if (new_priority >= ThreadPriority::kAboveNormal) {
+      qos = QOS_CLASS_USER_INTERACTIVE;
+    } else if (new_priority >= ThreadPriority::kNormal) {
+      qos = QOS_CLASS_USER_INITIATED;
+    } else if (new_priority >= ThreadPriority::kBelowNormal) {
+      qos = QOS_CLASS_UTILITY;
+    } else {
+      qos = QOS_CLASS_BACKGROUND;
+    }
+    pthread_override_t override = pthread_override_qos_class_start_np(thread_, qos, 0);
+    if (!override) {
+      REXSYS_WARN("set_priority: pthread_override_qos_class_start_np failed");
+      return;
+    }
+    qos_override_.store(override);
+#else
     sched_param param{};
     param.sched_priority = new_priority;
     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
@@ -826,6 +858,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
           break;
       }
     }
+#endif
   }
 
   void QueueUserCallback(std::function<void()> callback) {
@@ -991,9 +1024,20 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (thread_) {
       pthread_join(thread_, nullptr);
     }
+#if REX_PLATFORM_MAC
+    pthread_override_t override = qos_override_.exchange(nullptr);
+    if (override) {
+      pthread_override_qos_class_end_np(override);
+    }
+#endif
     sem_destroy(&suspend_sem_);
   }
   pthread_t thread_;
+#if REX_PLATFORM_MAC
+  // The live QoS override, so a later set_priority replaces it rather than
+  // stacking a second one (each start_np allocates).
+  std::atomic<pthread_override_t> qos_override_{nullptr};
+#endif
   bool signaled_;
   int exit_code_;
   State state_;             // Protected by state_mutex_

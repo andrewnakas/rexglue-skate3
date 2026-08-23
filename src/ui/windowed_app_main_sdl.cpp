@@ -61,6 +61,10 @@ std::vector<std::string> BuildIOSArguments() {
       "--vulkan_log_debug_messages=false",
       // The disc is staged into Documents, so never run the install wizard.
       "--skate3_auto_install_dlc=false",
+      // Per-window frame breakdown. One formatted line every 600 guest frames
+      // is far too little traffic to distort what it measures, and without it
+      // there is no way to tell a build that helped from one that did not.
+      "--skate3_native_render_scene_perf_log=true",
       // Mitigation for the WorldPresentation cross-thread use-after-free.
       "--skate3_instance_free_defer_ms=250",
 

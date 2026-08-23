@@ -355,6 +355,15 @@ void VdGetSystemCommandBuffer_entry(mapped_void p0_ptr, mapped_void p1_ptr) {
 
 void VdSetSystemCommandBufferGpuIdentifierAddress_entry(mapped_void unk) {
   // r3 = 0x2B10(d3d?) + 8
+  //
+  // The guest registers an address for the GPU to publish command-buffer
+  // progress into. Leaving this a no-op means that address never changes,
+  // which is one candidate source of the WAIT_REG_MEM poll that never clears.
+  auto* graphics_system =
+      static_cast<graphics::GraphicsSystem*>(REX_KERNEL_STATE()->emulator()->graphics_system());
+  if (!graphics_system)
+    return;
+  graphics_system->SetSystemCommandBufferGpuIdentifierAddress(unk.guest_address());
 }
 
 // VdVerifyMEInitCommand

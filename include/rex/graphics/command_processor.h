@@ -133,6 +133,11 @@ class CommandProcessor {
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
+  void SetSystemCommandBufferGpuIdentifierAddress(uint32_t ptr);
+
+  // Command-processor throughput telemetry (see the [cp-sum] log line).
+  static void AccumulateWaitRegMem(uint64_t wait_us, bool abandoned);
+  static void ReportCpSummary();
 
   void UpdateWritePointer(uint32_t value);
 
@@ -280,6 +285,9 @@ class CommandProcessor {
   uint32_t read_ptr_index_ = 0;
   uint32_t read_ptr_update_freq_ = 0;
   uint32_t read_ptr_writeback_ptr_ = 0;
+  // Guest address registered by VdSetSystemCommandBufferGpuIdentifierAddress.
+  // The guest expects the GPU to publish progress here; nothing ever did.
+  uint32_t system_cmdbuf_gpu_id_ptr_ = 0;
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;

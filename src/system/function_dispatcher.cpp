@@ -186,12 +186,16 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
   uint32_t old_tls_ptr = memory::load_and_swap<uint32_t>(pcr_address);
   memory::store_and_swap<uint32_t>(pcr_address, 0);
 
-  if (!Execute(thread_state, address)) {
+  const bool executed = Execute(thread_state, address);
+
+  // Restore TLS ptr. This has to happen even when dispatch failed: leaving it
+  // zeroed makes every later guest routine that checks it behave as though it
+  // were still running under an interrupt.
+  memory::store_and_swap<uint32_t>(pcr_address, old_tls_ptr);
+
+  if (!executed) {
     return 0xDEADBABE;
   }
-
-  // Restore TLS ptr.
-  memory::store_and_swap<uint32_t>(pcr_address, old_tls_ptr);
 
   return ctx->r3.u64;
 }

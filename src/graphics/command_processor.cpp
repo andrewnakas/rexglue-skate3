@@ -37,6 +37,10 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#if REX_PLATFORM_MAC
+#include <pthread/qos.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 
 // WAIT_REG_MEM blocks the command processor until a memory location or
@@ -352,7 +356,64 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
   CallInThread([this, swap_post_effect]() { swap_post_effect_actual_ = swap_post_effect; });
 }
 
+namespace {
+
+// Command-processor throughput summary. Everything here is touched only by the
+// command-processor thread, but the WAIT_REG_MEM counters are read by the
+// reporter on the same thread, so plain values are enough.
+struct CpSummary {
+  uint64_t abandons = 0;
+  uint64_t waits = 0;
+  uint64_t wait_us = 0;
+  uint64_t batches = 0;
+  std::chrono::steady_clock::time_point last_report{};
+};
+CpSummary g_cp_summary;
+
+}  // namespace
+
+void CommandProcessor::AccumulateWaitRegMem(uint64_t wait_us, bool abandoned) {
+  ++g_cp_summary.waits;
+  g_cp_summary.wait_us += wait_us;
+  if (abandoned) {
+    ++g_cp_summary.abandons;
+  }
+}
+
+void CommandProcessor::ReportCpSummary() {
+  const auto now = std::chrono::steady_clock::now();
+  if (g_cp_summary.last_report.time_since_epoch().count() == 0) {
+    g_cp_summary.last_report = now;
+    return;
+  }
+  const auto elapsed = now - g_cp_summary.last_report;
+  if (elapsed < std::chrono::seconds(30)) {
+    return;
+  }
+  const double secs = std::chrono::duration<double>(elapsed).count();
+  // Dead time as a share of the window is the number that matters: it is the
+  // fraction of the command processor's life spent parked on a fence.
+  const double wait_ms = double(g_cp_summary.wait_us) / 1000.0;
+  REXLOG_INFO(
+      "[cp-sum] {:.0f}s: abandons={} ({:.1f}/min) waits={} wait={:.0f}ms ({:.1f}% of window) "
+      "batches={} ({:.0f}/s)",
+      secs, g_cp_summary.abandons, double(g_cp_summary.abandons) * 60.0 / secs,
+      g_cp_summary.waits, wait_ms, wait_ms / (secs * 10.0), g_cp_summary.batches,
+      double(g_cp_summary.batches) / secs);
+  g_cp_summary = CpSummary{};
+  g_cp_summary.last_report = now;
+}
+
 void CommandProcessor::WorkerThreadMain() {
+#if REX_PLATFORM_MAC
+  // This thread is the emulated GPU: it interprets every PM4 packet and, on
+  // the Metal backend, encodes the command buffer too. It is the frame's
+  // critical path, and on a two-performance-core phone Darwin will happily
+  // park a default-QoS thread on an efficiency core next to the texture
+  // decode workers. Say what this thread is for.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
@@ -395,6 +456,8 @@ void CommandProcessor::WorkerThreadMain() {
 
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    ++g_cp_summary.batches;
+    ReportCpSummary();
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
@@ -480,6 +543,18 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
   // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
   //              the read pointer.
   read_ptr_update_freq_ = uint32_t(1) << block_size_log2 >> 2;
+}
+
+void CommandProcessor::SetSystemCommandBufferGpuIdentifierAddress(uint32_t ptr) {
+  // The guest hands the GPU a place to publish command-buffer progress. This
+  // was an empty stub, so nothing was ever written there - and Skate 3 then
+  // parks the command processor on a WAIT_REG_MEM poll of an address in that
+  // same writeback region that consequently never clears. Record it, and log
+  // it once so the address can be checked against the stalled poll.
+  system_cmdbuf_gpu_id_ptr_ = ptr;
+  REXGPU_INFO(
+      "VdSetSystemCommandBufferGpuIdentifierAddress: guest {:08X} (physical {:08X})",
+      ptr, ptr & 0x1FFFFFFF);
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
@@ -1415,6 +1490,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
               timeout_ms, n + 1, is_memory ? "memory" : "register", poll_reg_addr, wait_info & 0x7,
               ref, mask, value);
         }
+        AccumulateWaitRegMem(
+            uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(waited).count()),
+            /*abandoned=*/true);
         return true;
       }
       // Wait. Attributed separately so time spent blocked on guest-side
@@ -1446,6 +1524,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     s_hopeless_streak = 0;
   }
 
+  AccumulateWaitRegMem(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - wait_start)
+                                   .count()),
+                       /*abandoned=*/false);
   return true;
 }
 

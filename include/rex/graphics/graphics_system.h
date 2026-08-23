@@ -73,6 +73,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   virtual void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
   virtual void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
+  virtual void SetSystemCommandBufferGpuIdentifierAddress(uint32_t ptr);
 
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data);
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
