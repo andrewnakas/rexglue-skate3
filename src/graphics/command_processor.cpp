@@ -57,6 +57,16 @@ REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 REXCVAR_DEFINE_INT32(gpu_wait_reg_mem_timeout_ms, 500, "GPU",
                      "Abandon a WAIT_REG_MEM poll after this many milliseconds (0 = wait forever)");
 
+// Abandoning the wait already decides to continue on data that was not ready.
+// What it does not do is make memory agree with that decision, so the guest
+// re-reads the same unsatisfied value and waits the full timeout again on the
+// very next poll of the same fence. Measured on iPhone: 1025 abandons in a
+// single session, ~20 seconds of dead command-processor time.
+REXCVAR_DEFINE_BOOL(gpu_wait_reg_mem_publish_on_abandon, true, "GPU",
+                    "When a WAIT_REG_MEM poll on guest memory is abandoned, write the value "
+                    "the guest is waiting for, so the next poll of that fence is satisfied "
+                    "instead of stalling for another full timeout");
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -1381,6 +1391,21 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         // These come in bursts of hundreds; logging every one puts a formatted
         // synchronous write on the command processor thread and costs more than
         // the wait it is reporting. The first few tell the story, then taper.
+        // Publish what the guest is waiting for. This is not a new decision to
+        // run on unready data - returning true below already does that - it
+        // just stops the same fence charging the full timeout on every poll.
+        // Only the equality case, which is what the hardware writeback fences
+        // use and the only one whose satisfying value is unambiguous.
+        if (is_memory && (wait_info & 0x7) == 0x3 &&
+            REXCVAR_GET(gpu_wait_reg_mem_publish_on_abandon)) {
+          auto* slot =
+              reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+          const auto endian = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
+          // Bits outside the mask are not part of the comparison and may mean
+          // something to the guest, so carry them across untouched.
+          const uint32_t published = (value & ~mask) | (ref & mask);
+          *slot = xenos::GpuSwap(published, endian);
+        }
         const uint64_t n = s_abandon_count++;
         if (n < 8 || (n & 0xFF) == 0) {
           REXLOG_WARN(
