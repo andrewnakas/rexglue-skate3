@@ -26,6 +26,7 @@
 #include <SDL3/SDL_main.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <filesystem>
+#include <fstream>
 #include <cstdlib>
 
 namespace {
@@ -34,11 +35,62 @@ namespace {
 // them the way Skate3Activity does on Android, so the paths are derived here.
 // getenv("HOME") is the app sandbox root under iOS, making $HOME/Documents the
 // user-visible directory that files copied in via Finder or iTunes land in.
+// Arguments set here beat settings.toml, which is what makes them reliable and
+// also what makes them impossible to tune without a 30-minute rebuild-and-sign
+// cycle. `Documents/user/ios_args.txt` closes that gap: one argument per line,
+// blank lines and `#` comments ignored, and any `--key=` it names replaces the
+// built-in entry for that key rather than sitting alongside it. Nothing is
+// required to be in the file, and a file that is not there costs nothing.
+std::vector<std::string> ApplyIOSArgumentOverrides(std::vector<std::string> args,
+                                                   const std::filesystem::path& override_file) {
+  std::ifstream in(override_file);
+  if (!in) {
+    return args;
+  }
+
+  std::vector<std::string> overrides;
+  std::string line;
+  while (std::getline(in, line)) {
+    // Trim both ends; a stray \r from a file edited on a desktop would
+    // otherwise become part of the value.
+    const auto first = line.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+      continue;
+    }
+    const auto last = line.find_last_not_of(" \t\r\n");
+    line = line.substr(first, last - first + 1);
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    if (line.rfind("--", 0) != 0) {
+      line = "--" + line;
+    }
+    overrides.push_back(std::move(line));
+  }
+  if (overrides.empty()) {
+    return args;
+  }
+
+  auto key_of = [](const std::string& arg) {
+    const auto eq = arg.find('=');
+    return eq == std::string::npos ? arg : arg.substr(0, eq);
+  };
+
+  for (const std::string& override_arg : overrides) {
+    const std::string key = key_of(override_arg);
+    args.erase(std::remove_if(args.begin(), args.end(),
+                              [&](const std::string& arg) { return key_of(arg) == key; }),
+               args.end());
+  }
+  args.insert(args.end(), overrides.begin(), overrides.end());
+  return args;
+}
+
 std::vector<std::string> BuildIOSArguments() {
   const char* home = std::getenv("HOME");
   const std::filesystem::path documents =
       std::filesystem::path(home ? home : ".") / "Documents";
-  return {
+  std::vector<std::string> args = {
       "--game_data_root=" + (documents / "game").string(),
       "--user_data_root=" + (documents / "user").string(),
       "--log_file=" + (documents / "skate3.log").string(),
@@ -69,19 +121,23 @@ std::vector<std::string> BuildIOSArguments() {
       "--skate3_instance_free_defer_ms=250",
 
       // ---- Frame pacing ---------------------------------------------------
-      // 60, matching the panel. This was 30, for a good reason at the time: an
-      // exact 2:1 cadence on a 60 Hz panel reads as locked where an unstable 40
-      // reads as judder, and the device could not hold more anyway.
+      // 30, an exact 2:1 cadence on the 60 Hz panel: every frame shown for
+      // exactly two refreshes, which reads as locked where an unstable 40 reads
+      // as judder.
       //
-      // It can now. With the system command buffer fence acknowledged rather
-      // than timed out, the median frame measured 33.3ms - which is the cap to
-      // three significant figures, not a coincidence. The frame was no longer
-      // the constraint; this number was.
+      // This was briefly 60, and the frame time supports it - with the system
+      // command buffer fence acknowledged rather than timed out the median
+      // frame is 16.7ms, so the panel rate is genuinely reachable. What is not
+      // reachable is holding it: measured on device, an uncapped run starts at
+      // 57 fps and decays - 54, then 29, then 4.8, then 0.2 - while the kernel
+      // begins killing idle daemons and free memory falls to around 38 MB.
+      // Twice the frame rate is twice the decode, upload and in-flight frame
+      // residency, on a 4 GB phone that had no headroom at 30. A locked 30 with
+      // half the budget spare is worth more than a 60 that lasts four minutes.
       //
-      // If this needs to go back to 30, note that it has to happen here: an
-      // argument set in this list beats settings.toml, so the file cannot
-      // override it.
-      "--skate3_guest_fps_cap=60",
+      // Raise it from Documents/user/ios_args.txt (skate3_guest_fps_cap=60)
+      // when the residency work lands; no rebuild needed.
+      "--skate3_guest_fps_cap=30",
       "--skate3_guest_fps_cap_auto=false",
 
       // ---- Cache budgets --------------------------------------------------
@@ -163,6 +219,8 @@ std::vector<std::string> BuildIOSArguments() {
       "--vulkan_allow_present_mode_immediate=false",
       "--vulkan_allow_present_mode_mailbox=false",
   };
+
+  return ApplyIOSArgumentOverrides(std::move(args), documents / "user" / "ios_args.txt");
 }
 
 }  // namespace
