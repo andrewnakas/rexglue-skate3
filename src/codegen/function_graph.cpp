@@ -768,7 +768,14 @@ FunctionNode* FunctionGraph::addFunction(uint32_t base, uint32_t size, FunctionA
   auto node = std::make_unique<FunctionNode>(base, size, authority);
   FunctionNode* nodePtr = node.get();
   nodePtr->setName(makeSymbolName(nodePtr->name(), authority));
-  functions_[base] = std::move(node);
+  // Retain any node this one supersedes instead of letting the assignment
+  // destroy it; see retiredFunctions_ for why the pointer must stay valid.
+  if (auto superseded = functions_.find(base); superseded != functions_.end()) {
+    retiredFunctions_.push_back(std::move(superseded->second));
+    superseded->second = std::move(node);
+  } else {
+    functions_[base] = std::move(node);
+  }
   functionsByBase_[base] = nodePtr;
 
   // Track xrefs for merge eligibility
