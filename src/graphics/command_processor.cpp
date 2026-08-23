@@ -38,10 +38,6 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
-#if REX_PLATFORM_MAC
-#include <pthread/qos.h>
-#endif
-
 REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 
 // WAIT_REG_MEM blocks the command processor until a memory location or
@@ -445,15 +441,6 @@ void CommandProcessor::ReportCpSummary() {
 }
 
 void CommandProcessor::WorkerThreadMain() {
-#if REX_PLATFORM_MAC
-  // This thread is the emulated GPU: it interprets every PM4 packet and, on
-  // the Metal backend, encodes the command buffer too. It is the frame's
-  // critical path, and on a two-performance-core phone Darwin will happily
-  // park a default-QoS thread on an efficiency core next to the texture
-  // decode workers. Say what this thread is for.
-  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
-
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;

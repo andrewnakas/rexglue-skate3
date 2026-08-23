@@ -80,7 +80,7 @@ std::vector<std::string> BuildIOSArguments() {
       // If this needs to go back to 30, note that it has to happen here: an
       // argument set in this list beats settings.toml, so the file cannot
       // override it.
-      "--skate3_guest_fps_cap=60",
+      "--skate3_guest_fps_cap=30",
       "--skate3_guest_fps_cap_auto=false",
 
       // ---- Cache budgets --------------------------------------------------

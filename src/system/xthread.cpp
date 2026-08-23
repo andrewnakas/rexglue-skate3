@@ -36,10 +36,6 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 
-#if REX_PLATFORM_MAC
-#include <pthread/qos.h>
-#endif
-
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                     "Ignores game-specified thread priorities");
 
@@ -428,16 +424,6 @@ X_STATUS XThread::Create() {
   params.create_suspended = true;
   thread_ = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
-#if REX_PLATFORM_MAC
-    // Deliberately NOT raised to USER_INTERACTIVE. Marking every guest thread
-    // interactive on a phone with two performance cores means a dozen threads
-    // all insisting on those two cores, and the guest busy-waits in places
-    // (its render thread spins rather than blocking), so the scheduler is left
-    // with no way to run whichever thread the spinning one is waiting for.
-    // Tried, and it hung on load. The command processor is raised on its own,
-    // which is where the frame's critical path actually is.
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
-#endif
     runtime::ThreadState::Bind(thread_state_.get());
 
     // Set thread ID override. This is used by logging.
