@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -387,6 +388,29 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     return kFileMappingHandleInvalid;
   }
   return static_cast<FileMappingHandle>(ashmem_fd);
+#elif REX_PLATFORM_IOS
+  // The iOS sandbox denies shm_open outright, the same reason Android needs
+  // ASharedMemory above. A regular file works, and the guest views alias it
+  // through MAP_SHARED exactly as they would a shm object.
+  //
+  // ftruncate on APFS leaves the file sparse, so reserving the full 4.5 GB
+  // costs no disk until the guest actually touches a page. The file is
+  // unlinked immediately: the descriptor keeps it alive for the process, and
+  // nothing is left behind if we crash.
+  (void)commit;
+  const char* tmp_dir = std::getenv("TMPDIR");
+  std::filesystem::path backing_path =
+      std::filesystem::path(tmp_dir ? tmp_dir : "/tmp") / path.filename();
+  int fd = open(backing_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) {
+    return kFileMappingHandleInvalid;
+  }
+  unlink(backing_path.c_str());
+  if (ftruncate(fd, static_cast<off_t>(length)) != 0) {
+    close(fd);
+    return kFileMappingHandleInvalid;
+  }
+  return static_cast<FileMappingHandle>(fd);
 #else
   int oflag;
   switch (access) {
@@ -422,7 +446,9 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
+  // Android's shared-memory fd and the iOS backing file (already unlinked at
+  // creation) both need nothing beyond the close.
+#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_IOS
   auto full_path = MakeShmName(path);
   shm_unlink(full_path.c_str());
 #endif

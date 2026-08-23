@@ -206,6 +206,32 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     }
   }
 
+  // Input-path diagnostic: reports the first poll for a user index, and then
+  // the first time anything is actually pressed. Enough to tell "the guest
+  // never asks" from "it asks and we answer nothing" from "we answer and the
+  // game ignores it", which look identical from the outside.
+  {
+    static std::atomic<uint32_t> s_polled_mask{0};
+    const uint32_t user_bit = 1u << (user_index & 31);
+    if ((s_polled_mask.fetch_or(user_bit, std::memory_order_relaxed) & user_bit) == 0) {
+      REXLOG_INFO("input: first GetState for user {} - connected={} empty={}", user_index,
+                  any_connected, first_result);
+    }
+    if (!first_result) {
+      static std::atomic<bool> s_logged_press{false};
+      const bool pressed = static_cast<uint16_t>(merged.gamepad.buttons) != 0 ||
+                           merged.gamepad.left_trigger || merged.gamepad.right_trigger ||
+                           std::abs(int(merged.gamepad.thumb_lx)) > 8000 ||
+                           std::abs(int(merged.gamepad.thumb_ly)) > 8000;
+      if (pressed && !s_logged_press.exchange(true, std::memory_order_relaxed)) {
+        REXLOG_INFO("input: first press seen for user {} buttons={:04X} lt={} rt={} lx={} ly={}",
+                    user_index, static_cast<uint16_t>(merged.gamepad.buttons),
+                    merged.gamepad.left_trigger, merged.gamepad.right_trigger,
+                    int(merged.gamepad.thumb_lx), int(merged.gamepad.thumb_ly));
+      }
+    }
+  }
+
   if (first_result) {
     return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
   }

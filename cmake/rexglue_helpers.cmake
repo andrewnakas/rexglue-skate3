@@ -127,7 +127,21 @@ function(rexglue_configure_target target_name)
                 )
             endif()
         endforeach()
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        # Nothing to stage: iOS has no Vulkan loader and no ICD manifests.
+        # MoltenVK is linked statically into rexruntime (see
+        # src/system/CMakeLists.txt), which is where the Vulkan entry points are
+        # actually called from - linking it here as well would put a second copy
+        # of MoltenVK's state in the same process.
+        #
+        # Tested through CMAKE_SYSTEM_NAME rather than REX_IOS because this
+        # function runs in the consuming project's scope, where a plain variable
+        # set inside the SDK's own directory is invisible and the test would
+        # silently fall through to the macOS loader branch below.
     elseif(APPLE)
+        # macOS *loader* model: a Vulkan loader dylib next to the binary plus an
+        # ICD JSON pointing it at MoltenVK. iOS has no loader at all - there the
+        # app links MoltenVK.xcframework statically and this staging is skipped.
         set(_rexglue_macos_vulkan_lib_dirs)
         if(DEFINED ENV{VULKAN_SDK})
             list(APPEND _rexglue_macos_vulkan_lib_dirs "$ENV{VULKAN_SDK}/lib")

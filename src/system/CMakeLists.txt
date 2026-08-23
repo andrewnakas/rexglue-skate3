@@ -52,6 +52,28 @@ add_library(rex::kernel ALIAS rexruntime)
 
 set_target_properties(rexruntime PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND REXGLUE_USE_VULKAN)
+    # iOS has no Vulkan loader to dlopen, so MoltenVK is linked in statically
+    # here - this library carries rexui, which calls vkGetInstanceProcAddr
+    # directly on iOS. Point REXGLUE_IOS_MOLTENVK_STATIC_LIB at the libMoltenVK.a
+    # inside the *static* MoltenVK.xcframework of a release matching the Vulkan
+    # headers in use.
+    if(NOT REXGLUE_IOS_MOLTENVK_STATIC_LIB)
+        message(FATAL_ERROR
+            "iOS builds need -DREXGLUE_IOS_MOLTENVK_STATIC_LIB=<path to static ios-arm64 libMoltenVK.a>")
+    endif()
+    target_link_libraries(rexruntime PRIVATE
+        "${REXGLUE_IOS_MOLTENVK_STATIC_LIB}"
+        "-framework Metal"
+        "-framework QuartzCore"
+        "-framework IOSurface"
+        "-framework CoreGraphics"
+        "-framework CoreVideo"
+        "-framework Foundation"
+        "-framework UIKit"
+    )
+endif()
+
 target_include_directories(rexruntime PUBLIC
     $<BUILD_INTERFACE:${REXGLUE_ROOT}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>

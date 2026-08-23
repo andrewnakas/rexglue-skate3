@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -37,6 +38,24 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
+
+// WAIT_REG_MEM blocks the command processor until a memory location or
+// register reaches an expected value. On hardware that value always arrives,
+// so the loop was written without an escape; in emulation it can deadlock,
+// because the code that publishes the value may itself be queued behind the
+// stalled command processor. GraphicsSystem::MarkVblank already dispatches the
+// GPU interrupt from the vblank thread for exactly this reason, but that only
+// helps when the interrupt handler can run - if it needs a critical section
+// held by a guest thread that is itself waiting on the command processor,
+// nothing breaks the cycle and the whole emulator stops with a black screen.
+//
+// Giving up after a bound turns that permanent hang into a dropped wait: every
+// thread queued behind the command processor gets to run again, which is
+// usually what lets the awaited value be written. The frame it gives up on may
+// be visually wrong, and it says so in the log. Zero restores the original
+// wait-forever behaviour.
+REXCVAR_DEFINE_INT32(gpu_wait_reg_mem_timeout_ms, 500, "GPU",
+                     "Abandon a WAIT_REG_MEM poll after this many milliseconds (0 = wait forever)");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -1275,6 +1294,32 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // This loop has no timeout by design - on hardware the condition always
+  // arrives - so when it does not, the command processor simply stops and
+  // every guest thread queues behind it with nothing in the log to say why.
+  // Report the poll parameters once if it stays unsatisfied, which names the
+  // address and the value that never turned up.
+  const auto wait_start = std::chrono::steady_clock::now();
+  bool reported = false;
+
+  // Skate 3 re-enters the same unsatisfiable wait in bursts: the address is not
+  // slow to clear, it never clears, so paying the full timeout every time is
+  // pure dead time on the one thread the whole emulator queues behind. Once an
+  // address has been abandoned several times in a row, treat it as hopeless and
+  // spend the minimum on it; a single success puts it straight back on the full
+  // budget. The command processor is one thread, so these need no locking, and
+  // thread_local keeps the bookkeeping out of the class definition.
+  static thread_local uint32_t s_hopeless_addr = 0;
+  static thread_local uint32_t s_hopeless_streak = 0;
+  static thread_local uint64_t s_abandon_count = 0;
+  constexpr uint32_t kHopelessStreak = 3;
+
+  int32_t timeout_ms = REXCVAR_GET(gpu_wait_reg_mem_timeout_ms);
+  if (timeout_ms > 0 && poll_reg_addr == s_hopeless_addr &&
+      s_hopeless_streak >= kHopelessStreak) {
+    timeout_ms = 1;
+  }
+
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1317,6 +1362,36 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      const auto waited = std::chrono::steady_clock::now() - wait_start;
+      if (!reported && waited > std::chrono::seconds(3)) {
+        reported = true;
+        REXLOG_WARN(
+            "WAIT_REG_MEM stuck >3s: {} addr={:08X} function={} ref={:08X} mask={:08X} "
+            "value={:08X} wait={:X}",
+            is_memory ? "memory" : "register", poll_reg_addr, wait_info & 0x7, ref, mask, value,
+            wait);
+      }
+      if (timeout_ms > 0 && waited > std::chrono::milliseconds(timeout_ms)) {
+        if (poll_reg_addr == s_hopeless_addr) {
+          ++s_hopeless_streak;
+        } else {
+          s_hopeless_addr = poll_reg_addr;
+          s_hopeless_streak = 1;
+        }
+        // These come in bursts of hundreds; logging every one puts a formatted
+        // synchronous write on the command processor thread and costs more than
+        // the wait it is reporting. The first few tell the story, then taper.
+        const uint64_t n = s_abandon_count++;
+        if (n < 8 || (n & 0xFF) == 0) {
+          REXLOG_WARN(
+              "WAIT_REG_MEM abandoned after {}ms (occurrence {}): {} addr={:08X} function={} "
+              "ref={:08X} mask={:08X} value={:08X}; continuing so threads queued behind the "
+              "command processor can run",
+              timeout_ms, n + 1, is_memory ? "memory" : "register", poll_reg_addr, wait_info & 0x7,
+              ref, mask, value);
+        }
+        return true;
+      }
       // Wait. Attributed separately so time spent blocked on guest-side
       // progress isn't read as command processing cost.
       PROFILE_SCOPE_COUNTER(kCpuGuestWaitUs);
@@ -1340,6 +1415,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+
+  // It cleared, so it was a real wait after all - restore the full budget.
+  if (poll_reg_addr == s_hopeless_addr) {
+    s_hopeless_streak = 0;
+  }
 
   return true;
 }

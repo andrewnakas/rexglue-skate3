@@ -74,12 +74,18 @@ elseif(UNIX AND NOT APPLE)
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
 endif()
 
-# Enforce Clang18 compiler
-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+# Enforce Clang18 compiler. AppleClang counts: it is the only toolchain that
+# can target iOS, and its version numbers run ahead of a different scale
+# (AppleClang 16 already carries the LLVM 17/18-era frontend this needs).
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
     message(FATAL_ERROR "ReXGlue requires Clang compiler. Please set CMAKE_CXX_COMPILER to clang++")
 endif()
 
-if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "18.0")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "16.0")
+        message(FATAL_ERROR "ReXGlue requires AppleClang 16 or newer (found ${CMAKE_CXX_COMPILER_VERSION})")
+    endif()
+elseif(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "18.0")
     message(FATAL_ERROR "ReXGlue requires Clang 18 or newer (found ${CMAKE_CXX_COMPILER_VERSION})")
 endif()
 

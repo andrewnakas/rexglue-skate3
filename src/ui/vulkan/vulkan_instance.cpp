@@ -25,6 +25,17 @@
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, false, "UI/Vulkan", "Log Vulkan debug messages");
 
+#if REX_PLATFORM_IOS
+// iOS has no Vulkan loader to dlopen: MoltenVK is linked statically and these
+// two entry points are referenced directly (VK_NO_PROTOTYPES hides them from
+// the headers). Everything else still goes through vkGetInstanceProcAddr,
+// exactly as on the loader path.
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vkGetInstanceProcAddr(VkInstance instance, const char* pName);
+extern "C" VKAPI_ATTR void VKAPI_CALL
+vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator);
+#endif
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -63,6 +74,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   Functions& ifn = vulkan_instance->functions_;
 
   bool functions_loaded = true;
+#if REX_PLATFORM_IOS
+  ifn.vkGetInstanceProcAddr = &::vkGetInstanceProcAddr;
+  ifn.vkDestroyInstance = &::vkDestroyInstance;
+#else
   if (!vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)
 #if REX_PLATFORM_MAC
       && !vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoaderFallback)
@@ -81,6 +96,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     REXLOG_ERROR("Failed to get Vulkan loader function pointers");
     return nullptr;
   }
+#endif  // REX_PLATFORM_IOS
 
   // Load global functions.
 
