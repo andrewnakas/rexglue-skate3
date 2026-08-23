@@ -308,6 +308,38 @@ class PosixConditionBase {
     }
   }
 
+  // A multi-handle wait has no POSIX equivalent, so WaitMultiple scans the
+  // handles itself - and with no way to be woken, it had to rescan on a timer.
+  // That timer was 1ms, and the scan try-locks every handle: the audio worker
+  // waits on nine of them and spent 71% of a core doing nothing but this,
+  // ~9000 mutex acquisitions a second, on a phone with two performance cores.
+  //
+  // These give it a way to be woken. Every signal bumps the generation and
+  // notifies, so a rescan happens because something was signalled rather than
+  // because a millisecond passed, and the timer becomes a backstop rather than
+  // the mechanism. Lock order is always handle mutex then this one, never the
+  // reverse: the scan releases every handle lock before it waits here.
+  static std::mutex& wait_any_mutex() {
+    static std::mutex mutex;
+    return mutex;
+  }
+  static std::condition_variable& wait_any_cond() {
+    static std::condition_variable cond;
+    return cond;
+  }
+  // Guarded by wait_any_mutex().
+  static uint64_t& wait_any_generation() {
+    static uint64_t generation = 0;
+    return generation;
+  }
+  static void NotifyWaitAny() {
+    {
+      std::lock_guard<std::mutex> lock(wait_any_mutex());
+      ++wait_any_generation();
+    }
+    wait_any_cond().notify_all();
+  }
+
   static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
                                                     bool wait_all,
                                                     std::chrono::milliseconds timeout) {
@@ -324,6 +356,15 @@ class PosixConditionBase {
                         : start_time + timeout;
 
     while (true) {
+      // Read before the scan: a signal that arrives while scanning changes this,
+      // and the wait below then returns immediately instead of sleeping through
+      // the thing it was waiting for.
+      uint64_t generation_before_scan;
+      {
+        std::lock_guard<std::mutex> lock(wait_any_mutex());
+        generation_before_scan = wait_any_generation();
+      }
+
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
@@ -399,12 +440,17 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
+      // Backstop only. A signal wakes this immediately; the interval bounds how
+      // long a wait can hang if some future signal path forgets to notify.
+      constexpr auto kRescanBackstop = std::chrono::milliseconds(5);
+      auto wait_time = kRescanBackstop;
+      if (timeout != std::chrono::milliseconds::max()) {
+        wait_time = std::min(
+            kRescanBackstop, std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now));
+      }
+      std::unique_lock<std::mutex> wait_lock(wait_any_mutex());
+      if (wait_any_generation() == generation_before_scan) {
+        wait_any_cond().wait_for(wait_lock, wait_time);
       }
     }
   }
@@ -438,6 +484,7 @@ class PosixCondition<Event> : public PosixConditionBase {
     auto lock = std::unique_lock<std::mutex>(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyWaitAny();
     return true;
   }
 
@@ -475,6 +522,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
     }
     count_ += release_count;
     cond_.notify_all();
+    NotifyWaitAny();
     return true;
   }
 
@@ -483,6 +531,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   inline void post_execution() override {
     count_--;
     cond_.notify_all();
+    NotifyWaitAny();
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -507,6 +556,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
       // Free to be acquired by another thread
       if (count_ == 0) {
         cond_.notify_all();
+        NotifyWaitAny();
       }
       return true;
     }
@@ -539,6 +589,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
     std::lock_guard<std::mutex> lock(mutex_);
     signal_ = true;
     cond_.notify_all();
+    NotifyWaitAny();
     return true;
   }
 
@@ -953,6 +1004,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       exit_code_ = exit_code;
       signaled_ = true;
       cond_.notify_all();
+      NotifyWaitAny();
     }
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
