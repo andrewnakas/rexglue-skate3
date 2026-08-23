@@ -32,7 +32,11 @@
 #if REX_PLATFORM_IOS
 #include <mach/mach.h>
 #include <mach/task_info.h>
+#include <mach/thread_act.h>
+#include <mach/thread_info.h>
 #include <os/proc.h>
+#include <pthread.h>
+#include <map>
 #endif
 
 #include <algorithm>
@@ -1364,6 +1368,89 @@ class NrDeviceVulkan : public nrhi::Device {
               20,
           live_textures, live_buffers, live_views);
 #if REX_PLATFORM_IOS
+      // Where the frame actually goes.
+      //
+      // The renderer's own numbers say it costs almost nothing - hundredths of
+      // a millisecond a frame - while the delivered frame sits above 33ms, so
+      // the time is being spent somewhere this file cannot see: the recompiled
+      // guest threads, or the command processor interpreting PM4. Those are
+      // very different problems with very different fixes, and nothing in the
+      // log distinguished them. Cumulative per-thread CPU, differenced between
+      // two reports, does: a thread at ~100% of a wall-clock second is the one
+      // setting the frame rate.
+      {
+        static std::mutex s_thread_cpu_mutex;
+        static std::map<uint64_t, uint64_t> s_thread_cpu_us;
+        static std::chrono::steady_clock::time_point s_thread_cpu_at;
+
+        thread_act_array_t threads = nullptr;
+        mach_msg_type_number_t thread_count = 0;
+        if (task_threads(mach_task_self(), &threads, &thread_count) == KERN_SUCCESS) {
+          const auto now = std::chrono::steady_clock::now();
+          std::lock_guard<std::mutex> lock(s_thread_cpu_mutex);
+          const double window_s =
+              s_thread_cpu_at.time_since_epoch().count()
+                  ? std::chrono::duration<double>(now - s_thread_cpu_at).count()
+                  : 0.0;
+          std::map<uint64_t, uint64_t> current;
+          std::vector<std::pair<double, std::string>> busiest;
+          for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+            thread_identifier_info_data_t id_info = {};
+            mach_msg_type_number_t id_count = THREAD_IDENTIFIER_INFO_COUNT;
+            thread_basic_info_data_t basic = {};
+            mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(threads[i], THREAD_IDENTIFIER_INFO,
+                            reinterpret_cast<thread_info_t>(&id_info), &id_count) != KERN_SUCCESS ||
+                thread_info(threads[i], THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&basic),
+                            &basic_count) != KERN_SUCCESS) {
+              continue;
+            }
+            const uint64_t cpu_us =
+                uint64_t(basic.user_time.seconds + basic.system_time.seconds) * 1000000ull +
+                uint64_t(basic.user_time.microseconds + basic.system_time.microseconds);
+            current[id_info.thread_id] = cpu_us;
+            if (window_s <= 0.0) {
+              continue;
+            }
+            const auto previous = s_thread_cpu_us.find(id_info.thread_id);
+            if (previous == s_thread_cpu_us.end() || cpu_us < previous->second) {
+              continue;
+            }
+            const double busy = double(cpu_us - previous->second) / 1e6 / window_s;
+            if (busy < 0.05) {
+              continue;
+            }
+            char name[64] = {};
+            pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+            if (!pt || pthread_getname_np(pt, name, sizeof(name)) != 0 || !name[0]) {
+              std::snprintf(name, sizeof(name), "tid%llu",
+                            static_cast<unsigned long long>(id_info.thread_id));
+            }
+            busiest.emplace_back(busy, name);
+          }
+          for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+            mach_port_deallocate(mach_task_self(), threads[i]);
+          }
+          vm_deallocate(mach_task_self(), vm_address_t(threads),
+                        vm_size_t(thread_count * sizeof(thread_act_t)));
+
+          if (!busiest.empty()) {
+            std::sort(busiest.begin(), busiest.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string line;
+            for (size_t i = 0; i < busiest.size() && i < 6; ++i) {
+              if (!line.empty()) {
+                line += ' ';
+              }
+              line += fmt::format("{}={:.0f}%", busiest[i].second, busiest[i].first * 100.0);
+            }
+            REXLOG_INFO("ios cpu ({:.0f}s): {}", window_s, line);
+          }
+          s_thread_cpu_us = std::move(current);
+          s_thread_cpu_at = now;
+        }
+      }
+
       // The Vulkan numbers above are device memory, which on a unified-memory
       // phone is only part of what jetsam counts. This is the whole process as
       // the kernel sees it, next to what the kernel will still let it have -
