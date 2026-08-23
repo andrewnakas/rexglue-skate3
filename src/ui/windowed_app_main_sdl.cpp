@@ -83,6 +83,19 @@ std::vector<std::string> ApplyIOSArgumentOverrides(std::vector<std::string> args
                args.end());
   }
   args.insert(args.end(), overrides.begin(), overrides.end());
+
+  // Say so. An override that silently fails to apply is indistinguishable from
+  // one that applied and did nothing, and telling those apart by watching frame
+  // times is exactly the guessing this file exists to avoid. Logging is not up
+  // yet at this point - these arguments are what configures it - so this goes
+  // to stderr, which iOS has already been pointed at Documents/stderr.log.
+  std::fprintf(stderr, "ios_args: applied %zu override(s) from %s\n", overrides.size(),
+               override_file.c_str());
+  for (const std::string& override_arg : overrides) {
+    std::fprintf(stderr, "ios_args:   %s\n", override_arg.c_str());
+  }
+  std::fflush(stderr);
+
   return args;
 }
 
