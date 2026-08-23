@@ -28,6 +28,13 @@
 
 #include <rex/graphics/vulkan/native_rhi_vulkan.h>
 
+#include <rex/platform.h>
+#if REX_PLATFORM_IOS
+#include <mach/mach.h>
+#include <mach/task_info.h>
+#include <os/proc.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -1356,6 +1363,23 @@ class NrDeviceVulkan : public nrhi::Device {
           (vma_stats.total.statistics.blockBytes - vma_stats.total.statistics.allocationBytes) >>
               20,
           live_textures, live_buffers, live_views);
+#if REX_PLATFORM_IOS
+      // The Vulkan numbers above are device memory, which on a unified-memory
+      // phone is only part of what jetsam counts. This is the whole process as
+      // the kernel sees it, next to what the kernel will still let it have -
+      // the pair that says whether a run is about to be killed, and which the
+      // Vulkan totals cannot say on their own.
+      {
+        task_vm_info_data_t vm_info = {};
+        mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm_info),
+                      &count) == KERN_SUCCESS) {
+          REXLOG_INFO("ios mem: footprint={}MB (peak {}MB) headroom={}MB compressed={}MB",
+                      vm_info.phys_footprint >> 20, vm_info.ledger_phys_footprint_peak >> 20,
+                      os_proc_available_memory() >> 20, vm_info.compressed >> 20);
+        }
+      }
+#endif
       REXLOG_INFO(
           "nrhi-vulkan mem: {} | bufs upload dl={}MB host={}MB, default dl={}MB host={}MB | "
           "retired={} | ring peak={}KB ovf={}",
