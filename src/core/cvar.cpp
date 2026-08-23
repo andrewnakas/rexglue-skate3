@@ -33,20 +33,27 @@ std::mutex g_mutex;
 
 // Recursive: FlagRegistrar chain methods re-enter; change callbacks invoked
 // from SetFlagByName must not mutate the registry.
+// Deliberately immortal: REXCVAR_DEFINE_* installs a namespace-scope
+// FlagRegistrar in every translation unit that declares a cvar, and each
+// destructor calls UnregisterFlag during static / shared-library teardown.
+// Destruction order across translation units and DSOs is not the reverse of
+// construction order, so plain function-local statics are destroyed while
+// registrars are still running and the unregister then touches freed memory.
+// Leaking these at process exit is intentional.
 std::recursive_mutex& GetRegistryMutex() {
-  static std::recursive_mutex m;
-  return m;
+  static auto* m = new std::recursive_mutex();
+  return *m;
 }
 
-// Flag registry - use functions to avoid static init order issues
+// Flag registry - immortal, see GetRegistryMutex above.
 std::vector<FlagEntry>& GetRegistryStorage() {
-  static std::vector<FlagEntry> registry;
-  return registry;
+  static auto* registry = new std::vector<FlagEntry>();
+  return *registry;
 }
 
 std::unordered_map<std::string, size_t>& GetRegistryIndex() {
-  static std::unordered_map<std::string, size_t> index;
-  return index;
+  static auto* index = new std::unordered_map<std::string, size_t>();
+  return *index;
 }
 
 std::vector<std::pair<std::string, std::string>>& GetCommandLineOverrides() {
@@ -190,14 +197,15 @@ bool WriteConfigFile(const std::filesystem::path& config_path, const toml::table
 
 // todo(tomc): move restart manager to Runtime
 std::vector<std::string>& GetPendingRestartStorage() {
-  static std::vector<std::string> pending;
-  return pending;
+  static auto* pending = new std::vector<std::string>();
+  return *pending;
 }
 
 // Callback storage for change notifications
 std::unordered_map<std::string, std::vector<ChangeCallback>>& GetCallbackStorage() {
-  static std::unordered_map<std::string, std::vector<ChangeCallback>> callbacks;
-  return callbacks;
+  static auto* callbacks =
+      new std::unordered_map<std::string, std::vector<ChangeCallback>>();
+  return *callbacks;
 }
 
 void MarkPendingRestart(std::string_view name) {
