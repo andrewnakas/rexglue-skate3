@@ -63,6 +63,11 @@
 #include <pthread/qos.h>
 #endif
 
+REXCVAR_DEFINE_BOOL(vulkan_descriptor_set_recycle, true, "GPU/Vulkan",
+                    "Put retired descriptor sets on a per-layout free list instead of freeing "
+                    "them, so the re-allocation storm after a texture eviction sweep costs a "
+                    "pointer pop rather than a scan of every descriptor pool");
+
 namespace rex::graphics::vulkan {
 namespace {
 
@@ -579,6 +584,9 @@ class NrDeviceVulkan : public nrhi::Device {
     }
     FlushDissolvedViews();
     DrainRetired(~0ull);
+    // Recycled sets are owned by the pools destroyed below - dropping the
+    // handles is enough, and it must happen before those pools go away.
+    free_sets_.clear();
     for (auto& entry : set0_sets_) {
       dfn.vkFreeDescriptorSets(device, entry.second.pool, 1, &entry.second.set);
     }
@@ -1919,6 +1927,10 @@ class NrDeviceVulkan : public nrhi::Device {
   std::vector<NrTextureVulkan*>& pending_clear_textures() { return pending_clear_textures_; }
 
  private:
+  // Bound per layout so a pathological churn pattern cannot pin pool capacity
+  // in the free list forever; past it, sets go back to the pool as before.
+  static constexpr size_t kMaxFreeSetsPerLayout = 4096;
+
   struct RetiredObject {
     uint64_t submission = 0;
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -1931,11 +1943,15 @@ class NrDeviceVulkan : public nrhi::Device {
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    // Which layout the set was allocated from - a recycled set can only be
+    // handed back for the same layout, and the set itself does not carry it.
+    VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
   };
 
   struct SetEntry {
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
   };
 
   struct RenderPassKey {
@@ -2004,7 +2020,41 @@ class NrDeviceVulkan : public nrhi::Device {
   bool AllocateDescriptorSet(VkDescriptorSetLayout layout, SetEntry* out) {
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
     const VkDevice device = vulkan_device_->device();
+    out->layout = layout;
+    // A set retired by an eviction sweep is reusable exactly as it is: every
+    // caller rewrites all of its bindings with vkUpdateDescriptorSets before
+    // binding it (GetSet0 and GetTableSet both do, on every miss), and
+    // DrainRetired only releases a set once the GPU has passed the submission
+    // that used it. Popping one costs a pointer read where the pool path below
+    // costs a driver call per pool - on MoltenVK a failing
+    // vkAllocateDescriptorSets still walks argument-buffer storage, and the
+    // sweeps that retire thousands of sets are followed immediately by the
+    // frame that re-misses on all of them.
+    if (descriptor_set_recycle_) {
+      auto free_it = free_sets_.find(layout);
+      if (free_it != free_sets_.end() && !free_it->second.empty()) {
+        *out = free_it->second.back();
+        free_it->second.pop_back();
+        return true;
+      }
+    }
     for (int attempt = 0; attempt < 2; ++attempt) {
+      // The pool that satisfied the last allocation is overwhelmingly likely
+      // to satisfy this one; without the cursor every miss restarts the scan
+      // from the newest pool and re-walks the ones it just found full.
+      if (last_alloc_pool_ < descriptor_pools_.size()) {
+        VkDescriptorSetAllocateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        info.descriptorPool = descriptor_pools_[last_alloc_pool_];
+        info.descriptorSetCount = 1;
+        info.pSetLayouts = &layout;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (dfn.vkAllocateDescriptorSets(device, &info, &set) == VK_SUCCESS) {
+          out->set = set;
+          out->pool = descriptor_pools_[last_alloc_pool_];
+          return true;
+        }
+      }
       // Every pool, newest first - not just the newest one. Sets are freed
       // individually (that is what FREE_DESCRIPTOR_SET_BIT is for), so a pool
       // that filled once has capacity again as its sets retire. Only ever
@@ -2015,6 +2065,7 @@ class NrDeviceVulkan : public nrhi::Device {
       // frame as tens of milliseconds of table_miss, and the dead pools were
       // never reclaimed.
       for (size_t i = descriptor_pools_.size(); i-- > 0;) {
+        if (i == last_alloc_pool_) continue;  // just tried it
         VkDescriptorSetAllocateInfo info = {};
         info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         info.descriptorPool = descriptor_pools_[i];
@@ -2024,6 +2075,7 @@ class NrDeviceVulkan : public nrhi::Device {
         if (dfn.vkAllocateDescriptorSets(device, &info, &set) == VK_SUCCESS) {
           out->set = set;
           out->pool = descriptor_pools_[i];
+          last_alloc_pool_ = i;
           return true;
         }
       }
@@ -2051,6 +2103,7 @@ class NrDeviceVulkan : public nrhi::Device {
         return false;
       }
       descriptor_pools_.push_back(pool);
+      last_alloc_pool_ = descriptor_pools_.size() - 1;
       REXLOG_WARN("nrhi-vulkan: grew descriptor pools to {} (every existing pool was full)",
                   descriptor_pools_.size());
     }
@@ -2063,7 +2116,18 @@ class NrDeviceVulkan : public nrhi::Device {
     r.submission = submission;
     r.descriptor_set = entry.set;
     r.descriptor_pool = entry.pool;
+    r.descriptor_set_layout = entry.layout;
     retired_.push_back(r);
+  }
+
+  // A retirement that carries nothing but a descriptor set - what
+  // RetireDescriptorSetLocked produces. Only those can go on the free list;
+  // anything holding an image or a buffer has to go through the allocator.
+  static bool IsDescriptorSetOnlyRetirement(const RetiredObject& r) {
+    return r.buffer == VK_NULL_HANDLE && r.image == VK_NULL_HANDLE &&
+           r.view == VK_NULL_HANDLE && r.pipelines[0] == VK_NULL_HANDLE &&
+           r.pipelines[1] == VK_NULL_HANDLE && r.shader_module == VK_NULL_HANDLE &&
+           r.framebuffer == VK_NULL_HANDLE;
   }
 
   void DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX) {
@@ -2072,7 +2136,22 @@ class NrDeviceVulkan : public nrhi::Device {
     const VkDevice device = vulkan_device_->device();
     size_t destroyed = 0;
     std::erase_if(retired_, [&](const RetiredObject& r) {
-      if (r.submission >= completed || destroyed >= max_objects) return false;
+      if (r.submission >= completed) return false;
+      // Recycling a set is a pointer push, not allocator work, so it does not
+      // spend the per-frame budget. That is the point: an eviction sweep
+      // retires thousands of sets at once and the very next frame re-misses on
+      // all of them, so draining them at 256 a frame is what left the misses
+      // to rebuild capacity through the pools.
+      if (descriptor_set_recycle_ && r.descriptor_set != VK_NULL_HANDLE &&
+          r.descriptor_set_layout != VK_NULL_HANDLE && IsDescriptorSetOnlyRetirement(r)) {
+        std::vector<SetEntry>& free_list = free_sets_[r.descriptor_set_layout];
+        if (free_list.size() < kMaxFreeSetsPerLayout) {
+          free_list.push_back(
+              SetEntry{r.descriptor_set, r.descriptor_pool, r.descriptor_set_layout});
+          return true;
+        }
+      }
+      if (destroyed >= max_objects) return false;
       ++destroyed;
       if (r.framebuffer != VK_NULL_HANDLE) dfn.vkDestroyFramebuffer(device, r.framebuffer, nullptr);
       if (r.view != VK_NULL_HANDLE) dfn.vkDestroyImageView(device, r.view, nullptr);
@@ -2500,6 +2579,13 @@ class NrDeviceVulkan : public nrhi::Device {
   std::map<RenderPassKey, VkRenderPass> render_passes_;
   std::map<FramebufferKey, VkFramebuffer> framebuffers_;
   std::vector<VkDescriptorPool> descriptor_pools_;
+  // Index of the pool that satisfied the last allocation; tried first.
+  size_t last_alloc_pool_ = SIZE_MAX;
+  // Retired sets waiting to be handed out again, per layout. Render-thread
+  // only, like the caches below it - DrainRetired runs from BeginFrame and
+  // from the destructor, both on the render thread.
+  std::unordered_map<VkDescriptorSetLayout, std::vector<SetEntry>> free_sets_;
+  const bool descriptor_set_recycle_ = REXCVAR_GET(vulkan_descriptor_set_recycle);
   std::map<Set0Key, SetEntry> set0_sets_;
   std::map<TableKey, SetEntry> table_sets_;
   // Reverse of table_sets_: which cached sets name a given view, so destroying
