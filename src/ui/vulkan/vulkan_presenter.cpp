@@ -70,7 +70,7 @@ REXCVAR_DEFINE_UINT32(vulkan_present_timing_interval, 120, "UI/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
-REXCVAR_DEFINE_INT32(vulkan_device_lost_soft_retries, 0, "UI/Vulkan",
+REXCVAR_DEFINE_INT32(vulkan_device_lost_soft_retries, 8, "UI/Vulkan",
                      "Treat up to this many VK_ERROR_DEVICE_LOST results per 30 seconds as a "
                      "dropped frame plus a swapchain rebuild instead of a fatal error. Meant for "
                      "MoltenVK, which reports a lost device when its wait for a CAMetalDrawable "
@@ -1666,9 +1666,9 @@ bool VulkanPresenter::SoftenDeviceLoss(const char* stage) {
   }
   ++soft_device_loss_count_;
   REXLOG_WARN(
-      "VulkanPresenter: {} reported a lost device; dropping the frame and rebuilding the "
-      "swapchain ({} of {} allowed in this 30s window). On MoltenVK this is normally a "
-      "CAMetalDrawable wait that timed out on a long frame, not a dead device.",
+      "VulkanPresenter: {} reported a lost device; dropping the frame ({} of {} allowed in this "
+      "30s window). On MoltenVK this is normally a CAMetalDrawable wait that timed out on a long "
+      "frame, not a dead device.",
       stage, soft_device_loss_count_, budget);
   return true;
 }
@@ -1725,10 +1725,16 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_SUBOPTIMAL_KHR:
       break;
     case VK_ERROR_DEVICE_LOST:
-      // Nothing was acquired, so there is no image to hand back - going out
-      // through the outdated path rebuilds the swapchain and tries again.
+      // Just drop the frame. Nothing was acquired, so there is nothing to
+      // release and nothing to rebuild - and rebuilding is actively harmful:
+      // routing this through the outdated path tore the swapchain down while
+      // MoltenVK still held an in-flight drawable's completion block, which
+      // degraded it frame after frame and then faulted inside that block.
+      // A drawable wait that timed out is transient by definition, so the
+      // right response is to present nothing this frame and acquire again on
+      // the next one.
       if (SoftenDeviceLoss("Acquiring the swapchain image")) {
-        return PaintResult::kNotPresentedConnectionOutdated;
+        return PaintResult::kNotPresented;
       }
       REXLOG_ERROR(
           "VulkanPresenter: Failed to acquire the swapchain image as the "
