@@ -18,4 +18,9 @@ else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
 endif()
 
+# On-screen controls: only where there is a touchscreen and no other pad.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    target_sources(rexinput PRIVATE touch/touch_input_driver.cpp)
+endif()
+
 target_link_libraries(rexinput PUBLIC rexcore rexui SDL3::SDL3)

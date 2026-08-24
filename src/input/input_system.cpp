@@ -23,6 +23,9 @@
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
+#if REX_PLATFORM_IOS
+#include <rex/input/touch_input_driver.h>
+#endif
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
@@ -368,6 +371,17 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
         input->AddDriver(std::move(sdl_driver));
       }
     }
+
+#if REX_PLATFORM_IOS
+    // Touch driver last of the real drivers: it declines while a physical
+    // controller is attached, so it costs nothing when one is.
+    {
+      auto touch_driver = std::make_unique<touch::TouchInputDriver>(nullptr, 0);
+      if (touch_driver->Setup() == X_STATUS_SUCCESS) {
+        input->AddDriver(std::move(touch_driver));
+      }
+    }
+#endif
 
     // MnK driver (keyboard/mouse -> controller emulation)
     auto mnk_driver = std::make_unique<mnk::MnkInputDriver>(nullptr, 0);

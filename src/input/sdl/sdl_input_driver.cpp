@@ -19,6 +19,10 @@
 #include <rex/filesystem.h>
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+
+#if REX_PLATFORM_IOS
+#include <rex/input/touch_input_driver.h>
+#endif
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
@@ -451,9 +455,11 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
   switch (event.type) {
     case SDL_EVENT_GAMEPAD_ADDED:
       OnControllerDeviceAddedLocked(event);
+      NotifyTouchOfControllersLocked();
       break;
     case SDL_EVENT_GAMEPAD_REMOVED:
       OnControllerDeviceRemovedLocked(event);
+      NotifyTouchOfControllersLocked();
       break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
       OnControllerDeviceAxisMotionLocked(event);
@@ -465,6 +471,21 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
     default:
       break;
   }
+}
+
+void SDLInputDriver::NotifyTouchOfControllersLocked() {
+#if REX_PLATFORM_IOS
+  // The on-screen controls exist only to stand in for a pad that is not
+  // there, so they follow this driver's view of what is attached.
+  bool any = false;
+  for (const auto& controller : controllers_) {
+    if (controller.sdl) {
+      any = true;
+      break;
+    }
+  }
+  rex::input::touch::SetPhysicalControllerConnected(any);
+#endif
 }
 
 void SDLInputDriver::StopRumbleLocked(ControllerState& state) {
