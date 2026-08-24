@@ -160,6 +160,21 @@ class VulkanPresenter final : public Presenter {
   // a genuinely dead device still gets diagnosed instead of spinning.
   bool SoftenDeviceLoss(const char* stage);
 
+  // A retired swapchain cannot be destroyed the moment it is replaced.
+  // vkQueuePresentKHR gives no host-visible signal for a present completing,
+  // so its images may still be referenced by a presentation-completion block
+  // Metal has yet to run - destroying the swapchain frees them underneath it,
+  // and the block then faults on a dangling object. Retired swapchains are
+  // held for a few frames instead and destroyed once nothing can still be
+  // referring to them.
+  struct RetiredSwapchain {
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    uint32_t frames_remaining = 0;
+  };
+  std::vector<RetiredSwapchain> retired_swapchains_;
+  void RetireSwapchain(VkSwapchainKHR swapchain);
+  void DrainRetiredSwapchains(bool force);
+
   uint32_t soft_device_loss_count_ = 0;
   std::chrono::steady_clock::time_point soft_device_loss_window_start_{};
 

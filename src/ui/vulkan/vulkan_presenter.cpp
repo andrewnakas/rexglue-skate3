@@ -268,6 +268,9 @@ VulkanPresenter::~VulkanPresenter() {
   // and the vkQueuePresentKHR semaphore wait).
   // This will await completion of all paint submissions also.
   paint_context_.DestroySwapchainAndVulkanSurface();
+  // Anything still being held past a recreation goes now: the device is about
+  // to be torn down, so there is nothing left to fault against it.
+  DrainRetiredSwapchains(true);
 
   // Await completion of the usage of everything before destroying anything
   // (paint submission completion already awaited).
@@ -855,10 +858,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
-    // Destroy the old swapchain that may be retired now.
-    if (old_swapchain != VK_NULL_HANDLE) {
-      dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
-    }
+    // Held rather than destroyed here: see RetireSwapchain.
+    RetireSwapchain(old_swapchain);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Couldn't create the swapchain for the existing surface - start over.
       paint_context_.DestroySwapchainAndVulkanSurface();
@@ -1646,6 +1647,33 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   return true;
 }
 
+void VulkanPresenter::RetireSwapchain(VkSwapchainKHR swapchain) {
+  if (swapchain == VK_NULL_HANDLE) {
+    return;
+  }
+  // Three frames is the swapchain's own depth, which is how many presents can
+  // be outstanding against it. Cheap to hold: a retired swapchain owns images
+  // that are already being replaced, and recreations are rare.
+  retired_swapchains_.push_back(RetiredSwapchain{swapchain, 3});
+}
+
+void VulkanPresenter::DrainRetiredSwapchains(bool force) {
+  if (retired_swapchains_.empty()) {
+    return;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  for (auto it = retired_swapchains_.begin(); it != retired_swapchains_.end();) {
+    if (!force && it->frames_remaining > 0) {
+      --it->frames_remaining;
+      ++it;
+      continue;
+    }
+    dfn.vkDestroySwapchainKHR(device, it->swapchain, nullptr);
+    it = retired_swapchains_.erase(it);
+  }
+}
+
 bool VulkanPresenter::SoftenDeviceLoss(const char* stage) {
   const int32_t budget = REXCVAR_GET(vulkan_device_lost_soft_retries);
   if (budget <= 0) {
@@ -2428,6 +2456,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       ElapsedUs(timing_submit_start, timing_submit_end),
       ElapsedUs(timing_present_start, timing_present_end),
       ElapsedUs(timing_start, timing_present_end));
+  DrainRetiredSwapchains(false);
   switch (present_result) {
     case VK_SUCCESS:
       return PaintResult::kPresented;
