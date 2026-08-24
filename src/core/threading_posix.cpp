@@ -23,6 +23,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <memory>
 
 #include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include <semaphore.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -1529,6 +1532,22 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   }
 #endif
   set_current_thread_name("");
+
+#if defined(__APPLE__)
+  // Guest threads carry the game's own work - simulation, streaming,
+  // decompression - and a thread created without an explicit quality of
+  // service is left for the scheduler to place. On a big.LITTLE Apple SoC
+  // (the A15 has two performance cores against four efficiency ones) that
+  // routinely means an efficiency core, where the same work takes several
+  // times longer. That shows up as the world failing to stream in rather than
+  // as a slow frame, because the stall is on a guest thread the renderer is
+  // waiting for.
+  //
+  // USER_INITIATED rather than USER_INTERACTIVE: this is work the player is
+  // waiting on, but the main thread and the presenter are what must never be
+  // preempted. The decode workers deliberately stay at UTILITY.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
 
   auto start_data = static_cast<ThreadStartData*>(parameter);
   assert_not_null(start_data);
