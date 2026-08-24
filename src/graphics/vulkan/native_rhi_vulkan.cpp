@@ -1578,14 +1578,17 @@ class NrDeviceVulkan : public nrhi::Device {
         REXLOG_INFO(
             "nrhi-vulkan: SLOW frame {}us: pass_open={}us/{} flush={}us/{} copies={}us/{} "
             "table_miss={}us/{} set0_miss={}us/{} view_destroy={}us/{} view_create={}us/{} "
-            "const={}us/{} pso={}us/{} drain={}us/{}",
+            "const={}us/{} pso={}us/{} drain={}us/{} retired_backlog={}",
             total_us, prof_.pass_open.us, prof_.pass_open.count, prof_.flush_barriers.us,
             prof_.flush_barriers.count, prof_.copies.us, prof_.copies.count, prof_.table_miss.us,
             prof_.table_miss.count, prof_.set0_miss.us, prof_.set0_miss.count,
             prof_.view_destroy.us, prof_.view_destroy.count, prof_.view_create.us,
             prof_.view_create.count, prof_.const_slice.us, prof_.const_slice.count,
             prof_.pipeline_build.us, prof_.pipeline_build.count, prof_.drain.us,
-            prof_.drain.count);
+            prof_.drain.count,
+            // Backlog too: a drain that is falling behind decays the frame
+            // rate over minutes and is invisible in the per-frame timings.
+            retired_backlog_);
       }
     }
   }
@@ -2185,8 +2188,11 @@ class NrDeviceVulkan : public nrhi::Device {
     NrProfScope prof_scope(prof_.drain);
     if (!drain_budget_logged_) {
       drain_budget_logged_ = true;
-      REXLOG_INFO("nrhi-vulkan: retired-object drain budget {}us/frame ({} objects max)",
-                  max_us, max_objects == SIZE_MAX ? 0u : uint32_t(max_objects));
+      REXLOG_INFO(
+          "nrhi-vulkan: retired-object drain budget {}us/frame ({} objects max, floor {}, "
+          "backlog widen {} / unbounded {})",
+          max_us, max_objects == SIZE_MAX ? 0u : uint32_t(max_objects), kDrainFloorObjects,
+          kDrainBacklogHigh, kDrainBacklogUnbounded);
     }
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
     const VkDevice device = vulkan_device_->device();
@@ -2197,6 +2203,22 @@ class NrDeviceVulkan : public nrhi::Device {
     // overruns the frame badly enough that MoltenVK's wait for a drawable
     // expires, which it reports as a lost device. Bound the wall clock
     // instead; whatever is left drains next frame.
+    //
+    // BUT THE DRAIN MUST KEEP UP. A pure time budget starves it: destroying
+    // one large image can itself take milliseconds, so a 2 ms budget freed
+    // about two objects a frame while eviction retired thousands. The backlog
+    // grew, the GPU heap went to 1361 MB against a 250 MB texture store, and
+    // the frame rate decayed from 53 fps to 21 over two minutes - trading the
+    // hitch for a leak. So: always destroy a floor of objects regardless of
+    // the clock, and widen the budget as the backlog grows, because falling
+    // behind costs more than a stutter does.
+    const size_t backlog = retired_.size();
+    retired_backlog_ = backlog;
+    if (backlog > kDrainBacklogUnbounded) {
+      max_us = 0;  // catching up matters more than this frame's smoothness
+    } else if (backlog > kDrainBacklogHigh && max_us != 0) {
+      max_us *= 4;
+    }
     const auto drain_start = std::chrono::steady_clock::now();
     bool out_of_time = false;
     std::erase_if(retired_, [&](const RetiredObject& r) {
@@ -2220,8 +2242,9 @@ class NrDeviceVulkan : public nrhi::Device {
       // vmaDestroyImage of a large texture can run into milliseconds on
       // MoltenVK, so eight of them blew a 2 ms budget out to 73 ms. A
       // steady_clock read is tens of nanoseconds against that, and per-object
-      // checking bounds the overshoot to one object.
-      if (max_us != 0 && destroyed != 0) {
+      // checking bounds the overshoot to one object. The floor is exempt so
+      // the drain always makes progress.
+      if (max_us != 0 && destroyed >= kDrainFloorObjects) {
         const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                  std::chrono::steady_clock::now() - drain_start)
                                  .count();
@@ -2657,7 +2680,16 @@ class NrDeviceVulkan : public nrhi::Device {
   std::map<RenderPassKey, VkRenderPass> render_passes_;
   std::map<FramebufferKey, VkFramebuffer> framebuffers_;
   std::vector<VkDescriptorPool> descriptor_pools_;
+  // Destroyed every frame whatever the clock says, so the drain cannot be
+  // starved into falling permanently behind the retire rate.
+  static constexpr size_t kDrainFloorObjects = 24;
+  // Backlog sizes at which the time budget widens, then stops applying.
+  static constexpr size_t kDrainBacklogHigh = 512;
+  static constexpr size_t kDrainBacklogUnbounded = 2048;
+
   bool drain_budget_logged_ = false;
+  // Retired objects still awaiting destruction after the last drain.
+  size_t retired_backlog_ = 0;
   // Index of the pool that satisfied the last allocation; tried first.
   size_t last_alloc_pool_ = SIZE_MAX;
   // Retired sets waiting to be handed out again, per layout. Render-thread
