@@ -63,6 +63,20 @@ void SDLWindowedAppContext::DispatchEvent(const SDL_Event& event) {
     return;
   }
 
+  // iOS asks before it takes. Something else on the device wanting memory - a
+  // phone call is the usual one - makes the system send this, and an app that
+  // ignores it gets its resources reclaimed underneath it instead, which
+  // surfaces as a fault somewhere in the graphics driver rather than as
+  // anything recognisable. Handing back the caches is far cheaper than being
+  // reclaimed: they rebuild from guest memory on demand.
+  if (event.type == SDL_EVENT_LOW_MEMORY) {
+    REXLOG_WARN("system reported low memory; releasing caches");
+    if (low_memory_handler_) {
+      low_memory_handler_();
+    }
+    return;
+  }
+
   SDLWindow::HandleSDLEvent(event);
 }
 
