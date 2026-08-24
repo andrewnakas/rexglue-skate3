@@ -63,6 +63,14 @@
 #include <pthread/qos.h>
 #endif
 
+REXCVAR_DEFINE_INT32(vulkan_drain_budget_us, 2000, "GPU/Vulkan",
+                     "Microseconds per frame the backend may spend destroying retired GPU "
+                     "objects. An eviction sweep retires thousands at once and freeing them is "
+                     "allocator work that lands inside the frame; past this budget the rest wait "
+                     "for the next one. 0 removes the limit.")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_descriptor_set_recycle, true, "GPU/Vulkan",
                     "Put retired descriptor sets on a per-layout free list instead of freeing "
                     "them, so the re-allocation storm after a texture eviction sweep costs a "
@@ -1337,7 +1345,8 @@ class NrDeviceVulkan : public nrhi::Device {
       // at once, and destroying them all in one frame is its own hitch (the
       // remainder drains over the following frames). 256 objects measured
       // ~5 ms worst case through the allocator.
-      DrainRetired(cp_->GetCompletedSubmission(), 256);
+      DrainRetired(cp_->GetCompletedSubmission(), 256,
+                   uint32_t(std::max(0, REXCVAR_GET(vulkan_drain_budget_us))));
     }
     ++frame_index_;
     // Every 600 frames is a long time when a frame can take half a second -
@@ -2171,11 +2180,20 @@ class NrDeviceVulkan : public nrhi::Device {
            r.framebuffer == VK_NULL_HANDLE;
   }
 
-  void DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX) {
+  void DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX,
+                    uint32_t max_us = 0) {
     NrProfScope prof_scope(prof_.drain);
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
     const VkDevice device = vulkan_device_->device();
     size_t destroyed = 0;
+    // The object cap alone is a poor proxy for cost - a 4 MB image and a small
+    // buffer are each "one object" - so a 256-object budget was measured
+    // spending 107 ms in a single frame during an eviction sweep. That
+    // overruns the frame badly enough that MoltenVK's wait for a drawable
+    // expires, which it reports as a lost device. Bound the wall clock
+    // instead; whatever is left drains next frame.
+    const auto drain_start = std::chrono::steady_clock::now();
+    bool out_of_time = false;
     std::erase_if(retired_, [&](const RetiredObject& r) {
       if (r.submission >= completed) return false;
       // Recycling a set is a pointer push, not allocator work, so it does not
@@ -2192,8 +2210,18 @@ class NrDeviceVulkan : public nrhi::Device {
           return true;
         }
       }
-      if (destroyed >= max_objects) return false;
+      if (destroyed >= max_objects || out_of_time) return false;
       ++destroyed;
+      // Sampled rather than checked per object: the clock read is cheap but
+      // not free, and the budget only needs to be approximately honoured.
+      if (max_us != 0 && (destroyed & 7u) == 0) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - drain_start)
+                                 .count();
+        if (elapsed >= int64_t(max_us)) {
+          out_of_time = true;
+        }
+      }
       if (r.framebuffer != VK_NULL_HANDLE) dfn.vkDestroyFramebuffer(device, r.framebuffer, nullptr);
       if (r.view != VK_NULL_HANDLE) dfn.vkDestroyImageView(device, r.view, nullptr);
       for (VkPipeline pipeline : r.pipelines) {
