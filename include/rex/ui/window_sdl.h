@@ -70,6 +70,11 @@ class SDLWindow final : public Window {
   void* metal_layer_ = nullptr;
 #endif
   std::atomic<bool> paint_event_queued_{false};
+  // True between backgrounding and returning. Nothing may be presented in
+  // that window: Metal will not hand out a drawable for an off-screen layer,
+  // and presenting anyway leaves MoltenVK's completion block holding objects
+  // the system has reclaimed.
+  std::atomic<bool> presentation_suspended_{false};
   SDL_TimerID cursor_auto_hide_timer_ = 0;
   bool cursor_currently_auto_hidden_ = false;
   uint32_t dpi_ = 96;
