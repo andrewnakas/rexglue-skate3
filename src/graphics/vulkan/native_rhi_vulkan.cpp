@@ -2183,6 +2183,11 @@ class NrDeviceVulkan : public nrhi::Device {
   void DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX,
                     uint32_t max_us = 0) {
     NrProfScope prof_scope(prof_.drain);
+    if (!drain_budget_logged_) {
+      drain_budget_logged_ = true;
+      REXLOG_INFO("nrhi-vulkan: retired-object drain budget {}us/frame ({} objects max)",
+                  max_us, max_objects == SIZE_MAX ? 0u : uint32_t(max_objects));
+    }
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
     const VkDevice device = vulkan_device_->device();
     size_t destroyed = 0;
@@ -2211,17 +2216,21 @@ class NrDeviceVulkan : public nrhi::Device {
         }
       }
       if (destroyed >= max_objects || out_of_time) return false;
-      ++destroyed;
-      // Sampled rather than checked per object: the clock read is cheap but
-      // not free, and the budget only needs to be approximately honoured.
-      if (max_us != 0 && (destroyed & 7u) == 0) {
+      // Checked before EVERY destroy, not sampled every eighth: a single
+      // vmaDestroyImage of a large texture can run into milliseconds on
+      // MoltenVK, so eight of them blew a 2 ms budget out to 73 ms. A
+      // steady_clock read is tens of nanoseconds against that, and per-object
+      // checking bounds the overshoot to one object.
+      if (max_us != 0 && destroyed != 0) {
         const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                  std::chrono::steady_clock::now() - drain_start)
                                  .count();
         if (elapsed >= int64_t(max_us)) {
           out_of_time = true;
+          return false;
         }
       }
+      ++destroyed;
       if (r.framebuffer != VK_NULL_HANDLE) dfn.vkDestroyFramebuffer(device, r.framebuffer, nullptr);
       if (r.view != VK_NULL_HANDLE) dfn.vkDestroyImageView(device, r.view, nullptr);
       for (VkPipeline pipeline : r.pipelines) {
@@ -2648,6 +2657,7 @@ class NrDeviceVulkan : public nrhi::Device {
   std::map<RenderPassKey, VkRenderPass> render_passes_;
   std::map<FramebufferKey, VkFramebuffer> framebuffers_;
   std::vector<VkDescriptorPool> descriptor_pools_;
+  bool drain_budget_logged_ = false;
   // Index of the pool that satisfied the last allocation; tried first.
   size_t last_alloc_pool_ = SIZE_MAX;
   // Retired sets waiting to be handed out again, per layout. Render-thread
