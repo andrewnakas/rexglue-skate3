@@ -597,27 +597,8 @@ void SDLWindow::RequestPaintImpl() {
 void SDLWindow::HandleEvent(const SDL_Event& event) {
   WindowDestructionReceiver destruction_receiver(this);
   switch (event.type) {
-    // Backgrounded - a phone call, the home gesture, a notification pulled
-    // down. Metal does not allow presenting to a layer that is off screen: the
-    // drawable never comes back, and MoltenVK's presentation completion block
-    // is left holding objects the system has taken away. Presenting anyway is
-    // what has been faulting inside presentCAMetalDrawable.
-    case SDL_EVENT_WILL_ENTER_BACKGROUND:
-      REXLOG_INFO("window: entering the background; presentation suspended");
-      presentation_suspended_.store(true, std::memory_order_release);
-      break;
-    case SDL_EVENT_DID_ENTER_FOREGROUND:
-      REXLOG_INFO("window: back in the foreground; presentation resumed");
-      presentation_suspended_.store(false, std::memory_order_release);
-      // The surface was very likely torn down while away, so repaint through
-      // the normal request path rather than assuming the swapchain survived.
-      RequestPaint();
-      break;
     case SDL_EVENT_WINDOW_EXPOSED:
       paint_event_queued_.store(false, std::memory_order_release);
-      if (presentation_suspended_.load(std::memory_order_acquire)) {
-        break;
-      }
       OnPaint();
       break;
     case SDL_EVENT_WINDOW_RESIZED:
