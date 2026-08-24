@@ -1931,6 +1931,20 @@ class NrDeviceVulkan : public nrhi::Device {
   // in the free list forever; past it, sets go back to the pool as before.
   static constexpr size_t kMaxFreeSetsPerLayout = 4096;
 
+  // splitmix64 finalizer. Handles are pointers, so the low bits are alignment
+  // zeros and the high bits barely move - hashing them raw piles a whole cache
+  // into a few buckets.
+  static size_t MixHandle(uint64_t v) {
+    v += 0x9e3779b97f4a7c15ull;
+    v = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9ull;
+    v = (v ^ (v >> 27)) * 0x94d049bb133111ebull;
+    return static_cast<size_t>(v ^ (v >> 31));
+  }
+
+  static size_t MixCombine(size_t h, uint64_t v) {
+    return h ^ (MixHandle(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2));
+  }
+
   struct RetiredObject {
     uint64_t submission = 0;
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -1994,6 +2008,23 @@ class NrDeviceVulkan : public nrhi::Device {
       }
       return false;
     }
+    bool operator==(const Set0Key& o) const {
+      if (layout != o.layout || count != o.count) return false;
+      for (uint32_t i = 0; i < count; ++i) {
+        if (buffers[i] != o.buffers[i]) return false;
+      }
+      return true;
+    }
+    struct Hash {
+      size_t operator()(const Set0Key& k) const {
+        size_t h = MixHandle(reinterpret_cast<uint64_t>(k.layout));
+        h = MixCombine(h, k.count);
+        for (uint32_t i = 0; i < k.count; ++i) {
+          h = MixCombine(h, reinterpret_cast<uint64_t>(k.buffers[i]));
+        }
+        return h;
+      }
+    };
   };
 
   struct TableKey {
@@ -2015,6 +2046,16 @@ class NrDeviceVulkan : public nrhi::Device {
       }
       return true;
     }
+    struct Hash {
+      size_t operator()(const TableKey& k) const {
+        size_t h = MixHandle(reinterpret_cast<uint64_t>(k.layout));
+        h = MixCombine(h, k.count);
+        for (uint32_t i = 0; i < k.count; ++i) {
+          h = MixCombine(h, reinterpret_cast<uint64_t>(k.views[i]));
+        }
+        return h;
+      }
+    };
   };
 
   bool AllocateDescriptorSet(VkDescriptorSetLayout layout, SetEntry* out) {
@@ -2586,8 +2627,11 @@ class NrDeviceVulkan : public nrhi::Device {
   // from the destructor, both on the render thread.
   std::unordered_map<VkDescriptorSetLayout, std::vector<SetEntry>> free_sets_;
   const bool descriptor_set_recycle_ = REXCVAR_GET(vulkan_descriptor_set_recycle);
-  std::map<Set0Key, SetEntry> set0_sets_;
-  std::map<TableKey, SetEntry> table_sets_;
+  // Hashed, not ordered: these are pure lookup caches, and the tree spent a
+  // per-draw lookup walking a dozen comparisons of a key that is eight view
+  // pointers wide.
+  std::unordered_map<Set0Key, SetEntry, Set0Key::Hash> set0_sets_;
+  std::unordered_map<TableKey, SetEntry, TableKey::Hash> table_sets_;
   // Reverse of table_sets_: which cached sets name a given view, so destroying
   // a view does not have to scan every set in the cache.
   std::unordered_map<NrTextureViewVulkan*, std::vector<TableKey>> view_tables_;
