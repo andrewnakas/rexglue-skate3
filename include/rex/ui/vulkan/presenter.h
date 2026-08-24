@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -149,6 +150,19 @@ class VulkanPresenter final : public Presenter {
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
 
  private:
+  // MoltenVK reports VK_ERROR_DEVICE_LOST when its wait for a CAMetalDrawable
+  // expires, which on a loaded frame is a missed deadline rather than a lost
+  // device - and the default handling of a lost device is to abort the process.
+  // SoftenDeviceLoss converts a bounded number of them per window into
+  // "swapchain went outdated", which drops the frame and rebuilds the
+  // swapchain through the path that already exists for resizes. Returns true if
+  // this loss was absorbed. Past the budget the real loss reporting stands, so
+  // a genuinely dead device still gets diagnosed instead of spinning.
+  bool SoftenDeviceLoss(const char* stage);
+
+  uint32_t soft_device_loss_count_ = 0;
+  std::chrono::steady_clock::time_point soft_device_loss_window_start_{};
+
   // Usable for both the guest output image itself and for intermediate images.
   class GuestOutputImage {
    public:

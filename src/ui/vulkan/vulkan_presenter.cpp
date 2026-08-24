@@ -70,6 +70,14 @@ REXCVAR_DEFINE_UINT32(vulkan_present_timing_interval, 120, "UI/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
+REXCVAR_DEFINE_INT32(vulkan_device_lost_soft_retries, 0, "UI/Vulkan",
+                     "Treat up to this many VK_ERROR_DEVICE_LOST results per 30 seconds as a "
+                     "dropped frame plus a swapchain rebuild instead of a fatal error. Meant for "
+                     "MoltenVK, which reports a lost device when its wait for a CAMetalDrawable "
+                     "times out. 0 keeps the loss fatal.")
+    .range(0, 64)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -1638,6 +1646,33 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   return true;
 }
 
+bool VulkanPresenter::SoftenDeviceLoss(const char* stage) {
+  const int32_t budget = REXCVAR_GET(vulkan_device_lost_soft_retries);
+  if (budget <= 0) {
+    return false;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (soft_device_loss_window_start_ == std::chrono::steady_clock::time_point{} ||
+      now - soft_device_loss_window_start_ >= std::chrono::seconds(30)) {
+    soft_device_loss_window_start_ = now;
+    soft_device_loss_count_ = 0;
+  }
+  if (soft_device_loss_count_ >= uint32_t(budget)) {
+    REXLOG_ERROR(
+        "VulkanPresenter: {} reported a lost device {} times within 30s - past the soft-retry "
+        "budget, reporting it as a real device loss",
+        stage, soft_device_loss_count_);
+    return false;
+  }
+  ++soft_device_loss_count_;
+  REXLOG_WARN(
+      "VulkanPresenter: {} reported a lost device; dropping the frame and rebuilding the "
+      "swapchain ({} of {} allowed in this 30s window). On MoltenVK this is normally a "
+      "CAMetalDrawable wait that timed out on a long frame, not a dead device.",
+      stage, soft_device_loss_count_, budget);
+  return true;
+}
+
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   const auto timing_start = std::chrono::steady_clock::now();
   // Begin the submission in place of the one not currently potentially used on
@@ -1690,6 +1725,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_SUBOPTIMAL_KHR:
       break;
     case VK_ERROR_DEVICE_LOST:
+      // Nothing was acquired, so there is no image to hand back - going out
+      // through the outdated path rebuilds the swapchain and tries again.
+      if (SoftenDeviceLoss("Acquiring the swapchain image")) {
+        return PaintResult::kNotPresentedConnectionOutdated;
+      }
       REXLOG_ERROR(
           "VulkanPresenter: Failed to acquire the swapchain image as the "
           "device has been lost ({})",
@@ -2388,6 +2428,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_SUBOPTIMAL_KHR:
       return PaintResult::kPresentedSuboptimal;
     case VK_ERROR_DEVICE_LOST:
+      // The image stays in the acquired state forever after this, which is
+      // exactly the situation the outdated path handles for a failed present:
+      // recreating the swapchain is what releases it.
+      if (SoftenDeviceLoss("Presenting the swapchain image")) {
+        return PaintResult::kNotPresentedConnectionOutdated;
+      }
       REXLOG_ERROR(
           "VulkanPresenter: Failed to present the swapchain image as the "
           "device has been lost ({})",
