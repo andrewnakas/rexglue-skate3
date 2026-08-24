@@ -78,30 +78,18 @@ u32 XamContentGetDeviceName_entry(u32 device_id, mapped_wstring name_buffer, u32
 
 u32 XamContentGetDeviceState_entry(u32 device_id, mapped_void overlapped_ptr) {
   auto device_info = GetDummyDeviceInfo(device_id);
-  // Completed on the dispatch thread rather than inside this call, like the
-  // content enumeration APIs next to it. Signalling the overlapped's event
-  // before the caller has even returned is not something the real console can
-  // do - a device-state query goes to storage hardware - and a caller that
-  // sees X_ERROR_IO_PENDING is entitled to finish setting up its wait before
-  // the completion arrives. Skate 3's dlc_enumerator thread lost that race
-  // when the menu was driven quickly: it ended up parked in
-  // NtWaitForSingleObjectEx on an event that had already been signalled, while
-  // holding a critical section the main thread then blocked on - a hang that
-  // presents as a black screen after Start, with the render thread spinning in
-  // its ring poll and no new draws ever submitted.
   if (device_info == nullptr) {
     if (overlapped_ptr) {
-      REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(
-          []() {}, overlapped_ptr.guest_address(), X_ERROR_FUNCTION_FAILED,
-          X_ERROR_DEVICE_NOT_CONNECTED, 0);
+      REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
+          overlapped_ptr.guest_address(), X_ERROR_FUNCTION_FAILED, X_ERROR_DEVICE_NOT_CONNECTED, 0);
       return X_ERROR_IO_PENDING;
     } else {
       return X_ERROR_DEVICE_NOT_CONNECTED;
     }
   }
   if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedDeferredEx([]() {}, overlapped_ptr.guest_address(),
-                                                     X_ERROR_SUCCESS, X_ERROR_SUCCESS, 0);
+    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
+                                                    X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
   } else {
     return X_ERROR_SUCCESS;
