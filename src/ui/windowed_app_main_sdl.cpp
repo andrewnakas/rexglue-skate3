@@ -140,8 +140,11 @@ std::vector<std::string> BuildIOSArguments() {
       // chatty frame this bills the render path for a synchronous write per
       // message. Turn it back on when debugging the renderer, not to play.
       "--vulkan_log_debug_messages=false",
-      // The disc is staged into Documents, so never run the install wizard.
-      "--skate3_auto_install_dlc=false",
+      // Content packs are dropped into Documents like the disc is, and
+      // installing them is how a custom map reaches the game's own Freeskate
+      // list. This used to be forced off to keep the install WIZARD from
+      // running; the wizard is a separate thing and the packs are worth having.
+      "--skate3_auto_install_dlc=true",
       // Per-window frame breakdown. One formatted line every 600 guest frames
       // is far too little traffic to distort what it measures, and without it
       // there is no way to tell a build that helped from one that did not.
