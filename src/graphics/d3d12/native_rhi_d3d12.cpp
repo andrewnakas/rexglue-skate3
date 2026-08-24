@@ -921,6 +921,19 @@ class NrDeviceD3D12 : public nrhi::Device {
     return pipeline;
   }
 
+  bool SupportsSampledTextureFormat(Format format) override {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
+    support.Format = ToDxgi(format);
+    if (support.Format == DXGI_FORMAT_UNKNOWN) {
+      return false;
+    }
+    if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                            sizeof(support)))) {
+      return false;
+    }
+    return (support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0;
+  }
+
   uint32_t GetSupportedSampleCount(Format format, uint32_t desired) override {
     DXGI_FORMAT dxgi = ToDxgi(format);
     uint32_t count = desired;

@@ -1302,6 +1302,17 @@ class NrDeviceVulkan : public nrhi::Device {
     return std::max(count, 1u);
   }
 
+  bool SupportsSampledTextureFormat(Format format) override {
+    const VkFormat vk_format = ToVkFormat(format);
+    if (vk_format == VK_FORMAT_UNDEFINED) {
+      return false;
+    }
+    VkFormatProperties props = {};
+    vulkan_device_->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device_->physical_device(), vk_format, &props);
+    return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+  }
+
   uint64_t CurrentSubmission() const override { return cp_->GetCurrentSubmission(); }
   uint64_t CompletedSubmission() const override { return cp_->GetCompletedSubmission(); }
 

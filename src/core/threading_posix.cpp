@@ -311,14 +311,31 @@ class PosixConditionBase {
   // A multi-handle wait has no POSIX equivalent, so WaitMultiple scans the
   // handles itself - and with no way to be woken, it had to rescan on a timer.
   // That timer was 1ms, and the scan try-locks every handle: the audio worker
-  // waits on nine of them and spent 71% of a core doing nothing but this,
-  // ~9000 mutex acquisitions a second, on a phone with two performance cores.
+  // waits on ten of them and spent most of a performance core doing nothing
+  // else.
   //
-  // These give it a way to be woken. Every signal bumps the generation and
-  // notifies, so a rescan happens because something was signalled rather than
-  // because a millisecond passed, and the timer becomes a backstop rather than
-  // the mechanism. Lock order is always handle mutex then this one, never the
-  // reverse: the scan releases every handle lock before it waits here.
+  // A shared condition gives the scan a way to be woken, so a rescan happens
+  // because something was signalled rather than because a millisecond passed.
+  // Two things keep that from being just as expensive:
+  //
+  // Only a handle somebody is actually multi-waiting on wakes it. The count
+  // below is incremented for the duration of a scan; a signal to a handle with
+  // no multi-waiters skips the notify entirely. Without it every event and
+  // semaphore in the emulator - thousands a second - woke every multi-waiter,
+  // the generation had always moved by the time a scan finished, the sleep was
+  // therefore always skipped, and the "wait" was a spin. That is what the
+  // profile showed: the audio worker alone was 53% of the process's cycles,
+  // 93% of it inside this function.
+  //
+  // And a WaitAny locks one handle at a time instead of all of them at once. A
+  // wait for *any* handle does not need a consistent snapshot across them: the
+  // first signalled handle it finds is a correct answer. Locking them all did
+  // need one, could not get it with try-lock under contention, and fell back to
+  // yield-and-retry, which is the other way this function burned a core.
+  // wait_all still takes every lock, because it does need the snapshot.
+  //
+  // Lock order is always handle mutex then this one, never the reverse: the
+  // scan releases every handle lock before it waits here.
   static std::mutex& wait_any_mutex() {
     static std::mutex mutex;
     return mutex;
@@ -332,20 +349,59 @@ class PosixConditionBase {
     static uint64_t generation = 0;
     return generation;
   }
-  static void NotifyWaitAny() {
+  // Wakes every multi-handle scan. Used by the paths that are not a handle
+  // signal - queueing a user callback has to break the wait it is meant to
+  // interrupt, and no handle it watches has changed.
+  static void NotifyWaitAnyUnconditional() {
     {
       std::lock_guard<std::mutex> lock(wait_any_mutex());
       ++wait_any_generation();
     }
     wait_any_cond().notify_all();
   }
+  // The signal path. Callers hold this handle's mutex and have already made the
+  // handle signalled, so a scan that misses the notify still sees the state.
+  void NotifyWaitAny() {
+    if (multi_wait_refs_.load(std::memory_order_seq_cst) == 0) {
+      return;
+    }
+    NotifyWaitAnyUnconditional();
+  }
 
-  static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
+  // Marks handles as multi-waited for as long as a scan is running, so signals
+  // to them are worth a notify. Published before the first scan reads any
+  // handle state, which is what makes a signal racing the scan safe: either the
+  // signaller sees the count and wakes us, or it set the state before we looked.
+  class MultiWaitRefs {
+   public:
+    explicit MultiWaitRefs(const std::vector<PosixConditionBase*>& handles) : handles_(handles) {
+      for (auto* handle : handles_) {
+        handle->multi_wait_refs_.fetch_add(1, std::memory_order_seq_cst);
+      }
+    }
+    ~MultiWaitRefs() {
+      for (auto* handle : handles_) {
+        handle->multi_wait_refs_.fetch_sub(1, std::memory_order_seq_cst);
+      }
+    }
+    MultiWaitRefs(const MultiWaitRefs&) = delete;
+    MultiWaitRefs& operator=(const MultiWaitRefs&) = delete;
+
+   private:
+    const std::vector<PosixConditionBase*>& handles_;
+  };
+
+  // `alert_flag`, when given, is the calling thread's pending-user-callback
+  // flag. Returning kTimeout as soon as it is set lets an alertable wait pass
+  // the whole remaining timeout down instead of slicing it into milliseconds
+  // and rescanning between every slice.
+  static std::pair<WaitResult, size_t> WaitMultiple(const std::vector<PosixConditionBase*>& handles,
                                                     bool wait_all,
-                                                    std::chrono::milliseconds timeout) {
+                                                    std::chrono::milliseconds timeout,
+                                                    std::atomic<bool>* alert_flag = nullptr) {
     assert_true(!handles.empty());
 
-    if (handles.size() == 1) {
+    if (handles.size() == 1 && alert_flag == nullptr) {
       auto result = handles[0]->Wait(timeout);
       return std::make_pair(result, 0);
     }
@@ -355,7 +411,20 @@ class PosixConditionBase {
                         ? std::chrono::steady_clock::time_point::max()
                         : start_time + timeout;
 
+    MultiWaitRefs refs(handles);
+
+    // Reused across iterations so a scan does not allocate. Only wait_all needs
+    // it; a WaitAny holds one lock at a time.
+    std::vector<std::unique_lock<std::mutex>> locks;
+    if (wait_all) {
+      locks.reserve(handles.size());
+    }
+
     while (true) {
+      if (alert_flag != nullptr && alert_flag->load(std::memory_order_acquire)) {
+        return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
+      }
+
       // Read before the scan: a signal that arrives while scanning changes this,
       // and the wait below then returns immediately instead of sleeping through
       // the thing it was waiting for.
@@ -367,40 +436,59 @@ class PosixConditionBase {
 
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
-      bool all_locked = true;
 
-      std::vector<std::unique_lock<std::mutex>> locks;
-      locks.reserve(handles.size());
-
-      for (size_t i = 0; i < handles.size(); ++i) {
+      if (!wait_all) {
+        // One handle at a time. No try-lock, so no contention spin.
+        for (size_t i = 0; i < handles.size(); ++i) {
+          auto* handle = handles[i];
 #if REX_HAS_ROBUST_MUTEX
-        auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
-        int result = pthread_mutex_trylock(native_mutex);
-        if (result == 0 || result == EOWNERDEAD) {
+          auto native_mutex = static_cast<pthread_mutex_t*>(handle->mutex_.native_handle());
+          int result = pthread_mutex_lock(native_mutex);
           if (result == EOWNERDEAD) {
             pthread_mutex_consistent(native_mutex);
+          } else if (result != 0) {
+            continue;
           }
-          locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
-        } else {
-          all_locked = false;
-          break;
-        }
+          std::unique_lock<std::mutex> lock(handle->mutex_, std::adopt_lock);
 #else
-        locks.emplace_back(handles[i]->mutex_, std::try_to_lock);
-        if (!locks.back().owns_lock()) {
-          all_locked = false;
-          break;
-        }
+          std::unique_lock<std::mutex> lock(handle->mutex_);
 #endif
-      }
-
-      if (!all_locked) {
+          if (handle->signaled()) {
+            handle->post_execution();
+            return std::make_pair(WaitResult::kSuccess, i);
+          }
+        }
+      } else {
+        bool all_locked = true;
         locks.clear();
-        std::this_thread::yield();
-        continue;
-      }
+        for (size_t i = 0; i < handles.size(); ++i) {
+#if REX_HAS_ROBUST_MUTEX
+          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+          int result = pthread_mutex_trylock(native_mutex);
+          if (result == 0 || result == EOWNERDEAD) {
+            if (result == EOWNERDEAD) {
+              pthread_mutex_consistent(native_mutex);
+            }
+            locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
+          } else {
+            all_locked = false;
+            break;
+          }
+#else
+          locks.emplace_back(handles[i]->mutex_, std::try_to_lock);
+          if (!locks.back().owns_lock()) {
+            all_locked = false;
+            break;
+          }
+#endif
+        }
 
-      if (wait_all) {
+        if (!all_locked) {
+          locks.clear();
+          std::this_thread::yield();
+          continue;
+        }
+
         bool all_signaled = true;
         for (size_t i = 0; i < handles.size(); ++i) {
           if (!handles[i]->signaled()) {
@@ -412,28 +500,17 @@ class PosixConditionBase {
           }
         }
         condition_met = all_signaled;
-      } else {
-        for (size_t i = 0; i < handles.size(); ++i) {
-          if (handles[i]->signaled()) {
-            first_signaled = i;
-            condition_met = true;
-            break;
-          }
-        }
-      }
 
-      if (condition_met) {
-        if (wait_all) {
+        if (condition_met) {
           for (size_t i = 0; i < handles.size(); ++i) {
             handles[i]->post_execution();
           }
-        } else {
-          handles[first_signaled]->post_execution();
+          locks.clear();
+          return std::make_pair(WaitResult::kSuccess, first_signaled);
         }
-        return std::make_pair(WaitResult::kSuccess, first_signaled);
-      }
 
-      locks.clear();
+        locks.clear();
+      }
 
       auto now = std::chrono::steady_clock::now();
       if (now >= end_time) {
@@ -464,6 +541,9 @@ class PosixConditionBase {
   inline virtual void post_execution() = 0;
   std::condition_variable cond_;
   std::mutex mutex_;
+  // How many multi-handle waits are currently scanning this handle. Read by
+  // NotifyWaitAny to decide whether a signal is worth waking them for.
+  std::atomic<uint32_t> multi_wait_refs_{0};
 };
 
 // There really is no native POSIX handle for a single wait/signal construct
@@ -910,7 +990,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (result != 0) {
       REXSYS_WARN("QueueUserCallback: signal delivery failed ({})", result);
     }
+    // The signal alone does not reliably break a multi-handle scan's sleep, and
+    // no handle it watches has changed, so nothing else would wake it.
+    PosixConditionBase::NotifyWaitAnyUnconditional();
   }
+
+  // Lets an alertable wait block on the whole timeout and still return the
+  // moment a callback is queued, instead of waking every millisecond to look.
+  std::atomic<bool>* user_callback_flag() { return &has_pending_user_callbacks_; }
 
   bool DispatchQueuedUserCallbacks() {
     if (!has_pending_user_callbacks_.load(std::memory_order_acquire)) {
@@ -1081,6 +1168,13 @@ bool DispatchCurrentThreadUserCallback() {
   return current_thread_condition_ && current_thread_condition_->DispatchQueuedUserCallbacks();
 }
 
+std::atomic<bool>* CurrentThreadUserCallbackFlag() {
+  if (!current_thread_condition_) {
+    Thread::GetCurrentThread();
+  }
+  return current_thread_condition_ ? current_thread_condition_->user_callback_flag() : nullptr;
+}
+
 namespace {
 
 constexpr auto kAlertablePollSlice = std::chrono::milliseconds(1);
@@ -1112,6 +1206,17 @@ std::chrono::steady_clock::time_point ComputeAlertableDeadline(std::chrono::mill
 bool HasAlertableTimeoutElapsed(std::chrono::steady_clock::time_point deadline) {
   return deadline != std::chrono::steady_clock::time_point::max() &&
          std::chrono::steady_clock::now() >= deadline;
+}
+
+std::chrono::milliseconds ComputeRemainingWaitTimeout(
+    std::chrono::steady_clock::time_point deadline) {
+  if (deadline == std::chrono::steady_clock::time_point::max()) {
+    return std::chrono::milliseconds::max();
+  }
+  auto remaining =
+      std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+  return remaining <= std::chrono::milliseconds::zero() ? std::chrono::milliseconds::zero()
+                                                        : remaining;
 }
 
 std::chrono::milliseconds ComputeAlertableWaitTimeout(
@@ -1238,11 +1343,16 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
     conditions.push_back(&handle->condition());
   }
   if (!is_alertable) {
-    return PosixConditionBase::WaitMultiple(std::move(conditions), wait_all, timeout);
+    return PosixConditionBase::WaitMultiple(conditions, wait_all, timeout);
   }
 
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
+  // With the flag in hand the wait returns as soon as a callback is queued, so
+  // it can be given the whole remaining timeout. Without it - a host thread with
+  // no condition of its own - fall back to slicing, which is correct but wakes
+  // a thousand times a second.
+  std::atomic<bool>* alert_flag = CurrentThreadUserCallbackFlag();
   while (true) {
     if (DispatchCurrentThreadUserCallback()) {
       return std::make_pair(WaitResult::kUserCallback, 0);
@@ -1250,8 +1360,9 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
     if (HasAlertableTimeoutElapsed(deadline)) {
       return std::make_pair(WaitResult::kTimeout, 0);
     }
-    auto result = PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions),
-                                                   wait_all, ComputeAlertableWaitTimeout(deadline));
+    auto slice = alert_flag != nullptr ? ComputeRemainingWaitTimeout(deadline)
+                                       : ComputeAlertableWaitTimeout(deadline);
+    auto result = PosixConditionBase::WaitMultiple(conditions, wait_all, slice, alert_flag);
     if (result.first != WaitResult::kTimeout) {
       return result;
     }

@@ -541,6 +541,13 @@ class Device {
   virtual uint32_t GetSupportedSampleCount(Format format,
                                            uint32_t desired) = 0;
 
+  // Whether the device can sample this format directly from an optimally
+  // tiled image. Asked of the BC formats, where the answer decides between
+  // uploading the guest's blocks as they are and expanding them on the CPU -
+  // a difference of 4x to 8x in texture memory, so it is worth asking rather
+  // than assuming from the platform.
+  virtual bool SupportsSampledTextureFormat(Format format) = 0;
+
   // The command processor's monotonic submission counters: the basis of all
   // lifetime/readback gating.
   virtual uint64_t CurrentSubmission() const = 0;
