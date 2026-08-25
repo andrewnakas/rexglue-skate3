@@ -232,9 +232,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   if (!user_profile->is_signed_in()) {
     if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
-          REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_FUNCTION_FAILED,
-          X_E_NO_SUCH_USER, 0);
+      REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_FUNCTION_FAILED, X_E_NO_SUCH_USER, 0);
       return X_ERROR_IO_PENDING;
     }
     return X_ERROR_FUNCTION_FAILED;
@@ -242,9 +240,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
 
   if (xuids && static_cast<uint64_t>(xuids[0]) != user_profile->xuid()) {
     if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
-          REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_FUNCTION_FAILED,
-          X_E_NO_SUCH_USER, 0);
+      REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_FUNCTION_FAILED, X_E_NO_SUCH_USER, 0);
       return X_ERROR_IO_PENDING;
     }
     return X_ERROR_FUNCTION_FAILED;
@@ -256,8 +252,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   if (!xuids && user_index) {
     // Only support user 0.
     if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediate(
-          REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
+      REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
       return X_ERROR_IO_PENDING;
     }
     return X_ERROR_NO_SUCH_USER;
@@ -283,8 +278,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   if (any_missing) {
     // TODO(benvanik): don't fail? most games don't even check!
     if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediate(
-          REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_INVALID_PARAMETER);
+      REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_INVALID_PARAMETER);
       return X_ERROR_IO_PENDING;
     }
     return X_ERROR_INVALID_PARAMETER;
@@ -317,8 +311,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   }
 
   if (overlapped) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(
-        REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_SUCCESS);
+    REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
   }
   return X_ERROR_SUCCESS;
@@ -351,8 +344,7 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
   if (user_index) {
     // Only support user 0.
     if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
-                                                      X_ERROR_NO_SUCH_USER);
+      REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(overlapped.guest_address(), X_ERROR_NO_SUCH_USER);
       return X_ERROR_IO_PENDING;
     }
     return X_ERROR_NO_SUCH_USER;
@@ -362,8 +354,7 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   if (!user_profile->is_signed_in()) {
     if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
-                                                      X_ERROR_NO_SUCH_USER);
+      REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(overlapped.guest_address(), X_ERROR_NO_SUCH_USER);
       return X_ERROR_IO_PENDING;
     }
     return X_ERROR_NO_SUCH_USER;
@@ -412,7 +403,7 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
   }
 
   if (overlapped) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(), X_ERROR_SUCCESS);
+    REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(overlapped.guest_address(), X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
   }
   return X_ERROR_SUCCESS;
@@ -464,7 +455,7 @@ u32 XamUserContentRestrictionCheckAccess_entry(u32 user_index, u32 unk1, u32 unk
 
   if (overlapped_ptr) {
     // TODO(benvanik): does this need the access arg on it?
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
+    REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(overlapped_ptr, X_ERROR_SUCCESS);
   }
 
   return X_ERROR_SUCCESS;
@@ -522,9 +513,7 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
     return result;
   } else if (overlapped_ptr) {
     assert_true(!out_value);
-    REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
-        overlapped_ptr, result == X_ERROR_SUCCESS ? X_ERROR_SUCCESS : X_ERROR_FUNCTION_FAILED,
-        X_HRESULT_FROM_WIN32(result), result == X_ERROR_SUCCESS ? are_friends : 0);
+    REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(overlapped_ptr, result == X_ERROR_SUCCESS ? X_ERROR_SUCCESS : X_ERROR_FUNCTION_FAILED, X_HRESULT_FROM_WIN32(result), result == X_ERROR_SUCCESS ? are_friends : 0);
     return X_ERROR_IO_PENDING;
   } else {
     assert_always();
@@ -731,7 +720,7 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
   std::memset(buffer_ptr, 0xFF, size);
 
   if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
+    REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(overlapped_ptr, X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
   }
   return X_ERROR_SUCCESS;
@@ -739,7 +728,7 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
 
 u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u32 overlapped_ptr) {
   if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
+    REX_KERNEL_STATE()->CompleteOverlappedDeferredNow(overlapped_ptr, X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
   }
   return X_ERROR_SUCCESS;

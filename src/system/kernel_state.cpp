@@ -1137,20 +1137,25 @@ void KernelState::CompleteOverlappedDeferred(std::move_only_function<X_RESULT()>
 void KernelState::CompleteOverlappedDeferredEx(
     std::move_only_function<X_RESULT(uint32_t&, uint32_t&)> completion_callback,
     uint32_t overlapped_ptr, std::move_only_function<void()> pre_callback,
-    std::move_only_function<void()> post_callback) {
+    std::move_only_function<void()> post_callback, bool skip_delay) {
   REXSYS_DEBUG("CompleteOverlappedDeferredEx: queuing for overlapped {:08X}", overlapped_ptr);
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
   auto global_lock = global_critical_region_.Acquire();
   dispatch_queue_.push_back(
-      [this, overlapped_ptr, completion_callback = std::move(completion_callback),
+      [this, overlapped_ptr, skip_delay, completion_callback = std::move(completion_callback),
        pre_callback = std::move(pre_callback), post_callback = std::move(post_callback)]() mutable {
         REXSYS_DEBUG("Deferred overlapped {:08X}: running pre_callback", overlapped_ptr);
         if (pre_callback) {
           pre_callback();
         }
-        const uint32_t delay_ms = DeferredOverlappedDelayMillis();
+        // The delay exists to make dialog-shaped operations look like they
+        // took time. What actually matters for correctness is completing on
+        // this thread AFTER the caller returned, so a caller told
+        // X_ERROR_IO_PENDING has finished arranging its wait - and for the
+        // small query APIs, paying 100ms each for that would be absurd.
+        const uint32_t delay_ms = skip_delay ? 0u : DeferredOverlappedDelayMillis();
         // Counted at info level: these are rare (dialogs, content enumeration),
         // they serialise on this one thread, and the running total is how the
         // delay's share of boot time gets attributed.
