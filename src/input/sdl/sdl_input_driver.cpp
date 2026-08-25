@@ -101,6 +101,31 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       }
       SDL_Gamepad_initialized_ = true;
 
+      // Adopt controllers that were already attached. Until now this driver
+      // learned about pads only from SDL_EVENT_GAMEPAD_ADDED, so anything
+      // connected before its event watch was installed stayed invisible - and
+      // anything that pumps the event queue earlier in startup (the content
+      // pack chooser does, because it has to read a pad before this driver
+      // exists) consumed those events on the way past. Enumerating here does
+      // not depend on having seen the event.
+      {
+        int pad_count = 0;
+        SDL_JoystickID* pads = SDL_GetGamepads(&pad_count);
+        if (pads != nullptr) {
+          for (int i = 0; i < pad_count; ++i) {
+            SDL_Event added = {};
+            added.type = SDL_EVENT_GAMEPAD_ADDED;
+            added.gdevice.which = pads[i];
+            OnControllerDeviceAddedLocked(added);
+          }
+          if (pad_count > 0) {
+            REXLOG_INFO("SDL: adopted {} controller(s) already attached", pad_count);
+            NotifyTouchOfControllersLocked();
+          }
+          SDL_free(pads);
+        }
+      }
+
       // Load custom controller mappings if available. A relative path is
       // resolved against the application root rather than the working
       // directory, which is undefined when launched from a bundle/Finder.
