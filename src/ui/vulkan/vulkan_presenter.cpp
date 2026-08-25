@@ -1651,10 +1651,15 @@ void VulkanPresenter::RetireSwapchain(VkSwapchainKHR swapchain) {
   if (swapchain == VK_NULL_HANDLE) {
     return;
   }
-  // Three frames is the swapchain's own depth, which is how many presents can
-  // be outstanding against it. Cheap to hold: a retired swapchain owns images
-  // that are already being replaced, and recreations are rare.
-  retired_swapchains_.push_back(RetiredSwapchain{swapchain, 3});
+  // Held for a second of presents rather than the swapchain's own depth.
+  // Awaiting the submission fences does not cover this: they track the
+  // vkQueueSubmit that signalled them, not the presentation completion blocks
+  // Metal still has queued against these images - and there is no Vulkan wait
+  // that does. Those blocks capture the objects freed here, so one copied or
+  // run after the destroy faults on them. Recreations are rare and a swapchain
+  // held an extra second costs a few tens of MB, which is worth more than the
+  // crash it prevents.
+  retired_swapchains_.push_back(RetiredSwapchain{swapchain, 64});
 }
 
 void VulkanPresenter::DrainRetiredSwapchains(bool force) {
@@ -1663,12 +1668,14 @@ void VulkanPresenter::DrainRetiredSwapchains(bool force) {
   }
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+  bool destroyed_any = false;
   for (auto it = retired_swapchains_.begin(); it != retired_swapchains_.end();) {
     if (!force && it->frames_remaining > 0) {
       --it->frames_remaining;
       ++it;
       continue;
     }
+    destroyed_any = true;
     dfn.vkDestroySwapchainKHR(device, it->swapchain, nullptr);
     it = retired_swapchains_.erase(it);
   }

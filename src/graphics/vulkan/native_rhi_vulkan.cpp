@@ -2681,8 +2681,13 @@ class NrDeviceVulkan : public nrhi::Device {
   std::map<FramebufferKey, VkFramebuffer> framebuffers_;
   std::vector<VkDescriptorPool> descriptor_pools_;
   // Destroyed every frame whatever the clock says, so the drain cannot be
-  // starved into falling permanently behind the retire rate.
-  static constexpr size_t kDrainFloorObjects = 24;
+  // starved into falling permanently behind the retire rate. Kept small: a
+  // single vmaDestroyImage of a large texture can run to tens of milliseconds,
+  // and a floor of 24 let a frame spend 62ms destroying five objects because
+  // the time check does not apply until the floor is met. Four bounds that
+  // worst case while still guaranteeing progress; the backlog escalation below
+  // is what handles a genuine flood.
+  static constexpr size_t kDrainFloorObjects = 4;
   // Backlog sizes at which the time budget widens, then stops applying.
   static constexpr size_t kDrainBacklogHigh = 512;
   static constexpr size_t kDrainBacklogUnbounded = 2048;
