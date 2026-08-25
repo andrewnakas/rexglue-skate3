@@ -151,6 +151,15 @@ std::vector<std::string> BuildIOSArguments() {
       // list. This used to be forced off to keep the install WIZARD from
       // running; the wizard is a separate thing and the packs are worth having.
       "--skate3_auto_install_dlc=true",
+      // Present through a command buffer rather than calling presentDrawable
+      // on the drawable itself. Sessions were being ended by a fault inside
+      // MoltenVK's own presentCAMetalDrawable - in the completion block it
+      // hands to Metal - which survived every fix aimed at our own memory,
+      // the swapchain lifetime and the system's low-memory warning, and which
+      // MoltenVK's latest release still has. This route builds that completion
+      // somewhere else and does not fault. The alternative that also worked
+      // was synchronous submits, which costs half the frame rate.
+      "--vulkan_mvk_present_with_command_buffer=true",
       // Per-window frame breakdown. One formatted line every 600 guest frames
       // is far too little traffic to distort what it measures, and without it
       // there is no way to tell a build that helped from one that did not.
