@@ -15,6 +15,12 @@
 #include <SDL3/SDL.h>
 
 #if REX_PLATFORM_IOS
+REXCVAR_DEFINE_BOOL(vulkan_mvk_present_with_command_buffer, false, "GPU/Vulkan",
+                    "Have MoltenVK present through a command buffer instead of calling "
+                    "presentDrawable on the drawable itself. A different route to the same "
+                    "result, and it moves where the presentation completion block is created.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(vulkan_mvk_synchronous_queue_submits, true, "GPU/Vulkan",
                     "Encode Metal command buffers on the thread that submits them. On means the "
                     "encode is a known cost on the critical path; off moves it to MoltenVK's own "
@@ -366,6 +372,16 @@ int main(int argc, char** argv) {
   setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS",
          REXCVAR_GET(vulkan_mvk_synchronous_queue_submits) ? "1" : "0", 1);
   setenv("MVK_CONFIG_LOG_LEVEL", std::to_string(REXCVAR_GET(vulkan_mvk_log_level)).c_str(), 1);
+  // The fault that ends sessions is inside MoltenVK's own presentCAMetalDrawable,
+  // in the completion block it hands to Metal - it survives our own memory
+  // budgets, a deferred swapchain destroy, and answering the system's
+  // low-memory warning, and MoltenVK is already at its latest release. The one
+  // thing that reliably stops it is synchronous submits, which costs half the
+  // frame rate. This is the other route through that code: presenting via a
+  // command buffer rather than the drawable, which creates the completion in a
+  // different place.
+  setenv("MVK_CONFIG_PRESENT_WITH_COMMAND_BUFFER",
+         REXCVAR_GET(vulkan_mvk_present_with_command_buffer) ? "1" : "0", 1);
 #endif
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
