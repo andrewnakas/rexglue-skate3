@@ -38,6 +38,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/thread/timer_queue.h>
 
@@ -70,6 +71,73 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #endif
 #else
 #define REX_HAS_SIGEV_THREAD_ID 0
+#endif
+
+#if defined(__APPLE__)
+REXCVAR_DEFINE_STRING(
+    apple_thread_qos_map, "", "Threading",
+    "Per-thread quality of service on Apple platforms, as "
+    "\"prefix=class;prefix=class;...\" matched against the thread name (first "
+    "matching prefix wins; empty disables the feature and every thread keeps "
+    "the flat USER_INITIATED default). Classes: ui (USER_INTERACTIVE), in "
+    "(USER_INITIATED), def (DEFAULT), ut (UTILITY), bg (BACKGROUND). An A15 "
+    "has two performance cores against four efficiency ones, and the title "
+    "runs six threads that each want a quarter core or more, so leaving the "
+    "frame-critical producers to contend with the streaming pool costs frames "
+    "that no amount of per-thread optimisation recovers.");
+
+namespace {
+
+// Applied to the CALLING thread only - pthread_set_qos_class_self_np is
+// self-only by design, which is why the hook lives on the self-naming paths
+// (a thread names itself before it runs its entry point).
+void ApplyQosForCurrentThreadName(std::string_view name) {
+  if (name.empty()) {
+    return;
+  }
+  const std::string& map = REXCVAR_GET(apple_thread_qos_map);
+  if (map.empty()) {
+    return;
+  }
+  std::string_view rest(map);
+  while (!rest.empty()) {
+    const size_t sep = rest.find(';');
+    std::string_view entry = rest.substr(0, sep);
+    rest = sep == std::string_view::npos ? std::string_view() : rest.substr(sep + 1);
+
+    const size_t eq = entry.find('=');
+    if (eq == std::string_view::npos) {
+      continue;
+    }
+    const std::string_view prefix = entry.substr(0, eq);
+    const std::string_view cls = entry.substr(eq + 1);
+    if (prefix.empty() || name.compare(0, prefix.size(), prefix) != 0) {
+      continue;
+    }
+
+    qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+    if (cls == "ui") {
+      qos = QOS_CLASS_USER_INTERACTIVE;
+    } else if (cls == "in") {
+      qos = QOS_CLASS_USER_INITIATED;
+    } else if (cls == "def") {
+      qos = QOS_CLASS_DEFAULT;
+    } else if (cls == "ut") {
+      qos = QOS_CLASS_UTILITY;
+    } else if (cls == "bg") {
+      qos = QOS_CLASS_BACKGROUND;
+    } else {
+      REXSYS_WARN("thread qos: unknown class \"{}\" for prefix \"{}\"", cls, prefix);
+      return;
+    }
+    // First match wins, so the map reads as an ordered rule list.
+    pthread_set_qos_class_self_np(qos, 0);
+    REXSYS_INFO("thread qos: \"{}\" -> {}", name, cls);
+    return;
+  }
+}
+
+}  // namespace
 #endif
 
 namespace rex::thread {
@@ -848,6 +916,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #if REX_PLATFORM_MAC
       if (pthread_equal(thread_, pthread_self())) {
         pthread_setname_np(std::string(name).c_str());
+        // Every XThread/XHostThread self-names here before it enters its start
+        // routine, so this is the one place a thread's role is known while it
+        // can still set its own quality of service. Naming from ANOTHER thread
+        // is already a no-op above, and so is the QoS that would go with it.
+        ApplyQosForCurrentThreadName(name);
       }
 #else
       pthread_setname_np(thread_, std::string(name).c_str());
@@ -1647,6 +1720,7 @@ void Thread::Exit(int exit_code) {
 void set_current_thread_name(const std::string_view name) {
 #if REX_PLATFORM_MAC
   pthread_setname_np(std::string(name).c_str());
+  ApplyQosForCurrentThreadName(name);
 #else
   pthread_setname_np(pthread_self(), std::string(name).c_str());
 #endif

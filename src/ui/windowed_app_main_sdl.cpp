@@ -178,13 +178,14 @@ std::vector<std::string> BuildIOSArguments() {
       // reachable is holding it: measured on device, an uncapped run starts at
       // 57 fps and decays - 54, then 29, then 4.8, then 0.2 - while the kernel
       // begins killing idle daemons and free memory falls to around 38 MB.
-      // Twice the frame rate is twice the decode, upload and in-flight frame
-      // residency, on a 4 GB phone that had no headroom at 30. A locked 30 with
-      // half the budget spare is worth more than a 60 that lasts four minutes.
-      //
-      // Raise it from Documents/user/ios_args.txt (skate3_guest_fps_cap=60)
-      // when the residency work lands; no rebuild needed.
-      "--skate3_guest_fps_cap=30",
+      // 60 as of the residency + GPU work this comment used to wait on:
+      // suppress_mode=1 took GPU time from 17.8-19.4 ms to 11.0-11.9 ms, the
+      // occlusion cull now runs on iOS at all (its depth grid had only ever
+      // been produced inside the SSAO pass, which iOS disables), and the cache
+      // budgets below hold the resident set near 1 GB instead of 1.4 GB.
+      // Measured locked 60 on an iPhone 13 mini: p50 16.7 ms, p95 16.8-17.8 ms.
+      // Drop to 30 from Documents/user/ios_args.txt on a smaller device.
+      "--skate3_guest_fps_cap=60",
       "--skate3_guest_fps_cap_auto=false",
 
       // ---- Cache budgets --------------------------------------------------
@@ -196,8 +197,34 @@ std::vector<std::string> BuildIOSArguments() {
       // the binding constraint. Textures cost more here than the numbers
       // suggest, too, since Metal exposes no BC formats and every DXT surface
       // is expanded to RGBA8 on upload (8x for DXT1).
-      "--skate3_native_render_scene_tex_store_mb=512",
-      "--skate3_native_render_scene_mesh_store_mb=384",
+      "--skate3_native_render_scene_tex_store_mb=288",
+      "--skate3_native_render_scene_mesh_store_mb=224",
+
+      // The Xenos texture cache is a SEPARATE budget from the two above, and
+      // on device it is the largest single consumer of device-local memory:
+      // measured heap0 use=1448MB while the native stores held only 414MB and
+      // upload buffers 165MB. Menus and loading always render fully (the
+      // native renderer yields there), so it fills to its HARD limit during
+      // every map load and then sits there, because gameplay - with the
+      // emulated passes suppressed - never touches it again to age it out.
+      // The soft limit cannot bound that; only the hard one can. Leaving it at
+      // the desktop 2048/4096 ran the process to ~1.4 GB resident, which is
+      // where the MoltenVK presentation fault starts firing.
+      "--texture_cache_memory_limit_soft=256",
+      "--texture_cache_memory_limit_hard=320",
+      "--texture_cache_memory_limit_soft_lifetime=30",
+      "--texture_cache_memory_limit_render_to_texture=24",
+
+      // Suppress the emulated Xenos passes the native renderer replaces.
+      // Mode 2 keeps the memory-composition passes alive; measured with GPU
+      // timestamps, what they leave behind costs ~7 ms/frame - render-pass
+      // entry alone was 3.2 ms across 10 passes, and on a tile GPU every pass
+      // entry is a tile load/store. Total GPU time was 17.8-19.4 ms against a
+      // 16.67 ms budget; mode 1 brings it to 11.0-11.9 ms, which is the
+      // difference between ~50 fps and a locked 60. Mode 1 is documented to
+      // break mid-gameplay lightmap page composition; it was not visible in
+      // play testing on an iPhone 13 mini, but set 2 if lighting looks wrong.
+      "--native_render_suppress_mode=1",
 
       // ---- Memory budget -------------------------------------------------
       // A 4 GB iPhone allows roughly 2 GB resident, near 3 GB with the

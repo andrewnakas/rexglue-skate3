@@ -59,9 +59,16 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
   }
   // Unbounded logging here would itself be the problem: a caller in a loop can
   // hit this every frame, and each line is a synchronous write.
+  //
+  // The rate has to fall off GEOMETRICALLY, not by a fixed 1-in-N. A 1-in-256
+  // throttle still wrote seven MILLION lines when this fired 1.8 billion times
+  // from a linked-list walk whose node carried a bad function pointer, and the
+  // logging - not the bad call - is what turned a recoverable fault into a hang
+  // that needed the watchdog. Powers of two bound the whole session to a few
+  // dozen lines while still showing the growth rate.
   static std::atomic<uint64_t> s_count{0};
   const uint64_t n = s_count.fetch_add(1, std::memory_order_relaxed);
-  if (n < 8 || (n & 0xFF) == 0) {
+  if (n < 8 || (n & (n - 1)) == 0) {
     REXCPU_ERROR(
         "Call to invalid or unregistered function at guest address 0x{:08X} "
         "(occurrence {}, guest lr=0x{:08X}); returning to the caller instead of "
