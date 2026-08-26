@@ -47,6 +47,16 @@
 #include <rex/ui/surface_win.h>
 #endif
 
+REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 2, "UI/Vulkan",
+                     "How many paint submissions may be outstanding at once. Must stay "
+                     "BELOW the swapchain image count: a submission fence signals when the "
+                     "GPU finished rendering, not when the drawable was presented and "
+                     "returned to the pool, so allowing as many frames in flight as there "
+                     "are images lets the next acquire block forever on a drawable nothing "
+                     "will release. 3 restores the old behaviour.")
+    .range(1, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
@@ -1715,6 +1725,25 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   uint64_t current_paint_submission_index =
       paint_context_.submission_tracker.GetCurrentSubmission();
   uint64_t paint_submission_count = uint64_t(paint_context_.submissions.size());
+  // Keep strictly fewer frames in flight than the swapchain has images.
+  //
+  // The submission fence says the GPU finished RENDERING; it does not say the
+  // drawable was presented and handed back to CAMetalLayer's pool - that
+  // happens later, in a presentation completion block on another thread. With
+  // three submissions against a three-image swapchain (which is the maximum
+  // the surface offers here) the pipeline can wrap around and ask for a fourth
+  // drawable while all three are still held, and getCAMetalDrawable then
+  // blocks - forever, since nothing else will release one.
+  //
+  // That is the hang: every dump of it shows the main thread parked in
+  // vkWaitForFences under PaintAndPresentImpl while a MoltenVK thread sits in
+  // getCAMetalDrawable. It explains the startup hangs and the hang coming back
+  // from suspend as the same bug, which is why neither had a trigger anyone
+  // could pin down. Leaving one image spare costs a little pipelining and
+  // cannot deadlock.
+  const uint64_t max_frames_in_flight =
+      uint64_t(std::max(1, REXCVAR_GET(vulkan_max_frames_in_flight)));
+  paint_submission_count = std::min(paint_submission_count, max_frames_in_flight);
   if (current_paint_submission_index >= paint_submission_count) {
     paint_context_.submission_tracker.AwaitSubmissionCompletion(current_paint_submission_index -
                                                                 paint_submission_count);
