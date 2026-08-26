@@ -38,6 +38,39 @@ int SDLWindowedAppContext::RunMainLoop() {
     return EXIT_SUCCESS;
   }
 
+  // iOS lifecycle events must be handled from an event WATCH, not from the
+  // loop below. UIKit suspends the process as soon as its delegate returns, so
+  // an event that is merely queued for SDL_WaitEvent is not seen until the app
+  // is already coming back - far too late to act on. SDL dispatches watches
+  // synchronously from the delegate, which is the only point where releasing
+  // memory still changes whether the system evicts us.
+  //
+  // This is why the low-memory handler appeared never to fire: the event was
+  // being queued and arriving too late to matter, not going missing.
+  SDL_AddEventWatch(
+      [](void* userdata, SDL_Event* event) -> bool {
+        auto* context = static_cast<SDLWindowedAppContext*>(userdata);
+        switch (event->type) {
+          case SDL_EVENT_WILL_ENTER_BACKGROUND:
+          case SDL_EVENT_LOW_MEMORY:
+            // Jetsam evicts suspended processes largest-first, and this one
+            // sits near a gigabyte, most of it caches it cannot use while
+            // suspended. Handing them back here is the difference between
+            // resuming and relaunching. They refill from guest memory.
+            REXLOG_INFO("app lifecycle: releasing caches before suspending (event {})",
+                        uint32_t(event->type));
+            if (context->low_memory_handler_) {
+              context->low_memory_handler_();
+            }
+            break;
+          default:
+            break;
+        }
+        // Watches observe; the event still goes to the queue.
+        return true;
+      },
+      this);
+
   SDL_Event event;
   while (!HasQuitFromUIThread() && SDL_WaitEvent(&event)) {
     DispatchEvent(event);
