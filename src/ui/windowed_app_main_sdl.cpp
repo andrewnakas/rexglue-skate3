@@ -250,12 +250,24 @@ std::vector<std::string> BuildIOSArguments() {
       "--skate3_native_render_scene_bloom=false",
       "--skate3_native_render_scene_shafts=false",
       // Draw and LOD distance drive how much of the world is resident at
-      // once, which is guest-heap pressure rather than GPU memory. Deliberately
-      // NOT set here any more: these were pinned to 1.0, which beats
-      // settings.toml, so a player who had asked for 0.75 was silently given
-      // the full distance - and the extra residency shows up as texture store
-      // above its budget, continuous eviction, and multi-millisecond frames
-      // spent destroying what was evicted. Let the file decide.
+      // once, which is guest-heap pressure rather than GPU memory.
+      //
+      // Both cvars DEFAULT TO 2.0 - twice what the console drew - and leaving
+      // them unset here meant every iOS device ran at twice the draw radius,
+      // so roughly four times the world area resident and streaming. That is
+      // affordable standing still and is not affordable at speed: crossing
+      // streaming cell boundaries fast turns it into whole-second frames, and
+      // it is why "it deteriorates once you get going" was reproducible while
+      // the median frame stayed a perfect 16.7 ms.
+      //
+      // 1.0 is the ORIGINAL CONSOLE behavior, not a degradation below it, and
+      // it measurably cut the guest render thread from 90-95% of a core to
+      // 53-83%. The earlier objection to setting these - that pinning them
+      // beats settings.toml, so someone asking for 0.75 silently got more -
+      // is answered by Documents/user/ios_args.txt, which overrides anything
+      // here without a rebuild.
+      "--skate3_draw_distance_scale=1.0",
+      "--skate3_lod_distance_scale=1.0",
 
       // ---- Command processor stalls --------------------------------------
       // Skate 3 parks the command processor on a WAIT_REG_MEM poll that never
