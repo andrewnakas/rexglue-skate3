@@ -175,7 +175,31 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
 
   // context.work_buffer = context_init->work_buffer;  // ?
   context.subframe_decode_count = context_init->subframe_decode_count;
+  // `>= 1` looks wrong next to upstream Xenia's `== 2`, and it is NOT - the
+  // fields in XMA_CONTEXT_INIT are ENCODED, not literal. sample_rate is an enum
+  // index run through kIdToSampleRate (the title passes 3, meaning 48000Hz),
+  // and channel_count is likewise 0-based: measured on device, the title only
+  // ever passes 0 or 1, never 2. So 0 = mono and 1 = stereo, and `>= 1` is the
+  // correct test. Changing it to `== 2` marks every stream mono and collapses
+  // stereo - verified and reverted 2026-08-25. Do not "fix" this again.
   context.is_stereo = context_init->channel_count >= 1;
+
+  // One-shot visibility: this whole function is bypassed if the title drives
+  // XMA contexts by direct memory writes instead of XMAInitializeContext, in
+  // which case the line above cannot be responsible for anything. Log the
+  // first few calls at info so that question is answerable from a normal
+  // device log rather than a debug build.
+  static uint32_t xma_init_log_count = 0;
+  if (xma_init_log_count < 8) {
+    REXKRNL_INFO(
+        "XMAInitializeContext: channel_count={} sample_rate={} is_stereo={} "
+        "subframe_decode_count={} in0_packets={} in1_packets={}",
+        uint32_t(context_init->channel_count), uint32_t(context_init->sample_rate),
+        uint32_t(context.is_stereo), uint32_t(context_init->subframe_decode_count),
+        uint32_t(context_init->input_buffer_0_packet_count),
+        uint32_t(context_init->input_buffer_1_packet_count));
+    xma_init_log_count++;
+  }
   context.sample_rate = context_init->sample_rate;
 
   context.loop_start = context_init->loop_data.loop_start;

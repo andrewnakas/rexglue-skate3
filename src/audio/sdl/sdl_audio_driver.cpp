@@ -42,6 +42,15 @@ REXCVAR_DEFINE_BOOL(audio_stats, false, "Audio",
                     "crackling audio reports.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(audio_device_channels, 0, "Audio",
+                     "Channel count to open the audio device with (0 = ask the device, "
+                     "2 = force stereo and do the 5.1 fold ourselves, 6 = force 5.1). "
+                     "SDL clamps the device to at least the requested channel count, and "
+                     "the iOS backend deliberately never adjusts it, so 'ask the device' "
+                     "always answers 6 there - the built-in stereo fold is then left to "
+                     "CoreAudio on an untested route. Force 2 to take our own downmix.")
+    .range(0, 6);
+
 REXCVAR_DEFINE_INT32(audio_device_sample_frames, 0, "Audio",
                      "Requested audio device buffer size in sample frames (0 = backend default). "
                      "Larger values (e.g. 1024 or 2048) add latency but tolerate scheduling "
@@ -90,12 +99,19 @@ bool SDLAudioDriver::Initialize() {
   }
   sdl_initialized_ = true;
 
+  // 0 asks the device; 2 or 6 pins it. Anything else is treated as "ask".
+  const int32_t forced_channels = REXCVAR_GET(audio_device_channels);
+  const uint8_t initial_channels =
+      (forced_channels == 2 || forced_channels == 6)
+          ? static_cast<uint8_t>(forced_channels)
+          : static_cast<uint8_t>(frame_channels_);
+
   SDL_AudioSpec desired_spec = {};
   SDL_AudioSpec obtained_spec = {};
   desired_spec.freq = frame_frequency_;
   desired_spec.format = SDL_AUDIO_F32LE;
-  desired_spec.channels = frame_channels_;
-  sdl_device_channels_ = frame_channels_;
+  desired_spec.channels = initial_channels;
+  sdl_device_channels_ = initial_channels;
   sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
                                           SDLCallback, this);
   if (!sdl_stream_) {
@@ -114,7 +130,7 @@ bool SDLAudioDriver::Initialize() {
     obtained_spec = desired_spec;
   }
 
-  if (obtained_spec.channels == 2) {
+  if (forced_channels == 0 && obtained_spec.channels == 2) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
     desired_spec.channels = 2;
@@ -147,6 +163,25 @@ bool SDLAudioDriver::Initialize() {
     if (SDL_GetAudioDeviceFormat(sdl_device, &active_spec, &device_sample_frames) &&
         device_sample_frames > 0) {
       SetAutoDeviceSampleFrames(device_sample_frames);
+    }
+  }
+
+  // What the device actually settled on was never recorded anywhere, which
+  // made every audio report on this port guesswork. The guest side is fixed at
+  // 48000Hz / 6ch / 256 samples per frame (187.5 frames a second); a device
+  // that disagrees on rate is resampled by SDL, and one that disagrees on
+  // channels decides whether our own 5.1 fold runs at all.
+  {
+    SDL_AudioSpec active_spec = {};
+    int device_sample_frames = 0;
+    if (SDL_GetAudioDeviceFormat(sdl_device, &active_spec, &device_sample_frames)) {
+      REXAPU_INFO(
+          "SDLAudioDriver: device freq={}Hz channels={} sample_frames={} ({:.1f}ms); "
+          "guest 48000Hz/6ch/256 -> pushing {}ch, fold={}",
+          active_spec.freq, active_spec.channels, device_sample_frames,
+          active_spec.freq > 0 ? (double(device_sample_frames) * 1000.0 / active_spec.freq) : 0.0,
+          uint32_t(sdl_device_channels_),
+          sdl_device_channels_ == 2 ? "ours (5.1->stereo)" : "device");
     }
   }
 
@@ -299,6 +334,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
             conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_);
             break;
           default:
+            // `data` is SDL_stack_alloc (alloca) and therefore uninitialized,
+            // and assert_unhandled_case compiles to nothing under NDEBUG - so
+            // in a release build an unexpected channel count pushed raw stack
+            // contents to the speaker. Emit silence instead.
+            std::memset(data, 0, len);
             assert_unhandled_case(driver->sdl_device_channels_);
             break;
         }

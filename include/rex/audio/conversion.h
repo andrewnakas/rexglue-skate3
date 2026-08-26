@@ -91,8 +91,13 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
     float fl = rex::byte_swap(input[0 * ch_sample_count + sample]);
     float fr = rex::byte_swap(input[1 * ch_sample_count + sample]);
     float fc = rex::byte_swap(input[2 * ch_sample_count + sample]);
-    float br = rex::byte_swap(input[4 * ch_sample_count + sample]);
-    float bl = rex::byte_swap(input[5 * ch_sample_count + sample]);
+    // Channel 4 is BL and channel 5 is BR, per the documented order in the
+    // comment above and per the SSE path, which binds them that way. These two
+    // names were inverted here, so rear-left was mixed into the right output
+    // and rear-right into the left - an arm64-only channel swap, and arm64 is
+    // the path every iOS build takes.
+    float bl = rex::byte_swap(input[4 * ch_sample_count + sample]);
+    float br = rex::byte_swap(input[5 * ch_sample_count + sample]);
     float center_halved = fc * 0.5f;
     output[sample * 2] = (fl + bl + center_halved) * (1.0f / 2.5f);
     output[sample * 2 + 1] = (fr + br + center_halved) * (1.0f / 2.5f);

@@ -31,6 +31,13 @@ extern "C" {
 
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
 
+REXCVAR_DEFINE_BOOL(xma_stats, false, "Audio",
+                    "Log a 5-second XMA decode line: frames decoded, 256-byte output blocks "
+                    "written, active contexts, and why Work() made no progress. audio_stats "
+                    "covers the device side; this covers the stage that FEEDS it. Turn on "
+                    "when audio plays slow or stretched while the device stats look clean.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
 // decoders. Later games use XAudio*() and direct memory writes to the XMA
@@ -147,17 +154,66 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 }
 
 void XmaDecoder::WorkerThreadMain() {
+  auto stats_window_start = std::chrono::steady_clock::now();
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
+    uint32_t active = 0;
+    const bool stats_enabled = REXCVAR_GET(xma_stats);
     for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
       XmaContext& context = contexts_[n];
+      if (stats_enabled && context.is_allocated() && context.is_enabled()) {
+        active++;
+      }
       bool worked = context.Work();
       if (worked) {
         context.SignalWorkDone();
         PROFILE_XMA_FRAME_DECODED();
       }
       did_work = did_work || worked;
+    }
+
+    if (stats_enabled) {
+      using Stats = XmaContext::DecodeStats;
+      (did_work ? Stats::work_progress : Stats::work_no_progress)
+          .fetch_add(1, std::memory_order_relaxed);
+      Stats::active_contexts.store(active, std::memory_order_relaxed);
+
+      const auto now = std::chrono::steady_clock::now();
+      const auto window = now - stats_window_start;
+      if (window >= std::chrono::seconds(5)) {
+        const double secs = std::chrono::duration<double>(window).count();
+        const uint64_t frames = Stats::frames_decoded.exchange(0, std::memory_order_relaxed);
+        const uint64_t blocks = Stats::blocks_written.exchange(0, std::memory_order_relaxed);
+        const uint64_t prog = Stats::work_progress.exchange(0, std::memory_order_relaxed);
+        const uint64_t noprog = Stats::work_no_progress.exchange(0, std::memory_order_relaxed);
+        const uint64_t nospace = Stats::no_output_space.exchange(0, std::memory_order_relaxed);
+        const uint64_t ringinv = Stats::ring_marked_invalid.exchange(0, std::memory_order_relaxed);
+        const uint64_t inv_after_wr =
+            Stats::invalid_after_write.exchange(0, std::memory_order_relaxed);
+        const uint64_t dec_us = Stats::decode_us.exchange(0, std::memory_order_relaxed);
+        const uint32_t voices = Stats::TakeVoiceCount();
+
+        // A 256-byte block is 128 int16 samples, so one frame (512 samples per
+        // channel) is 10.67ms of audio. frames/s divided by 93.75 is therefore
+        // the number of voices being sustained at real time - the useful
+        // reading. active_ctx counts ALLOCATED contexts, which the free-running
+        // model pins at 256 and which is NOT a voice count.
+        //
+        // invalid_after_write is the one that matters: clearing
+        // output_buffer_valid right after writing means the ring wrapped to
+        // read==write and the guest is being told "no data" about audio we
+        // just produced.
+        REXAPU_INFO(
+            "XMA stats ({:.1f}s): frames={} ({:.0f}/s = {:.1f} voices at real time) "
+            "blocks={} ({:.0f}/s) active_ctx={} | sweeps prog={} noprog={} "
+            "no_output_space={} ring_marked_invalid={} (after-a-write={}) | REAL voices={} "
+            "need={:.0f} frames/s, decode_cpu={:.1f}% of one core",
+            secs, frames, double(frames) / secs, double(frames) / secs / 93.75, blocks,
+            double(blocks) / secs, active, prog, noprog, nospace, ringinv, inv_after_wr,
+            voices, double(voices) * 93.75, double(dec_us) / (secs * 1e6) * 100.0);
+        stats_window_start = now;
+      }
     }
 
     if (paused_) {

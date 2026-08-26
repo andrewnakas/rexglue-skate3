@@ -10,6 +10,7 @@
 */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <tuple>
 
@@ -38,6 +39,83 @@ extern "C" {
 
 // Credits for most of this code goes to:
 // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
+
+// Defined in xma_decoder.cpp; gates the diagnostic logging in this file too.
+REXCVAR_DECLARE(bool, xma_stats);
+
+REXCVAR_DEFINE_BOOL(
+    xma_old_fix_input_overrun, true, "Audio",
+    "Treat a next-frame offset that lands past the end of the input buffer as "
+    "end-of-buffer and swap cleanly, instead of storing it and tripping the "
+    "range check on the following call. That check logs "
+    "'input offset N exceeds buffer size N' (measured 16416 vs 16384 - exactly "
+    "one packet header past a single-packet streaming buffer, thousands of "
+    "times per session) and then swaps the buffer out mid-stream, splicing the "
+    "audio. false restores the old behaviour.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    xma_old_fix_split_detection, true, "Audio",
+    "Treat an XMA frame that does not fit in the remainder of its packet as "
+    "SPLIT, regardless of what the frame-count scan said. "
+    "GetPacketFrameCountOld returns early when fewer than 15 bits remain and "
+    "reports a straddling frame header as not-split, after which the old "
+    "decode path copies only the bits left in the packet but still hands "
+    "ffmpeg a packet sized for the FULL frame - so ffmpeg decodes zero padding "
+    "as bitstream. Measured: ~5200 num_vec_coeffs/spectral-RLE/fill-bit errors "
+    "per session on the old path and zero on the new one, which already fixes "
+    "this in GetPacketInfo. false restores the old behaviour.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    xma_old_decoder_merged_store, true, "Audio",
+    "Write back only decoder-owned context fields after an old-path decode "
+    "instead of blindly re-storing all 16 dwords. XMA_CONTEXT_DATA::Store() "
+    "copies the WHOLE struct, so the context read before an ffmpeg decode is "
+    "stamped back after it - clobbering anything the guest changed meanwhile, "
+    "including output_buffer_read_offset (dword 9, game-owned: rewinding it "
+    "makes the game replay audio it already played) and the voice config in "
+    "dwords 0/1 (block_count, packet_count, subframe_decode_count, sample_rate, "
+    "is_stereo). Upstream Xenia has the same whole-struct write-back; "
+    "StoreContextMerged was written here to fix it but was only wired into the "
+    "new decoder path, which is not the default. false restores the old "
+    "behaviour.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    xma_ring_track_full, false, "Audio",
+    "Remember when a decode filled the output ring exactly to read_offset, so "
+    "the next call treats that read==write as FULL rather than as an empty "
+    "ring with the whole capacity free. Without this the decoder overwrites "
+    "audio the game has not read yet (garbled speech, repeated fragments); "
+    "reserving a block instead avoids the state but starves the decoder, "
+    "because the game hands us exactly one frame of room at a time.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    xma_ring_reserve_block, false, "Audio",
+    "Keep one 256-byte block of the XMA output ring free so write_offset can "
+    "never land exactly on read_offset. That state is ambiguous - empty() and "
+    "write_count() both read it as EMPTY - so a ring filled to the brim looks "
+    "completely free on the next call and the decoder overwrites audio the "
+    "game has not read yet (heard as repeated fragments, gibberish speech and "
+    "buzz). Reserving a block makes full and empty distinguishable, which is "
+    "the standard fix for this and makes empty() mean what the surrounding "
+    "code assumes. false restores the old behaviour.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    xma_ring_full_is_not_empty, false, "Audio",
+    "Do not clear output_buffer_valid when the output ring wrapped to "
+    "read==write as a result of THIS decode. RingBuffer::empty() is "
+    "read_offset==write_offset, which is equally true when the ring is exactly "
+    "full - write_count() returns full capacity for that same state - so the "
+    "old test cannot tell 'drained' from 'just filled'. Measured on device: the "
+    "game holds read_offset exactly one frame ahead, so every single decoded "
+    "frame filled the ring exactly and was then declared invalid "
+    "(ring_marked_invalid after-a-write == frames decoded, exactly). false "
+    "restores the old behaviour.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(xma_use_old_decoder, true, "Audio",
                     "Use the xenia-edge old XMA decoder path. This avoids Skate 3 one-shot SFX "
@@ -150,7 +228,11 @@ bool XmaContext::Work() {
   const int32_t minimum_subframe_decode_count =
       static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
 
+  const uint32_t entry_write_offset = output_rb.write_offset();
+  const int32_t entry_free_blocks = remaining_subframe_blocks_in_output_buffer_;
+
   if (minimum_subframe_decode_count > remaining_subframe_blocks_in_output_buffer_) {
+    DecodeStats::no_output_space.fetch_add(1, std::memory_order_relaxed);
     StoreContextMerged(data, initial_data, context_ptr);
     return false;
   }
@@ -166,8 +248,45 @@ bool XmaContext::Work() {
 
   data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
 
-  if (output_rb.empty()) {
+  const bool wrote_this_call = output_rb.write_offset() != entry_write_offset;
+  if (output_rb.read_offset() != output_rb.write_offset()) {
+    output_ring_full_at_ = -1;  // unambiguous again
+  } else if (wrote_this_call) {
+    output_ring_full_at_ = static_cast<int64_t>(output_rb.write_offset());
+  }
+  // A ring we just wrote into that now reads read==write is FULL, not empty.
+  const bool ring_is_really_empty =
+      output_rb.empty() && !(REXCVAR_GET(xma_ring_full_is_not_empty) && wrote_this_call);
+  if (ring_is_really_empty) {
+    // RingBuffer::empty() is read_offset == write_offset, which is ALSO true
+    // when the ring is exactly full - the class's own write_count() returns
+    // full capacity for that state. So this cannot distinguish "drained" from
+    // "just filled it to the brim", and clearing output_buffer_valid on the
+    // second case strands audio the guest can never see.
+    DecodeStats::ring_marked_invalid.fetch_add(1, std::memory_order_relaxed);
     data.output_buffer_valid = 0;
+  }
+  if (output_rb.empty() && wrote_this_call) {
+    // Counted whether or not it now clears the flag, so the stats line stays
+    // comparable across the cvar.
+    DecodeStats::invalid_after_write.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Bounded burst trace of the real ring geometry - 40 lines, once per run.
+  // Theory kept failing here, so print the actual numbers.
+  if (REXCVAR_GET(xma_stats)) {
+    static std::atomic<uint32_t> trace_count{0};
+    uint32_t n = trace_count.load(std::memory_order_relaxed);
+    if (n < 40 && trace_count.compare_exchange_strong(n, n + 1, std::memory_order_relaxed)) {
+      REXAPU_INFO(
+          "XMA ring ctx={} blocks={} cap={}B rd={}B wr={} -> {} wrote={} free_at_entry={} "
+          "sdc={} pad={} stereo={} empty_now={}",
+          id(), uint32_t(data.output_buffer_block_count), output_rb.capacity(),
+          output_rb.read_offset(), entry_write_offset, output_rb.write_offset(),
+          wrote_this_call ? "yes" : "no", entry_free_blocks,
+          uint32_t(data.subframe_decode_count), uint32_t(data.output_buffer_padding),
+          uint32_t(data.is_stereo), output_rb.empty() ? "yes" : "no");
+    }
   }
 
   StoreContextMerged(data, initial_data, context_ptr);
@@ -216,6 +335,7 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
   data->input_buffer_1_valid = 0;
   data->output_buffer_valid = 0;
 
+  output_ring_full_at_ = -1;  // a reused voice must not inherit a full ring
   data->input_buffer_read_offset =
       REXCVAR_GET(xma_use_old_decoder) ? 0 : kBitsPerPacketHeader;
   data->output_buffer_read_offset = 0;
@@ -406,6 +526,18 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
   output_rb.set_write_offset(output_write_offset);
   remaining_subframe_blocks_in_output_buffer_ =
       static_cast<int32_t>(output_rb.write_count()) / kOutputBytesPerBlock;
+  if (REXCVAR_GET(xma_ring_track_full) && output_rb.read_offset() == output_rb.write_offset() &&
+      output_ring_full_at_ == static_cast<int64_t>(output_rb.write_offset())) {
+    // Known-full: no free space, despite write_count() claiming the lot.
+    remaining_subframe_blocks_in_output_buffer_ = 0;
+  }
+  if (REXCVAR_GET(xma_ring_reserve_block)) {
+    // Never write the last free block: write_offset landing on read_offset is
+    // indistinguishable from an empty ring in this RingBuffer (write_count()
+    // returns full capacity for read==write), so filling to the brim makes the
+    // NEXT call believe the whole buffer is free and clobber unread audio.
+    remaining_subframe_blocks_in_output_buffer_ -= 1;
+  }
 
   return output_rb;
 }
@@ -528,6 +660,11 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
   // DWORD 2: input_buffer_read_offset (0-25) + error_status (26-30).
   cas_update(2, 0x7FFFFFFFu, d[2] & 0x7FFFFFFFu);
 
+  // DWORD 3: parser_error_status (26-30) + parser_error_set (31). loop_start
+  // shares this dword and is game-owned (XMASetLoopData), so mask to the
+  // error bits only. The old decode path is the one that sets these.
+  cas_update(3, 0xFC000000u, d[3] & 0xFC000000u);
+
   // DWORD 4: current_buffer (bit 31).
   cas_update(4, 0x80000000u, d[4] & 0x80000000u);
 }
@@ -569,6 +706,9 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
 
   output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
                    subframes_to_write * kOutputBytesPerBlock);
+  if (subframes_to_write > 0) {
+    DecodeStats::blocks_written.fetch_add(uint64_t(subframes_to_write), std::memory_order_relaxed);
+  }
 
   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
                               ? data->output_buffer_padding
@@ -614,6 +754,22 @@ void XmaContext::PreparePacket(uint32_t frame_size, uint32_t frame_padding) {
 
 bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet,
                               AVFrame* av_frame) {
+  // Time the actual ffmpeg work. "Slow / pitched down" has survived both
+  // decoder paths and every ring change, and both paths funnel through here -
+  // so the question is whether XMA decode is simply CPU-bound on this phone,
+  // which would starve voices while leaving the device output path spotless.
+  const auto decode_start = std::chrono::steady_clock::now();
+  struct DecodeTimer {
+    std::chrono::steady_clock::time_point start;
+    ~DecodeTimer() {
+      DecodeStats::decode_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count()),
+          std::memory_order_relaxed);
+    }
+  } decode_timer{decode_start};
+
   auto ret = avcodec_send_packet(av_context, av_packet);
   if (ret < 0) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -785,6 +941,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                  raw_frame_.data());
     current_frame_remaining_subframes_ = 4 << data->is_stereo;
+    DecodeStats::frames_decoded.fetch_add(1, std::memory_order_relaxed);
+    DecodeStats::MarkVoiceActive(id());
 
     // Loop end: limit output to subframes 0..loop_subframe_end.
     if (is_loop_end_frame) {
@@ -838,8 +996,18 @@ bool XmaContext::WorkOldFrameDecoder() {
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
+  const XMA_CONTEXT_DATA initial_data = data;
   DecodeOldFrame(&data);
-  data.Store(context_ptr);
+  if (REXCVAR_GET(xma_old_decoder_merged_store)) {
+    // The ffmpeg decode between the read above and the store below is not
+    // instantaneous, and the guest touches this context without taking our
+    // host lock. A whole-struct Store() therefore rewinds whatever the game
+    // advanced during the decode - most damagingly output_buffer_read_offset,
+    // which makes it replay audio it has already played.
+    StoreContextMerged(data, initial_data, context_ptr);
+  } else {
+    data.Store(context_ptr);
+  }
   return true;
 }
 
@@ -847,6 +1015,22 @@ bool XmaContext::TrySetupNextLoopOld(XMA_CONTEXT_DATA* data,
                                      bool ignore_input_buffer_offset) {
   if (data->loop_count > 0 && data->loop_start < data->loop_end &&
       (ignore_input_buffer_offset || data->input_buffer_read_offset >= data->loop_end)) {
+    // loop_start is a raw guest value (XMASetLoopData, or a direct context
+    // write) and describes an offset in the STREAM, not necessarily in the
+    // buffer currently mapped. For 1-packet streaming double-buffering it is
+    // routinely past the end of the current window - 16416 (packet 1, first
+    // frame) against a 16384-bit single-packet buffer is the value seen on
+    // device. Applying it means the next call trips the range check, logs an
+    // error and swaps mid-stream, which is audible. If it does not address
+    // this buffer, decline the loop and let the normal end-of-buffer swap run.
+    if (REXCVAR_GET(xma_old_fix_input_overrun)) {
+      const uint32_t packet_count = data->current_buffer ? data->input_buffer_1_packet_count
+                                                         : data->input_buffer_0_packet_count;
+      const uint32_t size_bits = packet_count * kBytesPerPacket * 8;
+      if (size_bits && data->loop_start >= size_bits) {
+        return false;
+      }
+    }
     data->input_buffer_read_offset = data->loop_start;
     if (data->loop_count < 255) {
       data->loop_count--;
@@ -1078,10 +1262,25 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
     BitStream stream(current_input_buffer, current_input_size * 8);
     stream.SetOffset(data->input_buffer_read_offset);
 
-    if (data->input_buffer_read_offset > current_input_size * 8) {
-      REXAPU_ERROR("XmaContext {} old: input offset {} exceeds buffer size {}", id(),
-                   uint32_t(data->input_buffer_read_offset), current_input_size * 8);
+    // NOTE: >= , not >. An offset landing EXACTLY on the end of the buffer is
+    // a fully-consumed buffer, but the old `>` let it through, and the
+    // first-frame-offset branch below then bailed on a negative packet number
+    // WITHOUT swapping - stalling that voice until the game happened to reset
+    // the context. Reaching the end is normal, so swap and carry on rather
+    // than logging an error per occurrence.
+    const uint32_t input_size_bits = current_input_size * 8;
+    if (data->input_buffer_read_offset >= input_size_bits) {
+      if (!REXCVAR_GET(xma_old_fix_input_overrun)) {
+        REXAPU_ERROR("XmaContext {} old: input offset {} exceeds buffer size {}", id(),
+                     uint32_t(data->input_buffer_read_offset), input_size_bits);
+      } else {
+        REXAPU_NOISY_DEBUG("XmaContext {} old: input buffer consumed ({} >= {}), swapping", id(),
+                           uint32_t(data->input_buffer_read_offset), input_size_bits);
+      }
       SwapInputBuffer(data);
+      if (REXCVAR_GET(xma_old_fix_input_overrun) && is_streaming) {
+        data->input_buffer_read_offset = GetPacketFirstFrameOffsetOld(data);
+      }
       return;
     }
 
@@ -1181,7 +1380,7 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
 
       PrepareDecoder(data->sample_rate, bool(data->is_stereo));
 
-      const bool frame_is_split = frame_last_split && (frame_idx >= frame_count - 1);
+      bool frame_is_split = frame_last_split && (frame_idx >= frame_count - 1);
       stream = BitStream(current_input_buffer, (packet_idx + 1) * kBitsPerPacket);
       stream.SetOffset(data->input_buffer_read_offset);
       old_split_frame_len_partial_ = static_cast<uint32_t>(stream.BitsRemaining());
@@ -1189,6 +1388,22 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
         old_split_frame_len_ = static_cast<uint32_t>(stream.Peek(kBitsPerFrameHeader));
       } else {
         old_split_frame_len_ = xma::kMaxFrameLength + 1;
+      }
+
+      // A frame that does not fit in what remains of this packet IS split,
+      // whatever the frame-count scan concluded. GetPacketFrameCountOld reports
+      // a frame whose 15-bit size header straddles the packet boundary as "not
+      // split" (it returns early when fewer than 15 bits remain), and the new
+      // decoder path fixed exactly that case in GetPacketInfo. Without this,
+      // the code below copies only the bits left in the packet but still tells
+      // ffmpeg the packet is the FULL frame length - so ffmpeg decodes the
+      // zero padding as bitstream. That is the source of the thousands of
+      // "num_vec_coeffs is too large" / spectral-RLE-overflow / "would have to
+      // skip N bits" errors, and of the 32768-sentinel "XMA Frame sizing
+      // incorrent" ones when the header itself straddles.
+      if (REXCVAR_GET(xma_old_fix_split_detection) &&
+          old_split_frame_len_ > old_split_frame_len_partial_) {
+        frame_is_split = true;
       }
 
       xma_frame_.fill(0);
@@ -1236,11 +1451,24 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
     old_split_frame_len_partial_ = 0;
     old_split_frame_padding_start_ = 0;
 
+    // Timed for the xma_stats decode_cpu figure. The old path calls ffmpeg
+    // directly rather than through DecodePacket(), so wrapping only that
+    // function measured 0.0% here - a measurement bug, not a result.
+    const auto decode_start = std::chrono::steady_clock::now();
+    const auto note_decode_time = [&decode_start]() {
+      DecodeStats::decode_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - decode_start)
+                       .count()),
+          std::memory_order_relaxed);
+    };
     int ret = avcodec_send_packet(av_context_, av_packet_);
     if (ret < 0) {
+      note_decode_time();
       return;
     }
     ret = avcodec_receive_frame(av_context_, av_frame_);
+    note_decode_time();
     if (ret == AVERROR(EAGAIN)) {
       return;
     }
@@ -1257,6 +1485,9 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
                  raw_frame_.data());
 
     output_rb.Write(raw_frame_.data(), frame_byte_count);
+    DecodeStats::frames_decoded.fetch_add(1, std::memory_order_relaxed);
+    DecodeStats::MarkVoiceActive(id());
+    DecodeStats::blocks_written.fetch_add(frame_byte_count / kOutputBytesPerBlock, std::memory_order_relaxed);
     output_remaining_bytes -= frame_byte_count;
     data->output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
 
@@ -1313,6 +1544,30 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
                          uint32_t(data->input_buffer_read_offset));
       return;
     }
+
+    // GetNextFrameOld can hand back an offset one packet header past the end
+    // of the buffer (measured: 16416 against a 16384-bit single-packet
+    // streaming buffer - 16384 + kBitsPerPacketHeader, thousands of times per
+    // session). Storing that means the NEXT call trips the range check at the
+    // top, logs an error and swaps the buffer out mid-stream, which splices
+    // the audio hard. Reaching the end of the input is a normal event, so
+    // handle it the way the end-of-packets path above already does instead of
+    // storing an out-of-range cursor and discovering it later.
+    if (REXCVAR_GET(xma_old_fix_input_overrun) && offset >= current_input_size * 8) {
+      if (!reuse_input_buffer) {
+        reuse_input_buffer = TrySetupNextLoopOld(data, true);
+      }
+      if (!reuse_input_buffer) {
+        if (is_streaming) {
+          SwapInputBuffer(data);
+          data->input_buffer_read_offset = GetPacketFirstFrameOffsetOld(data);
+        } else {
+          old_is_stream_done_ = true;
+        }
+      }
+      break;
+    }
+
     data->input_buffer_read_offset = offset;
   }
 

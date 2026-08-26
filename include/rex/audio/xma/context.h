@@ -177,6 +177,39 @@ static constexpr int kIdToSampleRate[4] = {24000, 32000, 44100, 48000};
 
 class XmaContext {
  public:
+  // Decode throughput counters. The output side got instrumented first
+  // (audio_stats) and immediately proved the SDL path was blameless, which
+  // moved the whole investigation here; this is the same idea one stage
+  // upstream. Free-running and cheap - relaxed adds on counters read once
+  // every few seconds by the decoder worker. Enabled by the xma_stats cvar.
+  struct DecodeStats {
+    static inline std::atomic<uint64_t> frames_decoded{0};
+    static inline std::atomic<uint64_t> blocks_written{0};
+    static inline std::atomic<uint64_t> work_progress{0};
+    static inline std::atomic<uint64_t> work_no_progress{0};
+    static inline std::atomic<uint64_t> no_output_space{0};
+    static inline std::atomic<uint64_t> ring_marked_invalid{0};
+    static inline std::atomic<uint64_t> invalid_after_write{0};
+    static inline std::atomic<uint64_t> decode_us{0};
+    // Bitmap of context ids that produced a frame this window: the number of
+    // voices the game is actually running, which is the figure frames/s has to
+    // be judged against. active_contexts counts ALLOCATED contexts and the
+    // free-running model pins that at 256, so it is useless as a voice count.
+    static inline std::atomic<uint64_t> voice_bits[4] = {};
+    static void MarkVoiceActive(uint32_t ctx_id) {
+      voice_bits[(ctx_id >> 6) & 3].fetch_or(uint64_t(1) << (ctx_id & 63),
+                                             std::memory_order_relaxed);
+    }
+    static uint32_t TakeVoiceCount() {
+      uint32_t n = 0;
+      for (auto& w : voice_bits) {
+        n += uint32_t(__builtin_popcountll(w.exchange(0, std::memory_order_relaxed)));
+      }
+      return n;
+    }
+    static inline std::atomic<uint64_t> active_contexts{0};
+  };
+
   static const uint32_t kBytesPerPacket = 2048;
   static const uint32_t kBitsPerPacket = kBytesPerPacket * 8;
   static const uint32_t kBitsPerPacketHeader = 32;
@@ -302,6 +335,13 @@ class XmaContext {
 
   // Output buffer tracking
   int32_t remaining_subframe_blocks_in_output_buffer_ = 0;
+  // Write offset at which THIS context last filled its output ring exactly to
+  // read_offset, or -1 when the ring is not known-full. read==write cannot be
+  // told apart from an empty ring by the RingBuffer itself (write_count()
+  // reports full capacity for it), and the game routinely leaves exactly one
+  // frame of room - so filling that room is normal and must not be mistaken
+  // for an empty buffer on the next call.
+  int64_t output_ring_full_at_ = -1;
   uint8_t current_frame_remaining_subframes_ = 0;
 
   // Loop subframe precision state
