@@ -12,6 +12,7 @@
 #include <cstdint>
 
 #include <rex/assert.h>
+#include <rex/logging.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -119,8 +120,28 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
       assert_true(pending_pair.first > submission_completed_on_gpu_);
       if (pending_pair.first <= submission_index) {
         // Wait if requested.
-        if (dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX) ==
-            VK_SUCCESS) {
+        //
+        // Bounded and retried rather than a single UINT64_MAX wait. The
+        // semantics are identical - this still does not return until the fence
+        // signals - but an infinite wait here is invisible, and it is a real
+        // failure mode on iOS: the system can suspend the process mid-frame,
+        // and a submission parked on a CAMetalDrawable that never arrives
+        // leaves this blocked forever on return, with no log line and nothing
+        // for the hang watchdog to attribute. Saying so turns "it hung coming
+        // back from the home screen" into a stack.
+        constexpr uint64_t kFenceWaitSliceNs = 2ull * 1000 * 1000 * 1000;
+        uint32_t waited_slices = 0;
+        VkResult wait_result;
+        while ((wait_result = dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE,
+                                                  kFenceWaitSliceNs)) == VK_TIMEOUT) {
+          ++waited_slices;
+          REXLOG_WARN(
+              "vulkan: still waiting for submission {} to complete after {}s - the GPU has "
+              "not signalled its fence. On Apple platforms this is what a drawable that never "
+              "arrives looks like (the app was most likely suspended mid-frame).",
+              pending_pair.first, waited_slices * 2);
+        }
+        if (wait_result == VK_SUCCESS) {
           break;
         }
       }

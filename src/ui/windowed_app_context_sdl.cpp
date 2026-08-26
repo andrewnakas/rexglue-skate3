@@ -77,6 +77,29 @@ void SDLWindowedAppContext::DispatchEvent(const SDL_Event& event) {
     return;
   }
 
+  // Going to the background is the moment that actually matters on iOS, and
+  // the low-memory warning above is not it: that warning has never once fired
+  // on device across every session ever captured, while being killed while
+  // suspended happens constantly - the app comes back as a fresh launch
+  // instead of where the player left off.
+  //
+  // Jetsam evicts suspended processes largest-first, and this one sits near a
+  // gigabyte, most of it caches. Handing them back before suspending drops it
+  // by hundreds of megabytes and makes the process a far less attractive
+  // target. The cost on return is a few seconds of redecoding from guest
+  // memory, which is what these caches are for.
+  //
+  // Deliberately memory only. Suspending PRESENTATION here is a separate and
+  // much riskier change - it was tried and reverted for freezing on return -
+  // so this does not touch it.
+  if (event.type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+    REXLOG_INFO("entering the background; releasing caches so the app is not evicted");
+    if (low_memory_handler_) {
+      low_memory_handler_();
+    }
+    return;
+  }
+
   SDLWindow::HandleSDLEvent(event);
 }
 
