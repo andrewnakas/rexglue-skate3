@@ -28,6 +28,14 @@
 
 #include <rex/graphics/vulkan/native_rhi_vulkan.h>
 
+#include <rex/cvar.h>
+
+REXCVAR_DEFINE_BOOL(nrhi_vulkan_log_memory, false, "GPU/Vulkan",
+                    "Log VMA heap usage against the driver's reported budget every 600 "
+                    "frames. A diagnostic for VRAM pressure and bimodal frame rates; off "
+                    "by default because it is otherwise the most frequent line in the log "
+                    "during play.");
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -1281,7 +1289,7 @@ class NrDeviceVulkan : public nrhi::Device {
       DrainRetired(cp_->GetCompletedSubmission(), 256);
     }
     ++frame_index_;
-    if ((frame_index_ % 600) == 0) {
+    if ((frame_index_ % 600) == 0 && REXCVAR_GET(nrhi_vulkan_log_memory)) {
       // Periodic VRAM budget attribution (bimodal-FPS diagnosis): log every
       // heap's VMA usage vs the driver-reported budget, flagging device-local.
       VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};

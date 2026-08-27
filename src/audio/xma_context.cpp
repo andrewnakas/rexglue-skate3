@@ -9,6 +9,7 @@
 * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
 */
 
+#include <atomic>
 #include <algorithm>
 #include <cstring>
 #include <tuple>
@@ -1079,8 +1080,18 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
     stream.SetOffset(data->input_buffer_read_offset);
 
     if (data->input_buffer_read_offset > current_input_size * 8) {
-      REXAPU_ERROR("XmaContext {} old: input offset {} exceeds buffer size {}", id(),
-                   uint32_t(data->input_buffer_read_offset), current_input_size * 8);
+      // RECOVERED, not fatal: the read offset can land past the end of a
+      // packet buffer, and swapping to the next one resynchronises the
+      // stream with no audible effect. It happened often enough during
+      // ordinary play to fill the console with errors, which buried the
+      // faults worth reading, so only the first few are printed.
+      static std::atomic<uint32_t> s_offset_logs{0};
+      if (s_offset_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+        REXAPU_WARN("XmaContext {} old: input offset {} exceeds buffer size {}; "
+                    "swapping input buffer to resynchronise",
+                    id(), uint32_t(data->input_buffer_read_offset),
+                    current_input_size * 8);
+      }
       SwapInputBuffer(data);
       return;
     }

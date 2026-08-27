@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <unordered_map>
+#include <mutex>
 #include <chrono>
 
 #include <rex/audio/xma/context.h>
@@ -70,6 +72,27 @@ void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
   string::StringBuffer buff;
   buff.AppendVarargs(fmt, va);
   auto msg = buff.to_string_view();
+
+  // FFmpeg repeats the same complaint for every frame it dislikes, and a
+  // handful of malformed XMA frames in a stream then fill the console with
+  // identical lines. Keyed on the FORMAT string, not the message, so the
+  // varying numbers inside one complaint still collapse to a single entry.
+  // Verbose mode keeps every line.
+  if (!REXCVAR_GET(ffmpeg_verbose)) {
+    static std::mutex seen_mutex;
+    static std::unordered_map<const char*, uint32_t> seen;
+    constexpr uint32_t kMaxPerMessage = 4;
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    uint32_t& count = seen[fmt];
+    if (count >= kMaxPerMessage) {
+      return;
+    }
+    if (++count == kMaxPerMessage) {
+      REXAPU_WARN("ffmpeg: {} (further identical messages suppressed; "
+                  "set ffmpeg_verbose=true for all of them)", msg);
+      return;
+    }
+  }
 
   switch (level) {
     case AV_LOG_ERROR:

@@ -127,6 +127,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool mode_indicator_ = true;
   bool fps_counter_ = false;
   bool audio_mute_ = false;
+  // Video preset row; always rests at 0 (Custom) - see kVideoPresetLabels.
+  int video_preset_index_ = 0;
   bool rumble_ = true;
   float mnk_sensitivity_ = 1.0f;
   int chord_index_ = 0;

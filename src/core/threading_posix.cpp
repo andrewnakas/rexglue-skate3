@@ -815,9 +815,21 @@ class PosixCondition<Thread> : public PosixConditionBase {
     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
     if (result != 0) {
       switch (result) {
-        case EPERM:
-          REXSYS_WARN("set_priority: permission denied");
+        case EPERM: {
+          // Expected on an ordinary Linux desktop: SCHED_FIFO needs
+          // CAP_SYS_NICE or an rtprio limit, which a game launched normally
+          // does not have. The threads run at normal priority instead, which
+          // is fine - so say it once rather than once per thread, and do not
+          // dress a routine permission boundary up as a per-thread warning.
+          static std::atomic<bool> logged{false};
+          if (!logged.exchange(true, std::memory_order_relaxed)) {
+            REXSYS_INFO(
+                "set_priority: no permission for real-time thread priority; "
+                "running at normal priority (grant CAP_SYS_NICE or raise the "
+                "rtprio limit to enable it)");
+          }
           break;
+        }
         case EINVAL:
           assert_always();
           break;

@@ -54,7 +54,8 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 25> kOptionalSimpleSettingsCvars = {
+    "skate3_performance_profile",
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -79,6 +80,15 @@ constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
     "audio_mute",
     "audio_device_sample_frames",
     "user_language"};
+
+// One-click video presets. The row starts at Custom and keeps whichever preset
+// was last applied, so stepping through them works; the cvar behind it is put
+// back to "auto" immediately after applying, so a preset never re-runs at the
+// next launch and overwrites what the player tuned by hand afterwards.
+constexpr std::array<const char*, 5> kVideoPresetLabels = {
+    "Custom", "Quality", "Balanced", "Handheld / iGPU", "Performance"};
+constexpr std::array<const char*, 5> kVideoPresetValues = {
+    "auto", "quality", "balanced", "deck", "performance"};
 
 // MSAA sample counts for the native scene renderer.
 constexpr std::array<const char*, 4> kMsaaLabels = {"Off", "2x", "4x", "8x"};
@@ -1268,6 +1278,44 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
   switch (category) {
     case 0: {  // Video
       header("Display");
+      if (HasCvar("skate3_performance_profile")) {
+        // One row that sets every quality knob below at once. Applying is
+        // immediate (the app watches this cvar), and the row then returns to
+        // Custom - see kVideoPresetLabels for why it is an action, not a mode.
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Preset";
+        row.desc =
+            "Set every quality option below at once. Handheld / iGPU suits a "
+            "Steam Deck or integrated graphics; Performance trades shadows and "
+            "effects for the highest frame rate. The options below stay "
+            "editable afterwards.";
+        for (const char* label : kVideoPresetLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &video_preset_index_;
+        row.on_enum_change = [this](int index) {
+          if (index <= 0 || index >= int(kVideoPresetValues.size())) {
+            return;
+          }
+          rex::cvar::SetFlagByName("skate3_performance_profile",
+                                   kVideoPresetValues[index]);
+          // Put the cvar back so the preset does not re-run at the next launch,
+          // then re-read every row from the cvars the preset just wrote -
+          // without this the dialog would save its stale indices back over it.
+          rex::cvar::SetFlagByName("skate3_performance_profile", "auto");
+          const int chosen = index;
+          LoadSettingsFromCvars();
+          // LoadSettingsFromCvars resets this row (the cvar now reads "auto"),
+          // so restore the selection. Snapping it back to Custom instead meant
+          // every step from Custom re-applied the FIRST preset - stepping right
+          // three times applied Quality three times and never reached the
+          // others.
+          video_preset_index_ = chosen;
+        };
+        row.reset = [this] { video_preset_index_ = 0; };
+        rows.push_back(std::move(row));
+      }
       if (HasGraphicsApiChoice()) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
