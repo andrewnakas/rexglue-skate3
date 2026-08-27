@@ -14,6 +14,21 @@
 # runtime DLL staging is the host's job (see rexglue_configure_target).
 #==========================================================
 function(rexglue_apply_target_settings target_name)
+    # The SDK applies -fno-strict-aliasing to its OWN code via
+    # add_compile_options() at the top of the submodule - but that is
+    # DIRECTORY-scoped, so it never reaches a host project's targets. The host
+    # target is exactly the one that compiles the recompiled guest code, which
+    # reinterprets one flat `base + addr` byte array at u8/u16/u32/u64 and is
+    # the last code on earth that should be built at -O3 with strict aliasing
+    # on. Apply it here, where every configured target sees it.
+    #
+    # Deliberately NOT adding the SDK's other global flag, -ffp-model=strict:
+    # the guest TUs have always been built without it, so guest FP currently
+    # runs with -ffp-contract=on. Turning it on now would cost speed and change
+    # results. Noted as the first suspect if physics or replays ever diverge.
+    target_compile_options(${target_name} PRIVATE
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fno-strict-aliasing>)
+
     set(_rexglue_target_processor "${CMAKE_SYSTEM_PROCESSOR}")
     if(APPLE AND CMAKE_OSX_ARCHITECTURES)
         list(LENGTH CMAKE_OSX_ARCHITECTURES _rexglue_osx_arch_count)
@@ -49,9 +64,25 @@ function(rexglue_apply_target_settings target_name)
     # atomicity, FP16 and dot product, and (the part that matters most for
     # translated code, which is enormous and branchy) a scheduling model clang
     # can actually target.
+    #
+    # The condition below used to be just "APPLE AND arm64", which caught the
+    # Mac too and built 288 MB of guest code with an iPhone's scheduling model.
+    # An M-series core is a much wider machine than an A15 - deeper reorder
+    # window, more load/store units - and the recompiled guest code is exactly
+    # the branchy, load-modify-store shape whose throughput a scheduling model
+    # decides. Default the Mac to apple-m1 rather than -mcpu=native, so the
+    # shipped .app still runs on M2/M3/M4; override with
+    # -DREXGLUE_APPLE_ARM_MCPU=<cpu> to tune for one machine.
     if(APPLE AND _rexglue_target_processor MATCHES "aarch64|arm64|ARM64")
+        if(REXGLUE_APPLE_ARM_MCPU)
+            set(_rexglue_apple_mcpu "${REXGLUE_APPLE_ARM_MCPU}")
+        elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+            set(_rexglue_apple_mcpu "apple-a15")
+        else()
+            set(_rexglue_apple_mcpu "apple-m1")
+        endif()
         target_compile_options(${target_name} PRIVATE
-            $<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=apple-a15>)
+            $<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=${_rexglue_apple_mcpu}>)
     endif()
 
     if(NOT MSVC AND NOT APPLE)

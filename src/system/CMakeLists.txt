@@ -45,7 +45,26 @@ set(REXSYSTEM_SOURCES
     xex_module.cpp
 )
 
-add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
+# rexruntime aggregates rexcore/rexgraphics/rexui/rexaudio/rexinput/
+# rexfilesystem/imgui/o1heap into one library. As a SHARED library every
+# guest->kernel call crosses a dylib boundary that no optimizer can inline or
+# devirtualize across, and it exports its whole symbol table.
+#
+# Nothing actually requires it to be shared: the only dlopen in the SDK
+# (src/system/shared_library.cpp) loads GUEST modules, REX_WEAK_FUNC never
+# appears in the generated sources, and guest->host dispatch goes through the
+# PPCFuncMapping table by POINTER, not by name. Making it static is what lets
+# -fvisibility=hidden and ThinLTO see the whole program.
+#
+# Default OFF so existing consumers are untouched; the macos-fast preset turns
+# it on.
+option(REXGLUE_RUNTIME_STATIC
+       "Build rexruntime as a static library so the whole program links as one unit" OFF)
+if(REXGLUE_RUNTIME_STATIC)
+    add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
+else()
+    add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
+endif()
 add_library(rex::runtime ALIAS rexruntime)
 add_library(rex::system ALIAS rexruntime)
 add_library(rex::kernel ALIAS rexruntime)

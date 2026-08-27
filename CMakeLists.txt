@@ -233,9 +233,19 @@ configure_file(
 )
 
 # Output directories (multi-config appends /<Config>/ automatically)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+#
+# This path is keyed on PLATFORM, not on the build directory, so two build
+# trees for the same platform - say a baseline and an optimised one - write
+# their libraries on top of each other. Their ninja dep graphs are per-tree and
+# do not notice, so a rebuild of one can silently link libraries the other
+# compiled with different flags. Set REXGLUE_OUTPUT_DIR to keep a build tree's
+# artifacts to itself; the default is unchanged.
+if(NOT REXGLUE_OUTPUT_DIR)
+    set(REXGLUE_OUTPUT_DIR "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+endif()
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
 
 # Sanitizer support for debugging memory corruption and undefined behavior
 if(REXGLUE_ENABLE_SANITIZERS)
