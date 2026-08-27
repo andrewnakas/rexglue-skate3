@@ -109,6 +109,48 @@ constexpr std::array<const char*, 4> kStreamProbeLabels = {
     "Original", "Near (100 m)", "Extended (200 m)", "Far (300 m)"};
 constexpr std::array<double, 4> kStreamProbeRadii = {0.0, 100.0, 200.0, 300.0};
 
+// ---- Graphics presets ----------------------------------------------------
+// One row that writes the whole quality bundle, so the common case is a single
+// choice instead of eight. Index 0 is Custom and is never applied - it is what
+// the row reports when the individual settings do not match any preset.
+//
+// The fields are indices into the tables above, not raw values, so a preset
+// and a hand-set row always go through the same code path.
+struct GraphicsPreset {
+  const char* label;
+  const char* desc;
+  int resolution_scale;   // kResolutionScales
+  int msaa;               // kMsaaSamples
+  int shadow_quality;     // kShadowQualityTiles
+  int static_shadow_res;  // kStaticShadowResSizes
+  int draw_distance;      // kDrawDistanceScales
+  bool ssao;
+  bool bloom;
+  bool volumetrics;
+  bool shadow_pcss;
+  bool static_shadows;
+};
+
+constexpr std::array<GraphicsPreset, 5> kGraphicsPresets = {{
+    {"Custom", "Your own mix of the settings below.", 0, 0, 0, 0, 0, false, false, false, false,
+     false},
+    {"Performance",
+     "Highest frame rate. Shadows on, screen-space effects off, original draw "
+     "distance.",
+     0, 0, 3, 0, 0, false, false, false, false, true},
+    {"Balanced",
+     "Ambient occlusion and bloom on with 2x MSAA, original draw distance.",
+     0, 1, 3, 1, 0, true, true, false, false, true},
+    {"Quality",
+     "Everything on at native resolution: AO, bloom, sun shafts, soft shadows "
+     "and double draw distance.",
+     0, 1, 5, 1, 1, true, true, true, true, true},
+    {"Ultra",
+     "Quality plus 2x render scale and 4x MSAA. Four times the pixels in every "
+     "full-screen target - expect to drop below 60 on modest GPUs.",
+     1, 2, 5, 2, 1, true, true, true, true, true},
+}};
+
 // Audio device buffer sizes in sample frames (0 = backend default).
 constexpr std::array<const char*, 4> kAudioBufferLabels = {
     "Auto", "512 (low latency)", "1024", "2048 (most stable)"};
@@ -1235,6 +1277,86 @@ void SimpleSettingsDialog::SaveVideo() {
   SaveSimpleSettingsConfig(config_path_);
 }
 
+int SimpleSettingsDialog::DetectGraphicsPreset() const {
+  // Start at 1: index 0 is Custom and matches nothing by construction.
+  for (size_t i = 1; i < kGraphicsPresets.size(); ++i) {
+    const GraphicsPreset& p = kGraphicsPresets[i];
+    // Only compare the settings this build actually exposes - on a platform
+    // without, say, the MSAA cvar, a preset should still be recognised rather
+    // than silently reading as Custom forever.
+    if (HasMsaaCvar() && msaa_index_ != p.msaa) continue;
+    if (HasShadowQualityCvars() && shadow_quality_index_ != p.shadow_quality) continue;
+    if (HasStaticShadowCvars() && static_shadow_res_index_ != p.static_shadow_res) continue;
+    if (resolution_scale_index_ != p.resolution_scale) continue;
+    if (HasCvar("skate3_draw_distance_scale") && draw_distance_index_ != p.draw_distance) continue;
+    if (HasCvar("skate3_native_render_scene_ssao") && ssao_ != p.ssao) continue;
+    if (HasCvar("skate3_native_render_scene_bloom") && bloom_ != p.bloom) continue;
+    if (HasCvar("skate3_native_render_scene_shafts") && volumetrics_ != p.volumetrics) continue;
+    if (HasCvar("skate3_native_render_scene_shadow_pcss") && shadow_pcss_ != p.shadow_pcss)
+      continue;
+    if (HasCvar("skate3_native_render_scene_shadow_static_casters") &&
+        static_shadows_ != p.static_shadows)
+      continue;
+    return static_cast<int>(i);
+  }
+  return 0;
+}
+
+void SimpleSettingsDialog::ApplyGraphicsPreset(int preset) {
+  // Custom is a report, not a command: selecting it changes nothing, so a user
+  // scrolling past it does not wipe their settings.
+  if (preset <= 0 || preset >= static_cast<int>(kGraphicsPresets.size())) {
+    return;
+  }
+  const GraphicsPreset& p = kGraphicsPresets[preset];
+
+  // Deferred settings: these ride SaveVideo() below, exactly as the individual
+  // rows do.
+  resolution_scale_index_ = p.resolution_scale;
+  msaa_index_ = p.msaa;
+  shadow_quality_index_ = p.shadow_quality;
+  static_shadow_res_index_ = p.static_shadow_res;
+
+  // Hot settings: applied here, because their own rows apply on change rather
+  // than through SaveVideo(). Each is guarded the same way its row is, so a
+  // build without the cvar is left alone instead of writing a dead name.
+  ssao_ = p.ssao;
+  bloom_ = p.bloom;
+  volumetrics_ = p.volumetrics;
+  shadow_pcss_ = p.shadow_pcss;
+  static_shadows_ = p.static_shadows;
+  draw_distance_index_ = p.draw_distance;
+
+  if (HasCvar("skate3_native_render_scene_ssao")) {
+    SetBoolCvar("skate3_native_render_scene_ssao", ssao_);
+  }
+  if (HasCvar("skate3_native_render_scene_bloom")) {
+    SetBoolCvar("skate3_native_render_scene_bloom", bloom_);
+  }
+  // The volumetric row drives the shafts + haze pair; mirror that here.
+  if (HasCvar("skate3_native_render_scene_shafts")) {
+    SetBoolCvar("skate3_native_render_scene_shafts", volumetrics_);
+  }
+  if (HasCvar("skate3_native_render_scene_haze")) {
+    SetBoolCvar("skate3_native_render_scene_haze", volumetrics_);
+  }
+  if (HasCvar("skate3_native_render_scene_shadow_pcss")) {
+    SetBoolCvar("skate3_native_render_scene_shadow_pcss", shadow_pcss_);
+  }
+  if (HasCvar("skate3_native_render_scene_shadow_static_casters")) {
+    SetBoolCvar("skate3_native_render_scene_shadow_static_casters", static_shadows_);
+  }
+  if (HasCvar("skate3_draw_distance_scale")) {
+    const std::string scale = std::to_string(kDrawDistanceScales[std::clamp(
+        draw_distance_index_, 0, static_cast<int>(kDrawDistanceScales.size()) - 1)]);
+    rex::cvar::SetFlagByName("skate3_draw_distance_scale", scale);
+    rex::cvar::SetFlagByName("skate3_lod_distance_scale", scale);
+  }
+
+  // Persists the deferred half and writes the config file once.
+  SaveVideo();
+}
+
 void SimpleSettingsDialog::SaveProfile() {
   if (save_profile_) {
     save_profile_(profiles_.selected_index, gamertag_buf_, profile_signed_in_);
@@ -1449,6 +1571,30 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       if (HasRendererChoice() || HasMsaaCvar() || HasShadowQualityCvars() ||
           HasCvar("skate3_native_render_scene_ssao") || HasDrawDistanceCvars()) {
         header("Graphics");
+      }
+      // Preset row first: it writes every quality row below it, so the common
+      // case is one choice rather than eight. Only offered when enough of
+      // those rows exist for a preset to mean anything.
+      if (HasMsaaCvar() || HasShadowQualityCvars() ||
+          HasCvar("skate3_native_render_scene_ssao")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Quality Preset";
+        row.desc =
+            "Sets everything below in one go. Changing any individual setting "
+            "afterwards switches this back to Custom.";
+        for (const GraphicsPreset& preset : kGraphicsPresets) {
+          row.options.push_back(preset.label);
+        }
+        // Recomputed every rebuild rather than remembered, so editing a row
+        // below drops this to Custom instead of continuing to claim a preset.
+        graphics_preset_index_ = DetectGraphicsPreset();
+        row.index = &graphics_preset_index_;
+        row.on_enum_change = [this](int value) { ApplyGraphicsPreset(value); };
+        row.reset = [this] {
+          graphics_preset_index_ = DetectGraphicsPreset();
+        };
+        rows.push_back(std::move(row));
       }
       if (HasRendererChoice()) {
         RowSpec row;

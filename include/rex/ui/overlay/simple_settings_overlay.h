@@ -78,6 +78,12 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool HasSettingsChanges() const;
   void ReloadProfiles();
   void SaveVideo();
+  // Writes a whole quality bundle at once: applies the hot cvars immediately
+  // and routes the deferred ones through SaveVideo(), so a preset behaves
+  // exactly as if each row had been set by hand.
+  void ApplyGraphicsPreset(int preset);
+  // Which preset the current settings correspond to, or 0 (Custom).
+  int DetectGraphicsPreset() const;
   void SaveProfile();
   void ApplyAndRestart();
 
@@ -98,6 +104,11 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   GraphicsDeviceList device_list_;
   int graphics_api_index_ = 0;
   int device_index_ = 0;
+  // Graphics preset. 0 is "Custom" and is what the row shows whenever the
+  // individual settings do not match a preset exactly - selecting a preset
+  // writes the settings below, but editing any of them afterwards drops the
+  // row back to Custom rather than lying about which preset is active.
+  int graphics_preset_index_ = 0;
   int resolution_scale_index_ = 0;
   int frame_cap_index_ = 0;
   int aspect_ratio_index_ = 0;
