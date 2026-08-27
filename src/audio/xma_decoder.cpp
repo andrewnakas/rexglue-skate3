@@ -10,6 +10,7 @@
  */
 
 #include <chrono>
+#include <thread>
 
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
@@ -153,6 +154,19 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   return X_STATUS_SUCCESS;
 }
 
+REXCVAR_DEFINE_INT32(
+    xma_worker_poll_us, 2000, "Audio",
+    "How long the decoder worker sleeps after a sweep that decoded nothing. "
+    "The guest only permits a decode while output_buffer_valid is set, which "
+    "measured 9-15% of attempts, so this interval sets how many chances the "
+    "worker gets to catch an open window before the mixer needs the data. At "
+    "the original 2000us that is 2.7 polls per 5.33ms mixer chunk and so only "
+    "0.23 (iOS) to 0.39 (macOS) PERMITTED refills per chunk - under one, which "
+    "is why rings run dry and the mix goes silent for 5-16ms at a time. Lower "
+    "values cost idle CPU on a thread that measured under 1.5% of one core.")
+    .range(50, 20000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 void XmaDecoder::WorkerThreadMain() {
   auto stats_window_start = std::chrono::steady_clock::now();
   while (worker_running_) {
@@ -193,6 +207,14 @@ void XmaDecoder::WorkerThreadMain() {
             Stats::invalid_after_write.exchange(0, std::memory_order_relaxed);
         const uint64_t dec_us = Stats::decode_us.exchange(0, std::memory_order_relaxed);
         const uint32_t voices = Stats::TakeVoiceCount();
+        const uint64_t o_ent = Stats::old_entered.exchange(0, std::memory_order_relaxed);
+        const uint64_t o_nov = Stats::old_no_output_valid.exchange(0, std::memory_order_relaxed);
+        const uint64_t o_niv = Stats::old_no_input_valid.exchange(0, std::memory_order_relaxed);
+        const uint64_t o_full = Stats::old_ring_full.exchange(0, std::memory_order_relaxed);
+        const uint64_t o_keep = Stats::old_ring_kept_valid.exchange(0, std::memory_order_relaxed);
+        const uint64_t o_give = Stats::old_ring_full_gave_up.exchange(0, std::memory_order_relaxed);
+        const uint64_t o_dry = Stats::old_ring_drained.exchange(0, std::memory_order_relaxed);
+        const uint32_t dry_voices = Stats::TakeDrainedVoiceCount();
 
         // A 256-byte block is 128 int16 samples, so one frame (512 samples per
         // channel) is 10.67ms of audio. frames/s divided by 93.75 is therefore
@@ -212,6 +234,11 @@ void XmaDecoder::WorkerThreadMain() {
             secs, frames, double(frames) / secs, double(frames) / secs / 93.75, blocks,
             double(blocks) / secs, active, prog, noprog, nospace, ringinv, inv_after_wr,
             voices, double(voices) * 93.75, double(dec_us) / (secs * 1e6) * 100.0);
+        REXAPU_INFO(
+            "XMA old-path calls={} | bailed: output_buffer_valid=0 -> {}, no valid input -> {}, "
+            "ring already full -> {} | brim-full kept valid={} gave-up={} | RAN DRY {} times "
+            "across {} voices",
+            o_ent, o_nov, o_niv, o_full, o_keep, o_give, o_dry, dry_voices);
         stats_window_start = now;
       }
     }
@@ -228,7 +255,17 @@ void XmaDecoder::WorkerThreadMain() {
     // disables them (hardware free-running semantics, see XmaContext::Work),
     // so poll on a short cadence to refill output rings as the game consumes
     // them - real hardware resumes by itself, there is no kick to wake us.
-    rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(2));
+    const int32_t poll_us = REXCVAR_GET(xma_worker_poll_us);
+    if (poll_us >= 1000) {
+      rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(poll_us / 1000));
+    } else {
+      // Wait() takes whole milliseconds only. Below that, check the kick event
+      // without blocking and sleep the remainder - at these intervals the
+      // sweep itself is the wake-up, so losing the event's latency edge costs
+      // nothing.
+      rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(0));
+      std::this_thread::sleep_for(std::chrono::microseconds(poll_us));
+    }
   }
 }
 

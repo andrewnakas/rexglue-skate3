@@ -208,6 +208,41 @@ class XmaContext {
       return n;
     }
     static inline std::atomic<uint64_t> active_contexts{0};
+    // Why the OLD decoder path produced nothing on a call. The free-running
+    // worker keeps contexts enabled, so a sweep that decodes nothing has to
+    // say why - without these, "sweeps prog=0" is a dead end.
+    static inline std::atomic<uint64_t> old_no_output_valid{0};
+    static inline std::atomic<uint64_t> old_no_input_valid{0};
+    static inline std::atomic<uint64_t> old_ring_full{0};
+    static inline std::atomic<uint64_t> old_entered{0};
+    // Calls that ended read==write having just written, and so left
+    // output_buffer_valid SET instead of clearing it. This is the state the
+    // game spends most of its time in - see xma_old_ring_full_is_not_empty.
+    static inline std::atomic<uint64_t> old_ring_kept_valid{0};
+    // Times the stall fallback fired: known-full for too many consecutive
+    // calls, so the flag was cleared anyway to let the game re-arm.
+    static inline std::atomic<uint64_t> old_ring_full_gave_up{0};
+    // A voice ran OUT of decoded audio: the call ended read==write having
+    // written nothing, which is a genuinely drained ring, not a brim-full one.
+    // This is the only thing that can see a SINGLE voice dropping out - the
+    // guest mix stays non-silent because every other voice covers it, so
+    // "ambient sounds choppy while everything else is fine" is invisible
+    // everywhere else in the tree.
+    static inline std::atomic<uint64_t> old_ring_drained{0};
+    // Which contexts those drains belonged to, so one starving voice can be
+    // told from every voice starving a little.
+    static inline std::atomic<uint64_t> drained_bits[4] = {};
+    static void MarkVoiceDrained(uint32_t ctx_id) {
+      drained_bits[(ctx_id >> 6) & 3].fetch_or(uint64_t(1) << (ctx_id & 63),
+                                               std::memory_order_relaxed);
+    }
+    static uint32_t TakeDrainedVoiceCount() {
+      uint32_t n = 0;
+      for (auto& w : drained_bits) {
+        n += uint32_t(__builtin_popcountll(w.exchange(0, std::memory_order_relaxed)));
+      }
+      return n;
+    }
   };
 
   static const uint32_t kBytesPerPacket = 2048;
@@ -351,6 +386,11 @@ class XmaContext {
   // xenia-edge old XMA decoder state.
   uint32_t old_packets_skip_ = 0;
   bool old_is_stream_done_ = false;
+  // Consecutive DecodeOldFrame calls that found the output ring known-full and
+  // left output_buffer_valid set. Bounded so a genuinely stalled voice - one
+  // whose read_offset never moves again, which read==write cannot be told
+  // apart from - still falls back to the old invalidate-and-wait behaviour.
+  uint32_t old_ring_full_calls_ = 0;
   uint32_t old_split_frame_len_ = 0;
   uint32_t old_split_frame_len_partial_ = 0;
   uint8_t old_split_frame_padding_start_ = 0;

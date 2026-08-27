@@ -304,6 +304,27 @@ std::vector<std::string> BuildIOSArguments() {
       // tear that never comes. Ask for what the platform really does.
       "--vulkan_allow_present_mode_immediate=false",
       "--vulkan_allow_present_mode_mailbox=false",
+
+      // ---- Audio -----------------------------------------------------------
+      // Both of these are what fixed "the sound is awful" on macOS, which runs
+      // byte-identical audio code (the subsystem has no platform conditionals
+      // at all), and iOS had neither.
+      //
+      // SDL clamps the device to at least the channel count asked for and the
+      // iOS backend never adjusts it, so "ask the device" always answers 6 here
+      // and the 5.1 fold silently goes to CoreAudio - the route
+      // sdl_audio_driver.cpp itself calls untested. 2 forces our own downmix.
+      "--audio_device_channels=2",
+
+      // 512 frames = 10.7ms. macOS/CoreAudio honours this exactly and it is
+      // what made the game sound right there; the default with nothing asked
+      // for is 1024. Confirm what iOS actually chose from the
+      // "SDLAudioDriver: device ... sample_frames=" line in Documents/skate3.log,
+      // and judge the result by ear - frames/s, silence_chunks and queue depth
+      // read IDENTICALLY for a good and a bad buffer size, so no counter here
+      // can confirm it. Override from Documents/user/ios_args.txt to try other
+      // values without a rebuild.
+      "--audio_device_sample_frames=512",
   };
 
   return ApplyIOSArgumentOverrides(std::move(args), documents / "user" / "ios_args.txt");

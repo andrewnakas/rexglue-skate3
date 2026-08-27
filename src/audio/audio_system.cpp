@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
@@ -33,6 +35,41 @@ REXCVAR_DEFINE_INT32(
     "audio engine closer to hardware-like lockstep with playback (real hardware double "
     "buffers, ~2); may cause stuttering if too low for the machine.");
 
+// Defined in the SDL driver; gates the same 5-second reporting cadence.
+REXCVAR_DECLARE(bool, audio_stats);
+
+REXCVAR_DEFINE_BOOL(
+    audio_even_dispatch, true, "Audio",
+    "Hold each dispatch of the guest's mixing callback to the 5.333ms guest "
+    "frame period instead of running them as fast as credits arrive. Credits "
+    "arrive in BURSTS: the device callback consumes a whole device buffer at "
+    "once - two guest frames at sample_frames=512, four when a callback runs "
+    "late, which on iOS it regularly does (max_callback_gap reads 21ms there "
+    "against 11ms on macOS) - so the game's mixer is called several times "
+    "within a few hundred microseconds and then not at all for 10-20ms. Its "
+    "sources are filled by other guest code on a real-time cadence, so a burst "
+    "outruns them and the extra calls mix nothing: an all-zero frame, heard as "
+    "a 5.3ms hole. Measured before this: the mixer runs for 50-220us of its "
+    "5333us budget and STILL comes up empty for 7% of dispatches on macOS and "
+    "32% on iOS, so it is not short of CPU - it is called too early. The "
+    "long-run rate is still set by credits, so holding cannot fall behind; it "
+    "spends the frame queue's 75-85ms of slack to arrive on time rather than "
+    "early. false restores the burst behaviour.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    audio_even_dispatch_floor, 3, "Audio",
+    "Frames the driver must still have queued for audio_even_dispatch to hold "
+    "a dispatch back. Pacing deliberately runs the guest close to lockstep - "
+    "the queue settles at 2-4 frames instead of 14-16 - so a device callback "
+    "that arrives late could drain it before the next scheduled dispatch. iOS "
+    "does exactly that: its max_callback_gap reads 21ms, two whole periods. "
+    "Below this many frames the hold is skipped and the guest is dispatched "
+    "immediately, which trades a little of the evenness back for never "
+    "underrunning. 0 disables the floor.")
+    .range(0, 32)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(audio_worker_thread_priority, 1, "Audio",
                      "Native audio worker thread priority (-2 lowest, -1 below normal, 0 normal, "
                      "1 above normal, 2 highest). The worker runs the guest's audio mixing on a "
@@ -41,6 +78,12 @@ REXCVAR_DEFINE_INT32(audio_worker_thread_priority, 1, "Audio",
     .range(-2, 2);
 
 namespace {
+
+uint64_t WorkerNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
 
 class SilentAudioDriver final : public rex::audio::AudioDriver {
  public:
@@ -192,8 +235,49 @@ void AudioSystem::WorkerThreadMain() {
         }
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
+        const int32_t floor_frames = REXCVAR_GET(audio_even_dispatch_floor);
+        const bool cushion_ok =
+            floor_frames <= 0 ||
+            static_cast<int32_t>(clients_[index].driver->QueuedFrameCount()) >= floor_frames;
+        if (REXCVAR_GET(audio_even_dispatch) && cushion_ok) {
+          // 256 samples per guest frame at 48kHz.
+          constexpr uint64_t kGuestFrameNs = 5333333;
+          uint64_t now = WorkerNowNs();
+          if (next_dispatch_ns_ > now) {
+            // Never hold longer than one frame period. This is a smoother; a
+            // mistake in it must not be able to stall the pipeline.
+            const uint64_t hold_ns = std::min(next_dispatch_ns_ - now, kGuestFrameNs);
+            std::this_thread::sleep_for(std::chrono::nanoseconds(hold_ns));
+            now = WorkerNowNs();
+          }
+          // Re-base after startup, a pause, or any stall that left the
+          // schedule far behind, so it can never bank a burst of its own.
+          if (!next_dispatch_ns_ || next_dispatch_ns_ + 4 * kGuestFrameNs < now) {
+            next_dispatch_ns_ = now;
+          }
+          next_dispatch_ns_ += kGuestFrameNs;
+        }
+
+        const bool timing = REXCVAR_GET(audio_stats);
+        submits_this_dispatch_ = 0;
+        submit_was_silent_ = false;
+        const uint64_t cb_t0 = timing ? WorkerNowNs() : 0;
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
+        if (timing) {
+          const uint64_t us = (WorkerNowNs() - cb_t0) / 1000;
+          cb_dispatches_++;
+          cb_max_us_ = std::max(cb_max_us_, us);
+          if (!submits_this_dispatch_) {
+            cb_no_submit_++;
+          } else if (submit_was_silent_) {
+            cb_silent_n_++;
+            cb_silent_us_ += us;
+          } else {
+            cb_filled_n_++;
+            cb_filled_us_ += us;
+          }
+        }
         // Guest execution can return with host FP exceptions unmasked (the
         // FPSCR emulation leaks MXCSR state); the first host float op on this
         // thread then traps (seen as STATUS_FLOAT_INEXACT_RESULT in the gap
@@ -219,6 +303,24 @@ void AudioSystem::WorkerThreadMain() {
 
     if (!worker_running_) {
       break;
+    }
+
+    if (REXCVAR_GET(audio_stats)) {
+      const uint64_t now_ns = WorkerNowNs();
+      if (!cb_window_start_ns_) {
+        cb_window_start_ns_ = now_ns;
+      } else if (now_ns - cb_window_start_ns_ >= 5000000000ull) {
+        const double win_s = double(now_ns - cb_window_start_ns_) * 1e-9;
+        REXAPU_INFO(
+            "Audio callback ({:.1f}s): dispatches={} no-submit={} | filled n={} avg={}us | "
+            "all-silent n={} avg={}us | max={}us",
+            win_s, cb_dispatches_, cb_no_submit_, cb_filled_n_,
+            cb_filled_n_ ? cb_filled_us_ / cb_filled_n_ : 0, cb_silent_n_,
+            cb_silent_n_ ? cb_silent_us_ / cb_silent_n_ : 0, cb_max_us_);
+        cb_window_start_ns_ = now_ns;
+        cb_dispatches_ = cb_no_submit_ = cb_filled_n_ = cb_silent_n_ = 0;
+        cb_filled_us_ = cb_silent_us_ = cb_max_us_ = 0;
+      }
     }
 
     if (!pumped) {
@@ -322,6 +424,23 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
     REXAPU_DEBUG("AudioSystem::SubmitFrame called: index={} samples_ptr={:08X}", index,
                  samples_ptr);
     submit_count++;
+  }
+
+  if (REXCVAR_GET(audio_stats)) {
+    // Read the guest's buffer BEFORE the driver copies it, so the verdict is
+    // about what the game wrote, not about anything we did to it.
+    const auto samples = memory_->TranslateVirtual<const float*>(samples_ptr);
+    bool silent = true;
+    if (samples) {
+      for (uint32_t i = 0; i < 256 * 6; i++) {
+        if (samples[i] != 0.0f) {
+          silent = false;
+          break;
+        }
+      }
+    }
+    submit_was_silent_ = silent;
+    submits_this_dispatch_++;
   }
 
   auto global_lock = global_critical_region_.Acquire();

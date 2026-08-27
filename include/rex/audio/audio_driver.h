@@ -32,6 +32,12 @@ class AudioDriver {
 
   virtual void SubmitFrame(uint32_t samples_ptr) = 0;
 
+  // Frames the driver has accepted but not yet played. audio_even_dispatch
+  // holds the guest's mixing callback to a steady cadence, which deliberately
+  // keeps this shallow; it needs to know when jitter has eaten the cushion so
+  // it can stop holding. Drivers with no queue report 0 and are never held.
+  virtual size_t QueuedFrameCount() const { return 0; }
+
  protected:
   inline uint8_t* TranslatePhysical(uint32_t guest_address) const {
     return memory_->TranslatePhysical(guest_address);

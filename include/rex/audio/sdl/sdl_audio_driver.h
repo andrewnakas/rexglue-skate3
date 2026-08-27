@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -31,6 +32,7 @@ class SDLAudioDriver : public AudioDriver {
 
   bool Initialize();
   void SubmitFrame(uint32_t frame_ptr) override;
+  size_t QueuedFrameCount() const override;
   void Shutdown();
 
  protected:
@@ -59,7 +61,7 @@ class SDLAudioDriver : public AudioDriver {
   static const uint32_t frame_size_ = sizeof(float) * frame_samples_;
   std::queue<float*> frames_queued_ = {};
   std::stack<float*> frames_unused_ = {};
-  std::mutex frames_mutex_ = {};
+  mutable std::mutex frames_mutex_ = {};
   // Signaled by SubmitFrame; lets the device callback briefly wait for frames
   // the guest is mixing right now instead of splicing silence when a large
   // device quantum outruns the queue depth.
@@ -81,6 +83,20 @@ class SDLAudioDriver : public AudioDriver {
   uint32_t stats_silence_chunks_ = 0;
   size_t stats_queue_min_ = SIZE_MAX;
   size_t stats_queue_max_ = 0;
+
+  // What the guest mix CONTAINS, counted where the game hands it to us.
+  // Delivery being exactly real time says nothing about that - the iOS
+  // dropouts are all-zero frames arriving perfectly on time, which every
+  // existing counter reads as healthy. A capture is the only thing that has
+  // ever seen them, and the capture writes 1.1MB/s to flash on this very
+  // thread, so it perturbs what it measures. These do not.
+  // Written on the guest mixer thread, read and reset on the SDL thread.
+  std::atomic<uint32_t> stats_mix_submits_{0};
+  std::atomic<uint32_t> stats_mix_silent_{0};
+  std::atomic<uint32_t> stats_mix_gaps_{0};
+  std::atomic<uint32_t> stats_mix_gaps_short_{0};
+  // Guest mixer thread only.
+  uint32_t mix_silence_run_ = 0;
 };
 
 }  // namespace rex::audio::sdl

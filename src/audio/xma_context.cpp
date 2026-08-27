@@ -117,6 +117,63 @@ REXCVAR_DEFINE_BOOL(
     "restores the old behaviour.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(
+    xma_old_ring_full_calls, 32, "Audio",
+    "How many consecutive calls xma_old_ring_full_is_not_empty may hold a ring "
+    "as known-full before giving up and clearing output_buffer_valid anyway. "
+    "read==write cannot distinguish a brim-full ring from a drained one, so a "
+    "voice whose read_offset stops moving would otherwise never be handed back "
+    "to the game. The worker sweeps every xma_worker_poll_us, so 32 calls is "
+    "tens of milliseconds - long enough to cover normal consumption, short "
+    "enough that a real stall costs one game audio update.")
+    .range(1, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    xma_old_ring_full_is_not_empty, false, "Audio",
+    "In the OLD decoder path - the one xma_use_old_decoder makes the default - "
+    "do not clear output_buffer_valid when the ring reached read==write because "
+    "THIS call filled it. The same read==write test means both 'drained' and "
+    "'exactly full', and the game holds read_offset one frame ahead, so every "
+    "decoded frame fills the ring exactly and was then declared invalid. That "
+    "hands the buffer back to the game and stops decode until the game re-arms "
+    "it, which it does once per audio update - measured on iOS as 91% of all "
+    "old-path calls bailing on output_buffer_valid=0, and heard as a silent mix "
+    "chunk roughly once per 16.7ms guest frame. Keeping the flag set lets the "
+    "next sweep top the ring up as soon as the game consumes a frame. The "
+    "ambiguity is handled by remembering the offset the ring filled at and by "
+    "the xma_old_ring_full_calls fallback. The same fix on the NEW path is "
+    "xma_ring_full_is_not_empty, which does nothing while the old path is live. "
+    "\n"
+    "DEFAULTED OFF 2026-08-27 AFTER MEASURING IT - IT STARVES BACKGROUND "
+    "VOICES. It does reduce the bail rate, but read==write cannot be told "
+    "apart forever: a ring the game has actually drained keeps reading as "
+    "brim-full, so the voice sits undecoded. Measured on the menu background "
+    "track with the RAN DRY counter, per 5s: on with the 32-call give-up, 54 "
+    "dry across 3 voices (18 per voice); on with the give-up effectively "
+    "disabled at 4096, 70 across 3 (23 per voice - raising the fallback made "
+    "it WORSE, so the fallback was recovering from this, not causing it); OFF, "
+    "one dry per voice, i.e. a single event at voice start and no starvation "
+    "at all. The user confirmed the last as \"perfect audio foreground and "
+    "background\". The real fix for the dropouts is audio_even_dispatch; this "
+    "was a separate idea that measured well on the mix and badly on the "
+    "voices. true restores it.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    xma_old_free_running, true, "Audio",
+    "Keep an enabled context enabled after the old decoder runs, so the decoder "
+    "worker can refill its output ring on its own cadence. WorkOldFrameDecoder "
+    "cleared the enable on entry, which made the old path - the DEFAULT path - "
+    "strictly kick-driven: Work() then early-returned for every worker sweep "
+    "(sweeps prog=0, active_ctx=0) and decode only ever happened on the guest's "
+    "kick. Measured on macOS that sustained 157 frames/s against the 281 that 3 "
+    "real voices needed, at 0.3% of one core - starvation with the CPU idle, "
+    "heard as crackle, robotic repeats and audio lagging real time. The new "
+    "decoder path already keeps the enable for exactly this reason. false "
+    "restores the old kick-driven behaviour.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(xma_use_old_decoder, true, "Audio",
                     "Use the xenia-edge old XMA decoder path. This avoids Skate 3 one-shot SFX "
                     "crackle caused by the current subframe/frame assembly path.");
@@ -336,6 +393,7 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
   data->output_buffer_valid = 0;
 
   output_ring_full_at_ = -1;  // a reused voice must not inherit a full ring
+  old_ring_full_calls_ = 0;
   data->input_buffer_read_offset =
       REXCVAR_GET(xma_use_old_decoder) ? 0 : kBitsPerPacketHeader;
   data->output_buffer_read_offset = 0;
@@ -992,7 +1050,14 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 }
 
 bool XmaContext::WorkOldFrameDecoder() {
-  set_is_enabled(false);
+  // Real XMA hardware keeps an enabled context decoding whenever output space
+  // frees up; the enable persists until XMADisableContext/lock. Clearing it
+  // here made this path kick-driven, so the ring was refilled only as often as
+  // the game happened to kick and voices ran dry between kicks.
+  const bool free_running = REXCVAR_GET(xma_old_free_running);
+  if (!free_running) {
+    set_is_enabled(false);
+  }
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
@@ -1008,7 +1073,12 @@ bool XmaContext::WorkOldFrameDecoder() {
   } else {
     data.Store(context_ptr);
   }
-  return true;
+  if (!free_running) {
+    return true;
+  }
+  // Now that the enable persists, this is what stops the worker spinning: a
+  // sweep that wrote no output reports no progress and the worker waits.
+  return data.output_buffer_write_offset != initial_data.output_buffer_write_offset;
 }
 
 bool XmaContext::TrySetupNextLoopOld(XMA_CONTEXT_DATA* data,
@@ -1198,7 +1268,11 @@ uint32_t XmaContext::GetPacketFirstFrameOffsetOld(const XMA_CONTEXT_DATA* data) 
 void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
   SCOPE_profile_cpu_f("apu");
 
+  DecodeStats::old_entered.fetch_add(1, std::memory_order_relaxed);
   if (!data->output_buffer_valid || !data->IsAnyInputBufferValid()) {
+    (data->output_buffer_valid ? DecodeStats::old_no_input_valid
+                               : DecodeStats::old_no_output_valid)
+        .fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
@@ -1244,8 +1318,52 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
   output_rb.set_write_offset(output_write_offset);
 
   const size_t frame_byte_count = size_t(kBytesPerFrameChannel) << data->is_stereo;
-  size_t output_remaining_bytes = output_rb.write_count();
+  const uint32_t entry_write_offset = output_rb.write_offset();
+  const bool keep_full_valid = REXCVAR_GET(xma_old_ring_full_is_not_empty);
+
+  // A ring we ourselves filled to the brim last time reads read==write, and
+  // write_count() answers "the whole buffer is free" for exactly that state.
+  // Decoding into it would clobber audio the game has not played yet.
+  const bool known_full =
+      keep_full_valid && output_rb.read_offset() == output_rb.write_offset() &&
+      output_ring_full_at_ == static_cast<int64_t>(output_rb.write_offset());
+
+  size_t output_remaining_bytes = known_full ? 0 : output_rb.write_count();
   output_remaining_bytes -= output_remaining_bytes % frame_byte_count;
+  if (output_remaining_bytes == 0) {
+    DecodeStats::old_ring_full.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Both exits below have to settle the same question: read==write on the way
+  // out means the ring is either drained (hand it back to the game so it
+  // re-arms) or exactly full because this call filled it (keep it, so the next
+  // sweep can top it up the moment the game consumes a frame - waiting for a
+  // re-arm costs a whole audio update and is what left the mix silent).
+  auto finish_output_ring = [&]() {
+    if (output_rb.write_offset() != output_rb.read_offset()) {
+      output_ring_full_at_ = -1;
+      old_ring_full_calls_ = 0;
+      return;
+    }
+    const bool wrote_this_call = output_rb.write_offset() != entry_write_offset;
+    if (keep_full_valid && (wrote_this_call || known_full) &&
+        old_ring_full_calls_ < uint32_t(REXCVAR_GET(xma_old_ring_full_calls))) {
+      output_ring_full_at_ = static_cast<int64_t>(output_rb.write_offset());
+      old_ring_full_calls_++;
+      DecodeStats::old_ring_kept_valid.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (keep_full_valid && old_ring_full_calls_) {
+      DecodeStats::old_ring_full_gave_up.fetch_add(1, std::memory_order_relaxed);
+    } else if (!wrote_this_call) {
+      // Nothing written and the ring came out empty: this voice has run dry.
+      DecodeStats::old_ring_drained.fetch_add(1, std::memory_order_relaxed);
+      DecodeStats::MarkVoiceDrained(id());
+    }
+    output_ring_full_at_ = -1;
+    old_ring_full_calls_ = 0;
+    data->output_buffer_valid = 0;
+  };
 
   while (output_remaining_bytes > 0) {
     if (!data->IsAnyInputBufferValid()) {
@@ -1511,9 +1629,7 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
             } else {
               old_is_stream_done_ = true;
             }
-            if (output_rb.write_offset() == output_rb.read_offset()) {
-              data->output_buffer_valid = 0;
-            }
+            finish_output_ring();
           }
           return;
         }
@@ -1571,9 +1687,7 @@ void XmaContext::DecodeOldFrame(XMA_CONTEXT_DATA* data) {
     data->input_buffer_read_offset = offset;
   }
 
-  if (output_rb.write_offset() == output_rb.read_offset()) {
-    data->output_buffer_valid = 0;
-  }
+  finish_output_ring();
 }
 
 void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,

@@ -96,6 +96,26 @@ class AudioSystem : public system::IAudioSystem {
   bool paused_ = false;
   rex::thread::Fence pause_fence_;
   std::unique_ptr<rex::thread::Event> resume_event_;
+
+  // Splits the one question the mix counters cannot answer: when the game
+  // hands us an all-zero frame, did it MIX and find its sources dry, or did it
+  // bail without mixing at all? A bail is much cheaper than a mix, so the two
+  // are told apart by how long the guest callback ran. All of these are
+  // touched only on the audio worker thread, inside or around one dispatch.
+  // Next moment a guest mixing callback may be dispatched, for
+  // audio_even_dispatch. Audio worker thread only.
+  uint64_t next_dispatch_ns_ = 0;
+
+  bool submit_was_silent_ = false;
+  uint32_t submits_this_dispatch_ = 0;
+  uint64_t cb_window_start_ns_ = 0;
+  uint32_t cb_dispatches_ = 0;
+  uint32_t cb_no_submit_ = 0;
+  uint32_t cb_filled_n_ = 0;
+  uint64_t cb_filled_us_ = 0;
+  uint32_t cb_silent_n_ = 0;
+  uint64_t cb_silent_us_ = 0;
+  uint64_t cb_max_us_ = 0;
 };
 
 }  // namespace rex::audio

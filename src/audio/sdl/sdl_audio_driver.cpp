@@ -13,6 +13,9 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
 #include <string>
 
 #include <rex/assert.h>
@@ -56,6 +59,27 @@ REXCVAR_DEFINE_INT32(audio_device_sample_frames, 0, "Audio",
                      "Larger values (e.g. 1024 or 2048) add latency but tolerate scheduling "
                      "hiccups better - try this against crackling, especially on Linux.")
     .range(0, 8192);
+
+// Defined in src/core/logging.cpp; used to place a relative dump next to the
+// log, which is the one directory known to be writable on every platform.
+REXCVAR_DECLARE(std::string, log_file);
+
+REXCVAR_DEFINE_STRING(
+    audio_dump_path, "", "Audio",
+    "Diagnostic tap. When set to a file path, every frame the guest mixer "
+    "submits is appended there as raw bytes: 256 frames of 6 channels of "
+    "BIG-ENDIAN float32, stored per-channel (planar/sequential), 6144 bytes "
+    "per submit. This is the guest's own mix output, captured before our "
+    "5.1->stereo fold, so it distinguishes 'the game handed us bad audio' from "
+    "'we mangled good audio'. A RELATIVE path is placed next to log_file, which "
+    "avoids having to know the sandbox container path on iOS - it moves on "
+    "every reinstall. Empty disables the tap.");
+
+REXCVAR_DEFINE_INT32(
+    audio_dump_max_frames, 4000, "Audio",
+    "Frames to capture before audio_dump_path stops writing. 4000 frames is "
+    "about 21 seconds and 24 MB.")
+    .range(1, 200000);
 
 namespace {
 
@@ -203,6 +227,88 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
 
+  if (REXCVAR_GET(audio_stats)) {
+    // An all-zero frame is the dropout: the mixer met its deadline and handed
+    // us nothing to play. Endian-safe - a big-endian float is zero only when
+    // all four of its bytes are, and any other bit pattern (denormal, NaN)
+    // compares unequal to 0.0f whichever way it is read.
+    bool silent = true;
+    for (uint32_t i = 0; i < frame_samples_; i++) {
+      if (output_frame[i] != 0.0f) {
+        silent = false;
+        break;
+      }
+    }
+    stats_mix_submits_.fetch_add(1, std::memory_order_relaxed);
+    if (silent) {
+      stats_mix_silent_.fetch_add(1, std::memory_order_relaxed);
+      mix_silence_run_++;
+    } else if (mix_silence_run_) {
+      // Runs are what the ear hears. A long run is the game being quiet; a
+      // 1-3 frame run (5-16ms) is a hole punched in music that is still
+      // playing, and on iOS those came one per 16.7ms guest frame.
+      stats_mix_gaps_.fetch_add(1, std::memory_order_relaxed);
+      if (mix_silence_run_ <= 3) {
+        stats_mix_gaps_short_.fetch_add(1, std::memory_order_relaxed);
+      }
+      mix_silence_run_ = 0;
+    }
+  }
+
+  if (!REXCVAR_GET(audio_dump_path).empty()) {
+    // Only the guest audio worker reaches SubmitFrame, but guard anyway: the
+    // cost is uncontended and this runs under the global critical region.
+    static std::mutex dump_mutex;
+    static std::ofstream dump_file;
+    static int32_t dump_frames = 0;
+    std::lock_guard<std::mutex> dump_guard(dump_mutex);
+    if (!dump_file.is_open() && dump_frames == 0) {
+      std::filesystem::path dump_path(REXCVAR_GET(audio_dump_path));
+      if (dump_path.is_relative()) {
+        const std::filesystem::path log_path(REXCVAR_GET(log_file));
+        if (!log_path.empty()) {
+          dump_path = log_path.parent_path() / dump_path;
+        }
+      }
+      dump_file.open(dump_path, std::ios::binary | std::ios::trunc);
+      if (dump_file.is_open()) {
+        REXAPU_INFO("SDLAudioDriver: dumping guest mix to '{}' ({} frames max)",
+                    dump_path.string(), REXCVAR_GET(audio_dump_max_frames));
+      } else {
+        REXAPU_ERROR("SDLAudioDriver: could not open audio_dump_path '{}'",
+                     dump_path.string());
+      }
+    }
+    // Skip the run-up: the guest mixer submits silence from the moment the
+    // audio system starts, which is long before the game plays anything, so a
+    // capture that began at the first submit was 100% zeros. Start at the
+    // first frame carrying signal, then keep everything after it - including
+    // silence, because the gaps are the thing being diagnosed.
+    static bool dump_started = false;
+    if (!dump_started) {
+      for (uint32_t i = 0; i < frame_samples_; i++) {
+        if (output_frame[i] != 0.0f) {
+          dump_started = true;
+          break;
+        }
+      }
+      if (dump_started) {
+        REXAPU_INFO("SDLAudioDriver: guest mix dump armed (first frame with signal)");
+      }
+    }
+    if (dump_file.is_open() && dump_started) {
+      if (dump_frames < REXCVAR_GET(audio_dump_max_frames)) {
+        dump_file.write(reinterpret_cast<const char*>(output_frame),
+                        std::streamsize(frame_samples_ * sizeof(float)));
+        dump_frames++;
+      } else {
+        dump_file.flush();
+        dump_file.close();
+        REXAPU_INFO("SDLAudioDriver: guest mix dump complete ({} frames)", dump_frames);
+      }
+    }
+  }
+
   static uint32_t sdl_submit_count = 0;
   if (sdl_submit_count < 10) {
     std::unique_lock<std::mutex> guard(frames_mutex_);
@@ -217,6 +323,11 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
   }
   frames_available_cv_.notify_one();
+}
+
+size_t SDLAudioDriver::QueuedFrameCount() const {
+  std::unique_lock<std::mutex> guard(frames_mutex_);
+  return frames_queued_.size();
 }
 
 void SDLAudioDriver::Shutdown() {
@@ -376,6 +487,16 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
           driver->stats_queue_min_ == SIZE_MAX ? 0 : driver->stats_queue_min_,
           driver->stats_queue_max_, driver->pace_deferred_credits_,
           driver->pace_allowance_frames_, driver->stats_max_callback_gap_ns_ / 1000000ull);
+      {
+        const uint32_t subs = driver->stats_mix_submits_.exchange(0, std::memory_order_relaxed);
+        const uint32_t sil = driver->stats_mix_silent_.exchange(0, std::memory_order_relaxed);
+        const uint32_t gaps = driver->stats_mix_gaps_.exchange(0, std::memory_order_relaxed);
+        const uint32_t shrt = driver->stats_mix_gaps_short_.exchange(0, std::memory_order_relaxed);
+        REXAPU_INFO(
+            "Guest mix ({:.1f}s): submits={} all-silent={} ({:.1f}%) gaps={} of which "
+            "short(1-3 frames, 5-16ms)={}",
+            window_s, subs, sil, subs ? double(sil) * 100.0 / double(subs) : 0.0, gaps, shrt);
+      }
       driver->stats_window_start_ns_ = now_ns;
       driver->stats_callbacks_ = 0;
       driver->stats_frames_ = 0;
