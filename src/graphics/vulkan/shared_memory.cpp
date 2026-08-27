@@ -34,12 +34,20 @@ REXCVAR_DEFINE_BOOL(vulkan_alias_guest_shared_memory, true, "GPU/Vulkan",
                     "of dirty ranges. Falls back automatically when unsupported.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-// VK_NO_PROTOTYPES is set for the whole build, and on iOS MoltenVK is linked
-// into this library statically, so the import entry point is an ordinary symbol
-// rather than something to fetch through the device function table.
-extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkGetMemoryHostPointerPropertiesEXT(
-    VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType, const void* pHostPointer,
-    VkMemoryHostPointerPropertiesEXT* pMemoryHostPointerProperties);
+// This used to be declared here as an extern "C" FUNCTION, on the reasoning
+// that iOS links MoltenVK statically so the entry point is an ordinary symbol.
+// That is true on iOS and badly wrong everywhere else. macOS reaches MoltenVK
+// through the Vulkan loader, and with VK_NO_PROTOTYPES the name
+// `vkGetMemoryHostPointerPropertiesEXT` belongs to volk, which defines it as a
+// function-POINTER VARIABLE. Declaring it as a function made the call jump to
+// the address OF THE VARIABLE - a data page - so every macOS run died with
+// EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE on the GPU Commands thread, a few
+// seconds after "Runtime initialized successfully" and before any frame was
+// ever presented.
+//
+// Resolve it at runtime instead. vkGetDeviceProcAddr is correct on both
+// platforms: the loader returns MoltenVK's implementation on macOS, and the
+// statically linked MoltenVK answers the same query on iOS.
 
 namespace rex::graphics::vulkan {
 
@@ -70,11 +78,23 @@ bool VulkanSharedMemory::TryCreateImportedBuffer() {
     return false;
   }
 
+  const ui::vulkan::VulkanInstance::Functions& ifn =
+      vulkan_device->vulkan_instance()->functions();
+  const auto get_host_pointer_properties =
+      reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+          ifn.vkGetDeviceProcAddr(device, "vkGetMemoryHostPointerPropertiesEXT"));
+  if (get_host_pointer_properties == nullptr) {
+    REXGPU_INFO(
+        "Shared memory: the driver advertises VK_EXT_external_memory_host but exposes no "
+        "vkGetMemoryHostPointerPropertiesEXT");
+    return false;
+  }
+
   VkMemoryHostPointerPropertiesEXT host_pointer_properties;
   host_pointer_properties.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
   host_pointer_properties.pNext = nullptr;
   host_pointer_properties.memoryTypeBits = 0;
-  if (vkGetMemoryHostPointerPropertiesEXT(
+  if (get_host_pointer_properties(
           device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host_pointer,
           &host_pointer_properties) != VK_SUCCESS ||
       !host_pointer_properties.memoryTypeBits) {
