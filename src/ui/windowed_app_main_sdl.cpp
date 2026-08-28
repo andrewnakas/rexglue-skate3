@@ -212,6 +212,23 @@ std::vector<std::string> BuildIOSArguments() {
       // Drop to 30 from Documents/user/ios_args.txt on a smaller device.
       "--skate3_guest_fps_cap=60",
       "--skate3_guest_fps_cap_auto=false",
+      // Auto is still reachable from the settings menu, and on a ProMotion
+      // phone it used to derive 114 FPS from a 120 Hz panel that iOS only
+      // presents 60 through - which stopped the pacer pacing and locked the
+      // frame to 30. Fixed at the source (display_presentable_refresh_cap_hz),
+      // but the next report of this shape should carry the evidence rather
+      // than needing a Metal HUD capture to diagnose, so:
+      //
+      // The cadence line is avg/sd/jitter/max over 600 swaps - one formatted
+      // line every ten seconds or so, which cannot distort what it measures.
+      // Together with [pace] and the "guest frame cap is now" line it shows
+      // the cap, the rate the display accepts, and what actually came out.
+      "--presenter_present_cadence_log=true",
+      // Explicit rather than relying on the default: [pace] and [cp-sum] are
+      // INFO, and a settings.toml left at 'warning' on a device hides them
+      // with no indication that anything was suppressed. Costs nothing -
+      // log_flush_level=warn above means INFO never flushes inline.
+      "--log_level=info",
 
       // ---- Cache budgets --------------------------------------------------
       // These default to 1280 and 1024 MB, which is 2.3 GB of caches before
