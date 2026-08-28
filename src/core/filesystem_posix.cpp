@@ -10,6 +10,9 @@
  */
 
 #include <assert.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,6 +114,22 @@ std::filesystem::path GetAppRootFolder() {
 }
 
 std::filesystem::path GetUserFolder() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // iOS first, and unconditionally: inside the app's data container only
+  // Documents/, Library/ and tmp/ are writable - the container ROOT is not.
+  // The XDG ".local/share" fallback below therefore cannot even be created
+  // there, and everything built on this path (settings, profiles, cache, and
+  // the installer's game directory) failed with "Operation not permitted".
+  // Library/Application Support is Apple's location for app-managed data that
+  // should not be visible to the user in Files.
+  //
+  // Deliberately iOS-only. macOS genuinely uses ~/.local/share/skate3 today and
+  // moving it would strand existing settings.
+  if (const char* ios_home = std::getenv("HOME"); ios_home && *ios_home) {
+    return std::filesystem::path(ios_home) / "Library" / "Application Support";
+  }
+#endif
+
   // get preferred data home
   char* home = std::getenv("XDG_DATA_HOME");
   if (home) {
