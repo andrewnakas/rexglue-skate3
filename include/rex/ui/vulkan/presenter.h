@@ -472,6 +472,14 @@ class VulkanPresenter final : public Presenter {
     // after all submissions have completed and the swapchain releasing them
     // has been destroyed.
     std::vector<VkSemaphore> retired_present_semaphores;
+    // Framebuffers and image views from a swapchain that was retired while a
+    // submission fence had NOT signalled - see the give-up path in
+    // VulkanSubmissionTracker::AwaitSubmissionCompletion. The GPU may still be
+    // reading them, and there is no signal left that would say when it stops,
+    // so they are held to the end of the presenter's life rather than
+    // destroyed. Only the bounded-wait timeout puts anything here, so it stays
+    // empty in every healthy run.
+    std::vector<SwapchainFramebuffer> retired_framebuffers;
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,

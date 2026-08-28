@@ -305,6 +305,12 @@ VulkanPresenter::~VulkanPresenter() {
     dfn.vkDestroySemaphore(device, retired_present_semaphore, nullptr);
   }
   paint_context_.retired_present_semaphores.clear();
+  for (const PaintContext::SwapchainFramebuffer& framebuffer :
+       paint_context_.retired_framebuffers) {
+    dfn.vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
+    dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
+  }
+  paint_context_.retired_framebuffers.clear();
 
   if (paint_context_.swapchain_render_pass != VK_NULL_HANDLE) {
     dfn.vkDestroyRenderPass(device, paint_context_.swapchain_render_pass, nullptr);
@@ -1171,8 +1177,14 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   GuestOutputImageInstance& image_instance = guest_output_images_[mailbox_index];
   if (image_instance.image && (image_instance.image->extent().width != frontbuffer_width ||
                                image_instance.image->extent().height != frontbuffer_height)) {
-    guest_output_image_refresher_submission_tracker_.AwaitSubmissionCompletion(
-        image_instance.last_refresher_submission);
+    if (!guest_output_image_refresher_submission_tracker_.AwaitSubmissionCompletion(
+            image_instance.last_refresher_submission)) {
+      // Gave up on the fence - the GPU may still be reading this image. Keep
+      // it and skip the refresh; the next one retries.
+      REXLOG_WARN("VulkanPresenter: skipping a guest output refresh - submission {} never completed",
+                  image_instance.last_refresher_submission);
+      return false;
+    }
     image_instance.image.reset();
   }
   if (!image_instance.image) {
@@ -1539,14 +1551,27 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 }
 
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
+  // False means a fence never signalled and we stopped waiting rather than
+  // wedging the process. The GPU may still own everything that submission
+  // referenced, so nothing below may be destroyed - it is held instead.
+  bool all_submissions_completed = true;
   if (swapchain != VK_NULL_HANDLE) {
-    submission_tracker.AwaitAllSubmissionsCompletion();
+    all_submissions_completed = submission_tracker.AwaitAllSubmissionsCompletion();
   }
   const VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  for (const SwapchainFramebuffer& framebuffer : swapchain_framebuffers) {
-    dfn.vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
-    dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
+  if (all_submissions_completed) {
+    for (const SwapchainFramebuffer& framebuffer : swapchain_framebuffers) {
+      dfn.vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
+      dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
+    }
+  } else {
+    REXLOG_WARN(
+        "vulkan: retiring a swapchain whose submissions have not all completed - holding {} "
+        "framebuffers rather than destroying them, because the GPU may still be reading them.",
+        swapchain_framebuffers.size());
+    retired_framebuffers.insert(retired_framebuffers.end(), swapchain_framebuffers.begin(),
+                                swapchain_framebuffers.end());
   }
   swapchain_framebuffers.clear();
   // The retired swapchain may still have presents in flight, and
@@ -1745,8 +1770,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       uint64_t(std::max(1, REXCVAR_GET(vulkan_max_frames_in_flight)));
   paint_submission_count = std::min(paint_submission_count, max_frames_in_flight);
   if (current_paint_submission_index >= paint_submission_count) {
-    paint_context_.submission_tracker.AwaitSubmissionCompletion(current_paint_submission_index -
-                                                                paint_submission_count);
+    if (!paint_context_.submission_tracker.AwaitSubmissionCompletion(
+            current_paint_submission_index - paint_submission_count)) {
+      // The fence never signalled and the wait gave up rather than hanging the
+      // process. The slot below is indexed modulo the in-flight depth, so
+      // proceeding would record into command buffers and reference objects the
+      // GPU may still be reading. Drop the frame; the connection is reported
+      // outdated so the swapchain is rebuilt, which is what releases a
+      // submission stuck on a drawable that never arrived.
+      REXLOG_WARN(
+          "VulkanPresenter: dropping the frame - submission {} never completed, so its slot "
+          "cannot be reused. Rebuilding the swapchain.",
+          current_paint_submission_index - paint_submission_count);
+      return PaintResult::kNotPresentedConnectionOutdated;
+    }
   }
   const PaintContext::Submission& paint_submission =
       *paint_context_.submissions[current_paint_submission_index % paint_submission_count];
@@ -1910,10 +1947,18 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             }
           }
           // Await the completion of the usage of the old guest output image and
-          // its descriptors.
-          paint_context_.submission_tracker.AwaitSubmissionCompletion(
-              paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_new_index]
-                  .first);
+          // its descriptors. If that wait gave up, the descriptors may still be
+          // in use by the GPU - overwriting them would be a real corruption, so
+          // drop the frame and rebuild instead.
+          if (!paint_context_.submission_tracker.AwaitSubmissionCompletion(
+                  paint_context_
+                      .guest_output_image_paint_refs[guest_output_image_paint_ref_new_index]
+                      .first)) {
+            REXLOG_WARN(
+                "VulkanPresenter: dropping the frame - cannot recycle a guest output paint "
+                "reference whose submission never completed");
+            return PaintResult::kNotPresentedConnectionOutdated;
+          }
         }
         guest_output_image_paint_ref_index = guest_output_image_paint_ref_new_index;
         // The actual submission index will be set if the image is actually
@@ -1960,8 +2005,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             // Need to replace immediately as a new image with the requested
             // size is needed.
             if (intermediate_image_ptr_ref) {
-              paint_context_.submission_tracker.AwaitSubmissionCompletion(
-                  paint_context_.guest_output_intermediate_image_last_submission);
+              if (!paint_context_.submission_tracker.AwaitSubmissionCompletion(
+                      paint_context_.guest_output_intermediate_image_last_submission)) {
+                REXLOG_WARN(
+                    "VulkanPresenter: dropping the frame - cannot replace an intermediate image "
+                    "whose submission never completed");
+                return PaintResult::kNotPresentedConnectionOutdated;
+              }
               intermediate_image_ptr_ref.reset();
               util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device,
                                          paint_context_.guest_output_intermediate_framebuffers[i]);
@@ -2053,8 +2103,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           if (swapchain_effect_pipeline.swapchain_pipeline != VK_NULL_HANDLE &&
               swapchain_effect_pipeline.swapchain_format !=
                   paint_context_.swapchain_render_pass_format) {
-            paint_context_.submission_tracker.AwaitSubmissionCompletion(
-                paint_context_.guest_output_image_paint_last_submission);
+            if (!paint_context_.submission_tracker.AwaitSubmissionCompletion(
+                    paint_context_.guest_output_image_paint_last_submission)) {
+              REXLOG_WARN(
+                  "VulkanPresenter: dropping the frame - cannot destroy a pipeline whose "
+                  "submission never completed");
+              return PaintResult::kNotPresentedConnectionOutdated;
+            }
             util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                        swapchain_effect_pipeline.swapchain_pipeline);
             swapchain_effect_pipeline.swapchain_format = VK_FORMAT_UNDEFINED;

@@ -9,12 +9,27 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/util.h>
+
+REXCVAR_DEFINE_INT32(
+    vulkan_fence_wait_timeout_seconds, 4, "UI/Vulkan",
+    "Give up waiting for a submission's fence after this many seconds instead of waiting "
+    "forever. On Apple platforms a submission can park inside vkQueueSubmit on a "
+    "CAMetalDrawable that never arrives - while the app is suspended or its layer is not "
+    "visible - and the fence then never signals, wedging the whole process. Giving up turns "
+    "that into a dropped frame and a swapchain rebuild. Must stay under iOS's ~5s "
+    "suspension deadline, or the system kills the app for failing to go quiescent "
+    "before this ever gives up. 0 waits forever (the old behaviour).")
+    .range(0, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex {
 namespace ui {
@@ -41,7 +56,15 @@ VulkanSubmissionTracker::FenceAcquisition::~FenceAcquisition() {
 }
 
 void VulkanSubmissionTracker::Shutdown() {
-  AwaitAllSubmissionsCompletion();
+  // Bounded like every other wait now, so quitting a wedged app does not hang
+  // on the way out. The fences below are then destroyed while possibly still
+  // in use, which is invalid in principle - but this is teardown, the device
+  // goes with it, and a quit that never returns is worse.
+  if (!AwaitAllSubmissionsCompletion()) {
+    REXLOG_WARN(
+        "vulkan: shutting down with submissions still outstanding - their fences never "
+        "signalled. Destroying them anyway; the device is going away with them.");
+  }
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
   for (VkFence fence : fences_reclaimed_) {
@@ -90,6 +113,39 @@ uint64_t VulkanSubmissionTracker::UpdateAndGetCompletedSubmission() {
 }
 
 bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_index) {
+  // Diagnostic: a call that takes real time is the whole story of the hang, and
+  // without this there is no way to tell "the bound never fired" from "the
+  // bound was never reached". Rate-limited to one line a second so a wedged
+  // app is legible rather than a wall of text. Costs a steady_clock read per
+  // call on the healthy path.
+  const auto await_entry_time = std::chrono::steady_clock::now();
+  struct AwaitTrace {
+    VulkanSubmissionTracker* tracker;
+    uint64_t index;
+    std::chrono::steady_clock::time_point entry;
+    bool* result_slot;
+    bool result = false;
+    ~AwaitTrace() {
+      const auto elapsed = std::chrono::steady_clock::now() - entry;
+      if (elapsed < std::chrono::milliseconds(100)) {
+        return;
+      }
+      static std::chrono::steady_clock::time_point s_last_logged;
+      const auto now = std::chrono::steady_clock::now();
+      if (now - s_last_logged < std::chrono::seconds(1)) {
+        return;
+      }
+      s_last_logged = now;
+      REXLOG_WARN(
+          "vulkan: AwaitSubmissionCompletion({}) took {}ms -> {} | current={} completed={} "
+          "pending={}",
+          index, std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+          result ? "true" : "false", tracker->submission_current_,
+          tracker->submission_completed_on_gpu_, tracker->fences_pending_.size());
+    }
+  };
+  bool await_result_slot = false;
+  AwaitTrace await_trace{this, submission_index, await_entry_time, &await_result_slot};
   // The tracker itself can't give a submission index for a submission that
   // hasn't even started being recorded yet, the client has provided a
   // completely invalid value or has done overly optimistic math if such an
@@ -129,17 +185,70 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
         // leaves this blocked forever on return, with no log line and nothing
         // for the hang watchdog to attribute. Saying so turns "it hung coming
         // back from the home screen" into a stack.
-        constexpr uint64_t kFenceWaitSliceNs = 2ull * 1000 * 1000 * 1000;
-        uint32_t waited_slices = 0;
+        // Bound this OURSELVES rather than trusting vkWaitForFences.
+        //
+        // Measured on device 2026-08-27: a 2s timeout passed to MoltenVK's
+        // vkWaitForFences did NOT come back as VK_TIMEOUT. The main thread sat
+        // in it for 17s while the app was wedged, and the per-slice warning
+        // below never printed once - the cvar was confirmed applied, so the
+        // code was live and the timeout simply was not honoured. MoltenVK
+        // implements the wait as condition_variable::wait_until against a
+        // system_clock deadline, so a Vulkan-level timeout is only as good as
+        // that conversion. It is not something to build a hang bound on.
+        //
+        // vkGetFenceStatus does not block, so polling it against our own
+        // steady_clock deadline cannot be defeated the same way. The spin is
+        // short and yields, then backs off to a sleep, so a healthy frame pays
+        // microseconds and a wedged one is bounded for real.
+        const int32_t timeout_s = REXCVAR_GET(vulkan_fence_wait_timeout_seconds);
+        const auto poll_start = std::chrono::steady_clock::now();
+        const auto deadline = poll_start + std::chrono::seconds(timeout_s > 0 ? timeout_s : 0);
+        uint32_t next_warn_s = 2;
+        bool gave_up = false;
         VkResult wait_result;
-        while ((wait_result = dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE,
-                                                  kFenceWaitSliceNs)) == VK_TIMEOUT) {
-          ++waited_slices;
-          REXLOG_WARN(
-              "vulkan: still waiting for submission {} to complete after {}s - the GPU has "
-              "not signalled its fence. On Apple platforms this is what a drawable that never "
-              "arrives looks like (the app was most likely suspended mid-frame).",
-              pending_pair.first, waited_slices * 2);
+        for (;;) {
+          wait_result = dfn.vkGetFenceStatus(device, pending_pair.second);
+          if (wait_result != VK_NOT_READY) {
+            break;
+          }
+          const auto now = std::chrono::steady_clock::now();
+          const auto waited = now - poll_start;
+          if (timeout_s > 0 && now >= deadline) {
+            REXLOG_ERROR(
+                "vulkan: giving up waiting for submission {} after {}s. The fence is still "
+                "unsignalled, so the GPU may still own everything this submission referenced: "
+                "the fence is NOT recycled and the submission is NOT retired here, and the "
+                "caller drops the frame rather than reusing the slot. Waiting forever instead "
+                "would wedge the process, which on iOS is a kill for failing to suspend.",
+                pending_pair.first,
+                std::chrono::duration_cast<std::chrono::seconds>(waited).count());
+            gave_up = true;
+            break;
+          }
+          if (waited >= std::chrono::seconds(next_warn_s)) {
+            REXLOG_WARN(
+                "vulkan: still waiting for submission {} to complete after {}s - the GPU has "
+                "not signalled its fence. On Apple platforms this is what a drawable that never "
+                "arrives looks like (the app was most likely suspended mid-frame).",
+                pending_pair.first, next_warn_s);
+            next_warn_s += 2;
+          }
+          // Cheap for the first couple of ms - a fence about to signal usually
+          // does so well inside that - then back off so a long wait is idle.
+          if (waited < std::chrono::milliseconds(2)) {
+            std::this_thread::yield();
+          } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+        }
+        if (gave_up) {
+          await_trace.result = false;
+          // Leave the pending entry exactly as it is. It is still a live fence
+          // the GPU may signal late - the logs show these do sometimes come
+          // back - and a later call will pick it up through the ordinary
+          // vkGetFenceStatus path. Reclaiming or resetting it here is how a
+          // bounded wait would turn a hang into memory corruption.
+          return false;
         }
         if (wait_result == VK_SUCCESS) {
           break;
@@ -159,7 +268,13 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
       }
     }
   }
-  return submission_completed_on_gpu_ == submission_index;
+  // >= not ==: the caller is asking "has this submission completed", and the
+  // GPU having run PAST it is the ordinary healthy answer, not a failure. With
+  // == this returned false on every frame where the completed index had moved
+  // on, which is most of them - callers that treat false as "the fence never
+  // signalled" then drop every frame.
+  await_trace.result = submission_completed_on_gpu_ >= submission_index;
+  return await_trace.result;
 }
 
 VulkanSubmissionTracker::FenceAcquisition
