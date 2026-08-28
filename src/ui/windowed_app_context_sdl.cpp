@@ -52,6 +52,21 @@ int SDLWindowedAppContext::RunMainLoop() {
         auto* context = static_cast<SDLWindowedAppContext*>(userdata);
         switch (event->type) {
           case SDL_EVENT_WILL_ENTER_BACKGROUND:
+            // Stop painting BEFORE the process suspends. A backgrounded
+            // CAMetalLayer does not vend drawables, and MoltenVK takes the
+            // drawable inside vkQueueSubmit on an untimed wait, so a paint
+            // started now does not fail - it blocks, holding the queue lock,
+            // and the app never goes quiescent. iOS then kills it for failing
+            // to suspend, which writes no crash report.
+            //
+            // Every device-lost in the captured logs followed one of these
+            // events by ~1s (the drawable timeout), and every one of them was
+            // the last line its process ever wrote. This is that fix, and it
+            // has to happen here in the watch rather than in DispatchEvent -
+            // by the time a queued event is dispatched the app is already
+            // suspended.
+            SDLWindow::SetAllSurfacesPresentable(false, "entering the background");
+            [[fallthrough]];
           case SDL_EVENT_LOW_MEMORY:
             // Jetsam evicts suspended processes largest-first, and this one
             // sits near a gigabyte, most of it caches it cannot use while
@@ -62,6 +77,17 @@ int SDLWindowedAppContext::RunMainLoop() {
             if (context->low_memory_handler_) {
               context->low_memory_handler_();
             }
+            break;
+          // BOTH foreground events, because WILL_ENTER_FOREGROUND is not
+          // reliably delivered - measured on device, the app logged 10
+          // suspends against 5 resumes and every resume came from the window
+          // flags path, never from this one. An unmatched suspend leaves the
+          // gate shut, the app stops painting for good, and it looks exactly
+          // like the hang this gate exists to prevent. Handling both, and
+          // being idempotent, costs nothing.
+          case SDL_EVENT_WILL_ENTER_FOREGROUND:
+          case SDL_EVENT_DID_ENTER_FOREGROUND:
+            SDLWindow::SetAllSurfacesPresentable(true, "returning to the foreground");
             break;
           default:
             break;

@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -286,6 +287,31 @@ class Window {
   // Desired state stored by the common Window, modifiable both externally and
   // by the implementation (including from SetFullscreen itself).
   bool IsFullscreen() const { return fullscreen_; }
+
+  // Whether the platform surface can currently hand out a drawable to render
+  // into. False while the app is in the background on iOS, or while the window
+  // is occluded or hidden.
+  //
+  // This exists because of how MoltenVK works: it does not take the
+  // CAMetalDrawable at vkAcquireNextImageKHR, it defers it to render-pass
+  // encode time, so the acquisition happens inside vkQueueSubmit on an untimed
+  // semaphore. A CAMetalLayer that is not visible will not vend one, so that
+  // wait does not return - it takes the queue lock with it, and every other
+  // submitter queues behind it. Every iOS session ended this way: the app kept
+  // painting after being told it was suspending, the drawable never arrived,
+  // and the process was killed before it could recover.
+  //
+  // Readable from any thread (the guest output thread paints too); written
+  // only from the UI thread, which is where both SDL window events and the
+  // iOS lifecycle watch run.
+  bool IsSurfacePresentable() const {
+    return surface_presentable_.load(std::memory_order_acquire);
+  }
+  // Returns whether this changed anything, so the caller can log the
+  // transitions without logging every repeated event.
+  bool SetSurfacePresentable(bool presentable) {
+    return surface_presentable_.exchange(presentable, std::memory_order_acq_rel) != presentable;
+  }
   void SetFullscreen(bool new_fullscreen);
 
   // Desired state stored by the common Window, externally modifiable, read-only
@@ -686,6 +712,10 @@ class Window {
   WindowedAppContext& app_context_;
 
   Phase phase_ = Phase::kClosedOpenable;
+
+  // See IsSurfacePresentable(). Starts true so a window that never reports
+  // visibility at all still paints.
+  std::atomic_bool surface_presentable_{true};
   WindowDestructionReceiver* innermost_destruction_receiver_ = nullptr;
 
   // All currently-attached listeners that get event notifications.

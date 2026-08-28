@@ -1699,6 +1699,50 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+
+  // Do not paint into a surface that cannot hand out a drawable right now.
+  //
+  // This is the single choke point for both painting threads (the UI thread
+  // via PaintFromUIThread, and the guest output thread when the paint mode is
+  // kGuestOutputThreadImmediately), which is why the check lives here rather
+  // than in either caller.
+  //
+  // On Apple platforms a paint attempted while the app is backgrounded or the
+  // window is occluded does not fail - it BLOCKS, inside vkQueueSubmit, on the
+  // CAMetalDrawable that a non-visible CAMetalLayer will never vend. That takes
+  // the queue lock with it and wedges the whole process; on iOS the system then
+  // kills the app for failing to suspend. Skipping the frame is the whole fix.
+  //
+  // Deliberately does NOT touch the surface connection: returning kNotPresented
+  // leaves the state as it is, so the swapchain survives and coming back to the
+  // foreground is a resumed frame rather than a rebuild. Tearing the swapchain
+  // down here was tried before and reverted for freezing on return.
+  if (window_ && !window_->IsSurfacePresentable()) {
+    // Fail OPEN if this ever persists. A gate that shuts and is never reopened
+    // stops the app painting for good, which is indistinguishable from - and
+    // worse than - the drawable stall it exists to avoid: that one is now
+    // bounded, this one was not. Measured on device the app logged twice as
+    // many suspends as resumes, because the foreground event that should have
+    // reopened it is not reliably delivered, and the result was a permanent
+    // freeze. Reopening costs at worst one blocked acquire; staying shut costs
+    // the session.
+    const auto now = std::chrono::steady_clock::now();
+    if (surface_gated_since_ == std::chrono::steady_clock::time_point{}) {
+      surface_gated_since_ = now;
+    } else if (now - surface_gated_since_ > std::chrono::seconds(3)) {
+      REXLOG_WARN(
+          "presenter: presentation has been gated for over 3s without a resume - reopening. "
+          "A foreground or visibility event was missed.");
+      window_->SetSurfacePresentable(true);
+      surface_gated_since_ = {};
+      // Fall through and paint this frame.
+    }
+    if (surface_gated_since_ != std::chrono::steady_clock::time_point{}) {
+      return PaintResult::kNotPresented;
+    }
+  } else {
+    surface_gated_since_ = {};
+  }
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
   switch (result) {
     case PaintResult::kPresented:

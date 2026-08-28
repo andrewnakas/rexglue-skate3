@@ -27,7 +27,23 @@ class SDLWindow final : public Window {
 
   static void HandleSDLEvent(const SDL_Event& event);
 
+  // Marks every open window's surface presentable or not - see
+  // Window::IsSurfacePresentable(). Static because the iOS lifecycle watch in
+  // SDLWindowedAppContext has no window in hand: it runs synchronously from
+  // the UIKit delegate, before any per-window event is dispatched, which is
+  // the only point early enough to stop a paint that would otherwise block on
+  // a drawable the system will not hand out while suspended.
+  //
+  // UI thread only (both SDL window events and the lifecycle watch run there),
+  // so the window map needs no lock of its own.
+  static void SetAllSurfacesPresentable(bool presentable, const char* reason);
+
   void SetTextInputActive(bool active) override;
+
+  // Recomputes this window's surface presentability from SDL_GetWindowFlags.
+  // Returns whether it changed. See the definition for why the flags are read
+  // instead of trusting SDL_EVENT_WINDOW_EXPOSED.
+  bool RefreshSurfacePresentableFromWindowFlags();
 
  protected:
   uint32_t GetLatestDpiImpl() const override;

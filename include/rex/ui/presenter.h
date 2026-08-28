@@ -947,6 +947,11 @@ class Presenter {
   // disconnecting painting).
   Window* window_ = nullptr;
 
+  // When presentation was gated (see the check in PaintAndPresent), so a gate
+  // that is never reopened by an event can reopen itself rather than freezing
+  // the app. Zero means not currently gated.
+  std::chrono::steady_clock::time_point surface_gated_since_{};
+
   // The surface of the `window_` the presenter is currently attached to.
   Surface* surface_ = nullptr;
 

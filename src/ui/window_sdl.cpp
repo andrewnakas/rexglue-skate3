@@ -362,12 +362,61 @@ SDLWindow::~SDLWindow() {
   }
 }
 
+// Reads the surface's real presentability out of SDL rather than inferring it
+// from an event, because SDL_EVENT_WINDOW_EXPOSED is also what RequestPaintImpl
+// pushes for its own paint requests. Returns whether the state changed.
+//
+// Deliberately does not consider the iOS background state: that arrives through
+// the lifecycle watch, which SDL_GetWindowFlags knows nothing about, and it
+// must not be undone by a window event arriving afterwards. On iOS the flags
+// checked here are never set anyway.
+bool SDLWindow::RefreshSurfacePresentableFromWindowFlags() {
+  if (!window_) {
+    return false;
+  }
+  constexpr SDL_WindowFlags kCannotVendDrawable =
+      SDL_WINDOW_OCCLUDED | SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED;
+  const SDL_WindowFlags flags = SDL_GetWindowFlags(window_);
+  const bool presentable = (flags & kCannotVendDrawable) == 0;
+  if (!SetSurfacePresentable(presentable)) {
+    return false;
+  }
+  // Logged because "did the gate actually fire?" is the only way to tell a fix
+  // from a coincidence, and the answer is not otherwise visible anywhere.
+  REXLOG_INFO("presentation {}: window flags {:#x}{}{}{}", presentable ? "resumed" : "suspended",
+              uint64_t(flags), (flags & SDL_WINDOW_OCCLUDED) ? " occluded" : "",
+              (flags & SDL_WINDOW_HIDDEN) ? " hidden" : "",
+              (flags & SDL_WINDOW_MINIMIZED) ? " minimized" : "");
+  return true;
+}
+
+void SDLWindow::SetAllSurfacesPresentable(bool presentable, const char* reason) {
+  bool any_changed = false;
+  for (auto& [window_id, window] : WindowMap()) {
+    if (window->SetSurfacePresentable(presentable)) {
+      any_changed = true;
+      // Coming back, ask for a repaint - nothing else will, since the paints
+      // that would have been requested while gated were dropped. RequestPaint
+      // is already a no-op without a presenter surface.
+      if (presentable) {
+        window->RequestPaint();
+      }
+    }
+  }
+  if (any_changed) {
+    REXLOG_INFO("presentation {}: {}", presentable ? "resumed" : "suspended", reason);
+  }
+}
+
 void SDLWindow::HandleSDLEvent(const SDL_Event& event) {
   SDL_WindowID window_id = 0;
   switch (event.type) {
     case SDL_EVENT_WINDOW_SHOWN:
     case SDL_EVENT_WINDOW_HIDDEN:
     case SDL_EVENT_WINDOW_EXPOSED:
+    case SDL_EVENT_WINDOW_OCCLUDED:
+    case SDL_EVENT_WINDOW_MINIMIZED:
+    case SDL_EVENT_WINDOW_RESTORED:
     case SDL_EVENT_WINDOW_MOVED:
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -599,7 +648,28 @@ void SDLWindow::HandleEvent(const SDL_Event& event) {
   switch (event.type) {
     case SDL_EVENT_WINDOW_EXPOSED:
       paint_event_queued_.store(false, std::memory_order_release);
+      // Do NOT simply open the gate here. RequestPaintImpl pushes a SYNTHETIC
+      // event of this same type for every paint request, so trusting the event
+      // would have the app re-opening its own gate every frame - the occlusion
+      // gate would never hold. Ask the window system for the real state
+      // instead, which is correct whether this event was SDL's or ours.
+      RefreshSurfacePresentableFromWindowFlags();
       OnPaint();
+      break;
+    // A fully occluded or hidden CAMetalLayer does not vend drawables, and
+    // -[CAMetalLayer nextDrawable] BLOCKS rather than failing when asked - see
+    // Window::IsSurfacePresentable(). The vendored imgui Metal backend carries
+    // the same rule for the same reason.
+    case SDL_EVENT_WINDOW_OCCLUDED:
+    case SDL_EVENT_WINDOW_HIDDEN:
+    case SDL_EVENT_WINDOW_MINIMIZED:
+      SetSurfacePresentable(false);
+      break;
+    case SDL_EVENT_WINDOW_SHOWN:
+    case SDL_EVENT_WINDOW_RESTORED:
+      if (RefreshSurfacePresentableFromWindowFlags()) {
+        RequestPaint();
+      }
       break;
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -608,6 +678,11 @@ void SDLWindow::HandleEvent(const SDL_Event& event) {
       HandleSizeUpdate(destruction_receiver);
       break;
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
+      // Focus is unambiguous evidence that we are frontmost and the layer can
+      // vend again, and it arrives on paths the lifecycle events miss.
+      if (SetSurfacePresentable(true)) {
+        RequestPaint();
+      }
       OnFocusUpdate(true, destruction_receiver);
       break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
