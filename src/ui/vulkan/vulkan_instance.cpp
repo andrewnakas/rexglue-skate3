@@ -10,6 +10,7 @@
  */
 
 #include <cstdlib>
+#include <filesystem>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -53,6 +54,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     const std::filesystem::path local_icd_paths[] = {
         executable_folder / "MoltenVK_icd.json",
         executable_folder / "share" / "vulkan" / "icd.d" / "MoltenVK_icd.json",
+        // Inside an .app the executable lives in Contents/MacOS, and codesign
+        // refuses non-code beside it - so the manifest is staged one level up
+        // in Contents/Resources (see cmake/macos/StageBundle.cmake). Without
+        // this entry a bundled app finds no local ICD and silently falls back
+        // to whatever MoltenVK the machine happens to have installed, which on
+        // a machine with none is a failure to start at all.
+        executable_folder.parent_path() / "Resources" / "MoltenVK_icd.json",
     };
     for (const auto& local_icd_path : local_icd_paths) {
       if (std::filesystem::is_regular_file(local_icd_path)) {
@@ -78,12 +86,43 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   ifn.vkGetInstanceProcAddr = &::vkGetInstanceProcAddr;
   ifn.vkDestroyInstance = &::vkDestroyInstance;
 #else
-  if (!vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)
+  bool loader_loaded = false;
 #if REX_PLATFORM_MAC
-      && !vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoaderFallback)
-      && !vulkan_instance->loader_.Load(platform::lib_names::kMoltenVK)
+  // Try the copies we shipped BEFORE any bare name. A bare name goes through
+  // dyld's search paths, which find a Homebrew install ahead of our own - so a
+  // machine with Homebrew got its MoltenVK instead of ours, and a machine
+  // without got nothing. Both are wrong for a distributed app.
+  {
+    const auto executable_folder = rex::filesystem::GetExecutableFolder();
+    const std::filesystem::path bundled_libraries[] = {
+        executable_folder / platform::lib_names::kMoltenVK,
+        executable_folder / platform::lib_names::kVulkanLoader,
+        // Contents/MacOS -> Contents/Frameworks, the bundle layout.
+        executable_folder.parent_path() / "Frameworks" / platform::lib_names::kMoltenVK,
+        executable_folder.parent_path() / "Frameworks" / platform::lib_names::kVulkanLoader,
+    };
+    for (const auto& library : bundled_libraries) {
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(library, ec) || ec) {
+        continue;
+      }
+      if (vulkan_instance->loader_.Load(library.string().c_str())) {
+        REXLOG_INFO("Loaded bundled Vulkan library {}", library.string());
+        loader_loaded = true;
+        break;
+      }
+    }
+  }
 #endif
-  ) {
+  if (!loader_loaded) {
+    loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)
+#if REX_PLATFORM_MAC
+                    || vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoaderFallback)
+                    || vulkan_instance->loader_.Load(platform::lib_names::kMoltenVK)
+#endif
+        ;
+  }
+  if (!loader_loaded) {
     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
     return nullptr;
   }
