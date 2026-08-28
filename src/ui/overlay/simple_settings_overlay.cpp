@@ -2273,7 +2273,9 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.desc =
             "The one-line read on the numbers above, and the thing to fix "
             "first. Turning quality down only helps while this says Graphics "
-            "card.";
+            "card. Display sync means the frame is waiting on the screen "
+            "rather than on any work - change the Framerate Cap, not the "
+            "quality.";
         std::string verdict = "--";
         if (perf.valid && perf.frame_time_ms > 0.0) {
           // A cap makes the producer block exactly the way a slow GPU does,
@@ -2281,8 +2283,28 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
           // The 4% band absorbs the jitter in a short averaging window.
           const bool at_cap = cap >= 1.0 && perf.fps >= cap * 0.96;
           const double wait_ratio = perf.wait_ms / perf.frame_time_ms;
+          // "GPU Wait" only counts the command processor's vkWaitForFences,
+          // so a producer parked on the PRESENT path - waiting for a drawable
+          // the display has not handed back - reads as zero wait and used to
+          // be reported as "Emulation (CPU)". That misread cost this project a
+          // session on macOS and produced a bogus CPU report from a ProMotion
+          // iPhone. A frame time sitting on an exact multiple of the vblank
+          // while the GPU is nowhere near the budget is presentation, not
+          // cost: nothing that is genuinely compute-bound lands on 2.00x the
+          // refresh interval and holds there.
+          const double refresh_hz = double(rex::ui::Window::CachedDisplayRefreshHz());
+          bool vblank_locked = false;
+          if (refresh_hz >= 30.0 && wait_ratio <= 0.2) {
+            const double interval_ms = 1000.0 / refresh_hz;
+            const double multiple = perf.frame_time_ms / interval_ms;
+            const double nearest = std::floor(multiple + 0.5);
+            vblank_locked = nearest >= 2.0 && std::fabs(multiple - nearest) <= 0.03 &&
+                            perf.gpu_ms > 0.0 && perf.gpu_ms < interval_ms * 0.8;
+          }
           if (at_cap) {
             verdict = "Frame cap - headroom to spare";
+          } else if (vblank_locked) {
+            verdict = "Display sync";
           } else if (wait_ratio >= 0.6) {
             verdict = "Graphics card";
           } else if (wait_ratio <= 0.2) {

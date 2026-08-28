@@ -17,6 +17,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
@@ -59,6 +60,37 @@ REXCVAR_DEFINE_DOUBLE(video_mode_refresh_rate, 60.0, "GPU", "Guest video mode re
     .range(24.0, 240.0)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+namespace {
+// Ceiling applied to the refresh rate the platform reports, in Hz (0 = trust
+// the platform). See display_presentable_refresh_cap_hz below for why iOS
+// needs one.
+#if REX_PLATFORM_IOS
+constexpr double kDefaultPresentableRefreshCapHz = 60.0;
+#else
+constexpr double kDefaultPresentableRefreshCapHz = 0.0;
+#endif
+}  // namespace
+
+REXCVAR_DEFINE_DOUBLE(
+    display_presentable_refresh_cap_hz, kDefaultPresentableRefreshCapHz, "UI/Window",
+    "Highest refresh rate, in Hz, that this platform will actually present at "
+    "(0 = whatever the display reports). The panel's refresh rate and the rate "
+    "the app may present at are not the same number, and everything derived "
+    "from the refresh - above all the automatic frame cap - has to use the "
+    "second one.\n"
+    "\n"
+    "iOS is where they diverge. SDL reports UIScreen.maximumFramesPerSecond, so "
+    "a ProMotion iPhone reports 120, but iOS holds a CAMetalLayer to 60 fps "
+    "unless the bundle sets CADisableMinimumFrameDurationOnPhone - which this "
+    "one does not. Left uncapped, AutoFrameCapHz derived 114 FPS on a surface "
+    "that can only present 60: the pacer never fires, the producer overruns the "
+    "present pipeline and the frame settles on a multiple of the vblank - a "
+    "measured 33.3 ms, i.e. 30 FPS, on hardware far faster than the 60 Hz "
+    "phones that hold a locked 60 at an auto cap of 56. Raise this only "
+    "together with the Info.plist opt-in.")
+    .range(0.0, 1000.0)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex {
 namespace ui {
 
@@ -73,21 +105,53 @@ float Window::CachedDisplayRefreshHz() {
 }
 
 void Window::UpdateCachedDisplayRefresh() {
-  const float hz = QueryDisplayRefreshHzImpl();
-  if (hz > 0.0f) {
-    g_display_refresh_hz.store(hz, std::memory_order_relaxed);
+  const float reported_hz = QueryDisplayRefreshHzImpl();
+  if (reported_hz <= 0.0f) {
+    return;
   }
+  // Publish what can be PRESENTED at, not what the panel can refresh at - the
+  // frame pacer and the settings UI both want the former, and on iOS they
+  // differ (see display_presentable_refresh_cap_hz).
+  float hz = reported_hz;
+  const float ceiling = float(REXCVAR_GET(display_presentable_refresh_cap_hz));
+  if (ceiling > 0.0f && hz > ceiling) {
+    hz = ceiling;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true, std::memory_order_relaxed)) {
+      REXLOG_INFO(
+          "Window: display reports {:.0f} Hz, but this platform presents at no more than "
+          "{:.0f} Hz - pacing against {:.0f} Hz (auto frame cap {:.0f} FPS)",
+          reported_hz, ceiling, hz, AutoFrameCapHz(hz));
+    }
+  }
+  g_display_refresh_hz.store(hz, std::memory_order_relaxed);
 }
 
 float Window::AutoFrameCapHz(float refresh_hz) {
   if (refresh_hz < 30.0f) {
     return 0.0f;
   }
+#if REX_PLATFORM_IOS
+  // No margin here. The margin below buys slack against TEARING - a present
+  // arriving inside the panel's minimum refresh period - and that cannot
+  // happen on iOS: CAMetalLayer has no displaySyncEnabled (it is macOS-only),
+  // so presents are always display-synced whatever present mode MoltenVK
+  // reports. Backing off the refresh rate therefore buys nothing and costs
+  // something real - a cap of 56 into a 60 Hz presenter shows four frames
+  // twice every second, which is visible judder.
+  //
+  // Matching the refresh exactly is also the configuration measured to hold:
+  // BuildIOSArguments ships skate3_guest_fps_cap=60 with auto off, and that
+  // is what holds a locked 60 on an iPhone 13 mini (p50 16.7 ms). Auto now
+  // agrees with it instead of undercutting it.
+  return std::floor(refresh_hz);
+#else
   // 4 FPS of margin or 5% of the refresh rate, whichever is larger (see the
   // declaration): 4 FPS is 6.7% of headroom at 60 Hz but only 0.2 ms of
   // present slack at 144 Hz, within routine thread-scheduling jitter.
   const float margin = std::max(4.0f, refresh_hz * 0.05f);
   return std::floor(refresh_hz - margin);
+#endif
 }
 
 Window::Window(WindowedAppContext& app_context, const std::string_view title,
