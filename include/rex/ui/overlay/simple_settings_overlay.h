@@ -30,6 +30,25 @@ struct SimpleProfileState {
   int selected_index = 0;
 };
 
+// Live frame timings for the Performance page, sampled from the presenter by
+// the host every drawn frame. All zero when the host reports nothing, which
+// is what the page shows as "--".
+struct SimpleSettingsPerfStats {
+  bool valid = false;
+  double fps = 0.0;
+  double frame_time_ms = 0.0;
+  // Time the guest output producer spent blocked on host GPU fences. Near
+  // frame_time_ms means the host GPU is the limit; near zero means the
+  // producer thread is.
+  double wait_ms = 0.0;
+  // Host GPU span of the measured frame, and its breakdown. Zero when the
+  // backend does not measure them.
+  double gpu_ms = 0.0;
+  double gpu_draw_ms = 0.0;
+  double gpu_resolve_ms = 0.0;
+  double gpu_dump_ms = 0.0;
+};
+
 // Raw pad snapshot for overlay navigation (host-side, already merged across
 // pads). Poll callback runs on the UI thread every drawn frame.
 struct SimpleSettingsGamepad {
@@ -48,16 +67,27 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   using CloseGameCallback = std::function<void()>;
   using RestartGameCallback = std::function<void()>;
   using PollGamepadCallback = std::function<SimpleSettingsGamepad()>;
+  using PollPerfStatsCallback = std::function<SimpleSettingsPerfStats()>;
 
   SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem::path config_path,
                        LoadProfilesCallback load_profiles, SaveProfileCallback save_profile,
                        CloseSettingsCallback close_settings, CloseGameCallback close_game,
                        RestartGameCallback restart_game,
-                       PollGamepadCallback poll_gamepad = nullptr);
+                       PollGamepadCallback poll_gamepad = nullptr,
+                       PollPerfStatsCallback poll_perf_stats = nullptr);
   ~SimpleSettingsDialog();
 
   void Show();
+  // Opens straight onto the Performance page with the rows focused, which is
+  // what the performance chord binds to - landing on the category rail would
+  // cost an extra press to get to the thing that was asked for.
+  void ShowPerformance();
   void Toggle();
+  // Toggles the Performance page: opens there, and closes if it is already
+  // the page on screen. Opening the settings on some other page and then
+  // hitting the performance chord switches to Performance rather than
+  // closing, which is the reading that never loses the user's place.
+  void TogglePerformance();
   void Hide();
   // One "back" step (Escape / pad B): text edit -> row focus -> category rail
   // -> closed. The Escape keybind routes here so Escape backs out level by
@@ -88,6 +118,23 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void ApplyAndRestart();
 
   void BuildRows(std::vector<RowSpec>& rows, int category);
+  // Rows shared by the Video and Performance pages; each is self-gating and
+  // pushes nothing when its cvar is absent. See the .cpp for why they are
+  // factored out.
+  void PushQualityPresetRow(std::vector<RowSpec>& rows);
+  void PushRenderScaleRow(std::vector<RowSpec>& rows);
+  void PushFrameCapRow(std::vector<RowSpec>& rows);
+  void PushMsaaRow(std::vector<RowSpec>& rows);
+  void PushShadowQualityRow(std::vector<RowSpec>& rows);
+  void PushSsaoRow(std::vector<RowSpec>& rows);
+  void PushBloomRow(std::vector<RowSpec>& rows);
+  void PushVolumetricsRow(std::vector<RowSpec>& rows);
+  void PushDrawDistanceRow(std::vector<RowSpec>& rows);
+  void PushFpsCounterRow(std::vector<RowSpec>& rows);
+  // One controller-chord row. `allow_guide` offers the Guide button, which
+  // only the level picker can use.
+  void PushChordRow(std::vector<RowSpec>& rows, const char* label, const char* desc,
+                    const char* cvar_name, int* index, std::string* custom, bool allow_guide);
   NavIntents GatherInput(ImGuiIO& io);
 
   std::filesystem::path config_path_;
@@ -97,6 +144,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   CloseGameCallback close_game_;
   RestartGameCallback restart_game_;
   PollGamepadCallback poll_gamepad_;
+  PollPerfStatsCallback poll_perf_stats_;
   SimpleProfileState profiles_;
   bool visible_ = false;
 
@@ -141,8 +189,22 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool rumble_ = true;
   float mnk_sensitivity_ = 1.0f;
   int chord_index_ = 0;
+  int perf_chord_index_ = 0;
+  int picker_chord_index_ = 0;
   int input_backend_index_ = 0;
+  int rumble_scale_index_ = 0;
+  int stick_deadzone_index_ = 0;
+  int trigger_threshold_index_ = 0;
+  bool invert_camera_y_ = false;
+  bool swap_sticks_ = false;
+  bool guide_button_ = false;
   std::string chord_custom_;
+  std::string perf_chord_custom_;
+  std::string picker_chord_custom_;
+  // Live frame timings, refreshed once per drawn frame while the Performance
+  // page is open. Sampling in BuildRows instead would re-poll several times a
+  // frame and show different numbers in different rows.
+  SimpleSettingsPerfStats perf_stats_;
 
   // Navigation state.
   FocusZone zone_ = FocusZone::kRail;

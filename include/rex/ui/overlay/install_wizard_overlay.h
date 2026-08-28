@@ -10,6 +10,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <rex/ui/imgui_dialog.h>
 
@@ -28,6 +29,10 @@ class InstallWizardDialog final : public ImGuiDialog {
                       std::string intro, std::string install_directory,
                       PickSourceCallback pick_source, InstallCallback install,
                       CompleteCallback complete);
+
+  // Optional numbered instructions shown under the intro, for explaining how
+  // to get the source file onto this machine in the first place.
+  void SetInstructions(const char* steps_title, std::vector<std::string> steps);
 
  protected:
   void OnClose() override;
@@ -49,6 +54,8 @@ class InstallWizardDialog final : public ImGuiDialog {
   std::string section_label_;
   std::string intro_;
   std::string install_directory_;
+  const char* steps_title_ = nullptr;
+  std::vector<std::string> steps_;
   PickSourceCallback pick_source_;
   InstallCallback install_;
   CompleteCallback complete_;

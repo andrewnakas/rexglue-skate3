@@ -29,6 +29,12 @@ InstallWizardDialog::InstallWizardDialog(ImGuiDrawer* drawer, std::string title,
       complete_(std::move(complete)),
       status_(intro_) {}
 
+void InstallWizardDialog::SetInstructions(const char* steps_title,
+                                          std::vector<std::string> steps) {
+  steps_title_ = steps_title;
+  steps_ = std::move(steps);
+}
+
 void InstallWizardDialog::OnClose() {
   if (install_thread_.joinable()) {
     install_thread_.join();
@@ -119,6 +125,12 @@ void InstallWizardDialog::OnDraw(ImGuiIO& io) {
   spec.paragraphs.push_back({status_, WizardScreenSpec::Emphasis::kNormal});
   if (state_ == State::kFailed && !error_.empty()) {
     spec.paragraphs.push_back({error_, WizardScreenSpec::Emphasis::kDanger});
+  }
+  // The instructions only help while there is still nothing to install;
+  // once a copy is under way they are just noise taking up the screen.
+  if (state_ == State::kWaitingForSource || state_ == State::kFailed) {
+    spec.steps_title = steps_title_;
+    spec.steps = steps_;
   }
   spec.info_rows.push_back({"Install Directory", install_directory_});
   if (!source_path_.empty()) {

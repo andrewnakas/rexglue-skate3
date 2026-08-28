@@ -54,7 +54,7 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 32> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -74,7 +74,15 @@ constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
     "monitor",
     "mnk_sensitivity",
     "hid_rumble_enabled",
+    "hid_rumble_scale",
+    "hid_stick_deadzone",
+    "hid_trigger_threshold",
+    "hid_invert_camera_y",
+    "hid_swap_sticks",
+    "guide_button",
     "menu_chord",
+    "perf_chord",
+    "picker_chord",
     "input_backend",
     "audio_mute",
     "audio_device_sample_frames",
@@ -172,6 +180,23 @@ constexpr std::array<const char*, 4> kMenuChordLabels = {"RB + Start", "LB + RB 
 constexpr std::array<const char*, 5> kMonitorLabels = {"Auto", "Monitor 1", "Monitor 2",
                                                        "Monitor 3", "Monitor 4"};
 
+// Vibration strength as a percentage of what the game asks for.
+constexpr std::array<const char*, 6> kRumbleScaleLabels = {"0%",   "25%",  "50%",
+                                                           "75%",  "100%", "150%"};
+constexpr std::array<int32_t, 6> kRumbleScaleValues = {0, 25, 50, 75, 100, 150};
+
+// Extra thumbstick deadzone in raw stick units (32767 = full deflection).
+// "None" is the console behaviour and the default; the rest exist to cancel
+// drift on a worn pad.
+constexpr std::array<const char*, 5> kStickDeadzoneLabels = {
+    "None", "Small (5%)", "Medium (10%)", "Large (15%)", "Very Large (20%)"};
+constexpr std::array<int32_t, 5> kStickDeadzoneValues = {0, 1638, 3277, 4915, 6553};
+
+// Trigger travel below the threshold reads as fully released.
+constexpr std::array<const char*, 4> kTriggerThresholdLabels = {"None", "Light", "Medium",
+                                                                "Heavy"};
+constexpr std::array<int32_t, 4> kTriggerThresholdValues = {0, 30, 60, 100};
+
 // X_INPUT_GAMEPAD_* button bits, mirrored locally to keep the UI overlay
 // decoupled from the kernel input headers.
 constexpr uint16_t kPadDpadUp = 0x0001;
@@ -190,13 +215,18 @@ struct CategoryInfo {
   const char* name;
   const char* desc;
 };
-constexpr std::array<CategoryInfo, 5> kCategories = {{
+constexpr std::array<CategoryInfo, 6> kCategories = {{
     {"Video", "Display, resolution, framerate and renderer quality settings."},
+    {"Performance", "Live frame timings and the settings that move them most."},
     {"Controls", "Controller, mouse and keyboard input settings."},
     {"Audio", "Sound output settings."},
     {"Profile", "Local player profile and sign-in."},
     {"System", "Game language, pending changes and closing the settings."},
 }};
+
+// Index of the Performance page in kCategories, for the chord that opens it
+// directly.
+constexpr int kPerformanceCategory = 1;
 
 // Navigation repeat pacing (seconds).
 constexpr float kRepeatDelay = 0.42f;
@@ -407,6 +437,29 @@ int FrameCapIndexFromCvar() {
   return FrameCapIndexFromRate(current);
 }
 
+// The frame cap actually in force right now, in FPS, or 0 when uncapped.
+// Read from the cvars rather than the menu's staged index: the staged value
+// may not have been applied yet, and the Performance page's verdict has to
+// describe the frames being drawn, not the ones that will be.
+double ActiveFrameCapRate() {
+  if (FrameCapHasAuto() && rex::cvar::Query<bool>("skate3_guest_fps_cap_auto")) {
+    return double(rex::ui::Window::AutoFrameCapHz(rex::ui::Window::CachedDisplayRefreshHz()));
+  }
+  if (UseGuestFrameCap()) {
+    return rex::cvar::Query<double>("skate3_guest_fps_cap");
+  }
+  if (HasHostFrameCapCvars() && rex::cvar::Query<bool>("d3d12_present_frame_limiter")) {
+    return rex::cvar::Query<double>("d3d12_present_frame_limiter_fps");
+  }
+  return 0.0;
+}
+
+std::string FormatMs(double ms) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.2f ms", ms);
+  return buf;
+}
+
 bool HasFieldOfViewCvar() {
   return HasCvar("skate3_field_of_view");
 }
@@ -568,20 +621,30 @@ int LanguageIndexFromCvar() {
          1;
 }
 
-// Preset index for the current menu_chord spec; kMenuChordSpecs.size() means
-// "custom" (a hand-edited spec the presets don't cover - kept as an extra
-// option so opening the menu never silently rewrites it).
-int MenuChordIndexFromCvar(std::string* custom_spec) {
-  std::string current = rex::cvar::Query<std::string>("menu_chord");
-  for (int i = 0; i < static_cast<int>(kMenuChordSpecs.size()); ++i) {
-    if (current == kMenuChordSpecs[i]) {
-      return i;
+// Nearest option for an integer-valued cvar (the stick/trigger/rumble rows):
+// a hand-set value that falls between two options snaps to the closer one
+// rather than silently reading as the first.
+template <size_t N>
+int NearestIntIndex(const std::array<int32_t, N>& values, int32_t value) {
+  int best = 0;
+  int64_t best_err = std::abs(int64_t(value) - int64_t(values[0]));
+  for (size_t i = 1; i < N; ++i) {
+    const int64_t err = std::abs(int64_t(value) - int64_t(values[i]));
+    if (err < best_err) {
+      best = static_cast<int>(i);
+      best_err = err;
     }
   }
-  if (custom_spec) {
-    *custom_spec = std::move(current);
+  return best;
+}
+
+template <size_t N>
+int NearestIntIndexFromCvar(const std::array<int32_t, N>& values, std::string_view cvar_name,
+                            int32_t fallback) {
+  if (!HasCvar(cvar_name)) {
+    return NearestIntIndex(values, fallback);
   }
-  return static_cast<int>(kMenuChordSpecs.size());
+  return NearestIntIndex(values, rex::cvar::Query<int32_t>(cvar_name));
 }
 
 // ---- CVar default parsing (Y / R "reset to default") ----------------------
@@ -608,6 +671,59 @@ double CvarDefaultDouble(std::string_view name, double fallback) {
     return fallback;
   }
   return std::strtod(value->c_str(), nullptr);
+}
+
+// ---- Chord option lists ---------------------------------------------------
+// The settings, performance and level-picker chords share one option list, so
+// the same four presets read identically on all three rows. Only the picker
+// offers the Guide button, which the other two cannot use (it needs
+// guide_button on to reach the input system at all). Anything the presets do
+// not cover is preserved as a trailing "Custom" entry rather than silently
+// rewritten the first time the menu is opened.
+
+constexpr const char* kGuideChordSpec = "guide";
+
+int ChordIndexFromSpec(const std::string& current, bool allow_guide,
+                       std::string* custom_spec) {
+  const int preset_count = static_cast<int>(kMenuChordSpecs.size());
+  for (int i = 0; i < preset_count; ++i) {
+    if (current == kMenuChordSpecs[i]) {
+      return i;
+    }
+  }
+  if (allow_guide && current == kGuideChordSpec) {
+    return preset_count;
+  }
+  if (custom_spec) {
+    *custom_spec = current;
+  }
+  return preset_count + (allow_guide ? 1 : 0);
+}
+
+int ChordIndexFromCvar(std::string_view cvar_name, bool allow_guide,
+                       std::string* custom_spec) {
+  return ChordIndexFromSpec(rex::cvar::Query<std::string>(cvar_name), allow_guide,
+                            custom_spec);
+}
+
+// The compiled-in default, as an option index. Each chord cvar has a
+// different default, so resetting cannot just snap to the first entry.
+int ChordDefaultIndex(std::string_view cvar_name, bool allow_guide) {
+  auto value = CvarDefault(cvar_name);
+  return ChordIndexFromSpec(value ? *value : std::string(), allow_guide, nullptr);
+}
+
+// Spec string an option index selects; the custom spec for the trailing
+// entry, which is empty only when there was no custom spec to begin with.
+std::string ChordSpecForIndex(int index, bool allow_guide, const std::string& custom) {
+  const int preset_count = static_cast<int>(kMenuChordSpecs.size());
+  if (index >= 0 && index < preset_count) {
+    return kMenuChordSpecs[index];
+  }
+  if (allow_guide && index == preset_count) {
+    return kGuideChordSpec;
+  }
+  return custom;
 }
 
 void CopyToBuffer(char* buffer, size_t buffer_size, const std::string& value) {
@@ -1017,7 +1133,8 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
                                            CloseSettingsCallback close_settings,
                                            CloseGameCallback close_game,
                                            RestartGameCallback restart_game,
-                                           PollGamepadCallback poll_gamepad)
+                                           PollGamepadCallback poll_gamepad,
+                                           PollPerfStatsCallback poll_perf_stats)
     : ImGuiDialog(drawer),
       config_path_(std::move(config_path)),
       load_profiles_(std::move(load_profiles)),
@@ -1025,7 +1142,8 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
       close_settings_(std::move(close_settings)),
       close_game_(std::move(close_game)),
       restart_game_(std::move(restart_game)),
-      poll_gamepad_(std::move(poll_gamepad)) {
+      poll_gamepad_(std::move(poll_gamepad)),
+      poll_perf_stats_(std::move(poll_perf_stats)) {
   ReloadProfiles();
   LoadSettingsFromCvars();
   SetDrawActive(false);
@@ -1048,6 +1166,24 @@ void SimpleSettingsDialog::Show() {
   rail_anim_y_ = -1.0f;
   prev_pad_buttons_ = 0xFFFF;  // swallow buttons already held at open
   just_shown_ = true;          // swallow the stale cursor delta too
+}
+
+void SimpleSettingsDialog::ShowPerformance() {
+  Show();
+  category_ = kPerformanceCategory;
+  rail_sel_ = kPerformanceCategory;
+  // Straight into the rows: the chord was pressed to see the numbers, and
+  // leaving focus on the rail would make that cost another press.
+  zone_ = FocusZone::kContent;
+  row_index_ = 0;
+}
+
+void SimpleSettingsDialog::TogglePerformance() {
+  if (visible_ && category_ == kPerformanceCategory) {
+    Hide();
+    return;
+  }
+  ShowPerformance();
 }
 
 void SimpleSettingsDialog::LoadSettingsFromCvars() {
@@ -1098,8 +1234,26 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                          ? float(std::clamp(rex::cvar::Query<double>("mnk_sensitivity"), 0.1, 5.0))
                          : 1.0f;
   chord_custom_.clear();
-  chord_index_ = HasCvar("menu_chord") ? MenuChordIndexFromCvar(&chord_custom_) : 0;
+  chord_index_ =
+      HasCvar("menu_chord") ? ChordIndexFromCvar("menu_chord", false, &chord_custom_) : 0;
+  perf_chord_custom_.clear();
+  perf_chord_index_ =
+      HasCvar("perf_chord") ? ChordIndexFromCvar("perf_chord", false, &perf_chord_custom_) : 0;
+  picker_chord_custom_.clear();
+  picker_chord_index_ = HasCvar("picker_chord")
+                            ? ChordIndexFromCvar("picker_chord", true, &picker_chord_custom_)
+                            : 0;
   input_backend_index_ = HasInputBackendChoice() ? InputBackendIndexFromCvar() : 0;
+  rumble_scale_index_ =
+      NearestIntIndexFromCvar(kRumbleScaleValues, "hid_rumble_scale", 100);
+  stick_deadzone_index_ =
+      NearestIntIndexFromCvar(kStickDeadzoneValues, "hid_stick_deadzone", 0);
+  trigger_threshold_index_ =
+      NearestIntIndexFromCvar(kTriggerThresholdValues, "hid_trigger_threshold", 0);
+  invert_camera_y_ =
+      HasCvar("hid_invert_camera_y") && rex::cvar::Query<bool>("hid_invert_camera_y");
+  swap_sticks_ = HasCvar("hid_swap_sticks") && rex::cvar::Query<bool>("hid_swap_sticks");
+  guide_button_ = HasCvar("guide_button") && rex::cvar::Query<bool>("guide_button");
 }
 
 bool SimpleSettingsDialog::HasSettingsChanges() const {
@@ -1371,6 +1525,344 @@ void SimpleSettingsDialog::ApplyAndRestart() {
   }
 }
 
+// ---- Shared row builders -------------------------------------------------
+// Rows that appear on more than one page (the Video page and the Performance
+// page both offer the quality knobs). They stay single definitions so the two
+// pages can never drift apart in wording, defaults or apply behaviour; each
+// keeps its own HasCvar gate and pushes nothing when the host lacks the cvar.
+
+void SimpleSettingsDialog::PushRenderScaleRow(std::vector<RowSpec>& rows) {
+  {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Render Scale";
+    row.desc =
+        "Internal 3D render resolution, as a multiple of the game's native 720p. "
+        "The image is always displayed at your monitor's native resolution - "
+        "higher settings supersample down to it.";
+    for (const char* label : kResolutionLabels) {
+      row.options.push_back(label);
+    }
+    row.index = &resolution_scale_index_;
+    row.reset = [this] {
+      resolution_scale_index_ = ResolutionIndexFromScale(
+          int32_t(CvarDefaultDouble("resolution_scale", 3.0)));
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushFrameCapRow(std::vector<RowSpec>& rows) {
+  if (HasFrameCapControl()) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Framerate Cap";
+    row.desc =
+        "Limit how fast the game runs. A steady cap slightly below your display's "
+        "refresh rate gives the smoothest pacing on variable-refresh displays; "
+        "Auto tracks the current display and does exactly that. Frames above the "
+        "refresh rate cannot be shown and only make steady motion judder.";
+    if (FrameCapHasAuto()) {
+      // Same policy the guest pacer applies (see Window::AutoFrameCapHz).
+      const float auto_cap =
+          rex::ui::Window::AutoFrameCapHz(rex::ui::Window::CachedDisplayRefreshHz());
+      row.options.push_back(
+          auto_cap > 0.0f
+              ? "Auto (" + std::to_string(int(auto_cap)) + " FPS)"
+              : std::string("Auto"));
+    }
+    for (size_t i = 1; i < kFrameCapLabels.size(); ++i) {
+      row.options.push_back(kFrameCapLabels[i]);
+    }
+    row.options.push_back(kFrameCapLabels[0]);
+    row.index = &frame_cap_index_;
+    row.reset = [this] {
+      if (FrameCapHasAuto() &&
+          CvarDefaultBool("skate3_guest_fps_cap_auto", false)) {
+        frame_cap_index_ = 0;
+        return;
+      }
+      double rate = 0.0;
+      if (UseGuestFrameCap()) {
+        rate = CvarDefaultDouble("skate3_guest_fps_cap", 0.0);
+      } else if (CvarDefaultBool("d3d12_present_frame_limiter", false)) {
+        rate = CvarDefaultDouble("d3d12_present_frame_limiter_fps", 0.0);
+      }
+      frame_cap_index_ = FrameCapIndexFromRate(rate);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushChordRow(std::vector<RowSpec>& rows, const char* label,
+                                       const char* desc, const char* cvar_name, int* index,
+                                       std::string* custom, bool allow_guide) {
+  if (!HasCvar(cvar_name)) {
+    return;
+  }
+  RowSpec row;
+  row.kind = RowSpec::kEnum;
+  row.label = label;
+  row.desc = desc;
+  for (const char* preset : kMenuChordLabels) {
+    row.options.push_back(preset);
+  }
+  if (allow_guide) {
+    row.options.push_back("Guide Button");
+  }
+  if (!custom->empty()) {
+    row.options.push_back("Custom: " + *custom);
+  }
+  row.index = index;
+  // Two chords set to the same buttons would fire both screens off one
+  // press; the input system resolves that in favour of the settings menu,
+  // and saying so beats letting the other shortcut look broken.
+  if (std::string(cvar_name) != "menu_chord" && HasCvar("menu_chord") &&
+      ChordSpecForIndex(*index, allow_guide, *custom) ==
+          rex::cvar::Query<std::string>("menu_chord")) {
+    row.value_note = "Same as the settings menu - that one wins";
+  }
+  const std::string name = cvar_name;
+  row.on_enum_change = [this, name, custom, allow_guide](int value) {
+    const std::string spec = ChordSpecForIndex(value, allow_guide, *custom);
+    if (!spec.empty()) {
+      rex::cvar::SetFlagByName(name, spec);
+      SaveSimpleSettingsConfig(config_path_);
+    }
+  };
+  row.reset = [this, name, index, custom, allow_guide] {
+    *index = ChordDefaultIndex(name, allow_guide);
+    const std::string spec = ChordSpecForIndex(*index, allow_guide, *custom);
+    if (!spec.empty()) {
+      rex::cvar::SetFlagByName(name, spec);
+      SaveSimpleSettingsConfig(config_path_);
+    }
+  };
+  rows.push_back(std::move(row));
+}
+
+void SimpleSettingsDialog::PushQualityPresetRow(std::vector<RowSpec>& rows) {
+  if (HasMsaaCvar() || HasShadowQualityCvars() ||
+      HasCvar("skate3_native_render_scene_ssao")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Quality Preset";
+    row.desc =
+        "Sets everything below in one go. Changing any individual setting "
+        "afterwards switches this back to Custom.";
+    for (const GraphicsPreset& preset : kGraphicsPresets) {
+      row.options.push_back(preset.label);
+    }
+    // Recomputed every rebuild rather than remembered, so editing a row
+    // below drops this to Custom instead of continuing to claim a preset.
+    graphics_preset_index_ = DetectGraphicsPreset();
+    row.index = &graphics_preset_index_;
+    row.on_enum_change = [this](int value) { ApplyGraphicsPreset(value); };
+    row.reset = [this] {
+      graphics_preset_index_ = DetectGraphicsPreset();
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushMsaaRow(std::vector<RowSpec>& rows) {
+  if (HasMsaaCvar()) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Anti-Aliasing (MSAA)";
+    row.desc =
+        "Multisampling for the native renderer. Smooths distant thin geometry "
+        "(railings, wires) that shimmers otherwise.";
+    for (const char* label : kMsaaLabels) {
+      row.options.push_back(label);
+    }
+    row.index = &msaa_index_;
+    row.reset = [this] {
+      msaa_index_ =
+          MsaaIndexFromSamples(int32_t(CvarDefaultDouble("skate3_native_render_scene_msaa", 4.0)));
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushShadowQualityRow(std::vector<RowSpec>& rows) {
+  if (HasShadowQualityCvars()) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Shadow Quality";
+    row.desc =
+        "Dynamic character/prop shadow resolution in the native renderer. "
+        "Auto follows the Render Scale setting; 512 matches the original "
+        "game's shadow maps.";
+    for (size_t i = 0; i < kShadowQualityLabels.size(); ++i) {
+      if (i == 1) {
+        // Auto = the game's 512 tiles at the render resolution scale;
+        // the renderer sizes the atlas from its scaled output (see the
+        // shadow_tile cvar), so the label follows the Render Scale
+        // row's STAGED selection: both apply on restart, and changing
+        // the scale updates what Auto reads as immediately.
+        const int scale_index = std::clamp(
+            resolution_scale_index_, 0,
+            static_cast<int>(kResolutionScales.size()) - 1);
+        const uint32_t auto_tile = std::min(
+            512u * uint32_t(kResolutionScales[scale_index]), 4096u);
+        row.options.push_back("Auto (" + std::to_string(auto_tile) + ")");
+      } else {
+        row.options.push_back(kShadowQualityLabels[i]);
+      }
+    }
+    row.index = &shadow_quality_index_;
+    row.reset = [this] {
+      shadow_quality_index_ = ShadowQualityIndexFrom(
+          CvarDefaultBool("skate3_native_render_scene_shadows", true),
+          int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_tile", 0.0)));
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushSsaoRow(std::vector<RowSpec>& rows) {
+  if (HasCvar("skate3_native_render_scene_ssao")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Ambient Occlusion";
+    row.desc =
+        "Ground-truth ambient occlusion (GTAO): soft contact shading "
+        "where surfaces meet (under ledges, rails, vehicles, the "
+        "skater). Native renderer only; applies immediately.";
+    row.options = {"Off", "On"};
+    row.flag = &ssao_;
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("skate3_native_render_scene_ssao", value != 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      ssao_ = CvarDefaultBool("skate3_native_render_scene_ssao", true);
+      SetBoolCvar("skate3_native_render_scene_ssao", ssao_);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushBloomRow(std::vector<RowSpec>& rows) {
+  if (HasCvar("skate3_native_render_scene_bloom")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Bloom";
+    row.desc =
+        "Glow around bright light sources (lamps, neon, the sun and "
+        "sky glare), driven by real scene brightness. Most visible at "
+        "night. Applies immediately.";
+    row.options = {"Off", "On"};
+    row.flag = &bloom_;
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("skate3_native_render_scene_bloom", value != 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      bloom_ = CvarDefaultBool("skate3_native_render_scene_bloom", true);
+      SetBoolCvar("skate3_native_render_scene_bloom", bloom_);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushVolumetricsRow(std::vector<RowSpec>& rows) {
+  if (HasCvar("skate3_native_render_scene_shafts") ||
+      HasCvar("skate3_native_render_scene_haze")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Volumetric Lighting";
+    row.desc =
+        "Sun shafts through buildings and trees plus directional "
+        "atmospheric haze, both following the time of day. Costs a "
+        "little performance. Applies immediately.";
+    row.options = {"Off", "On"};
+    row.flag = &volumetrics_;
+    row.on_enum_change = [this](int value) {
+      if (HasCvar("skate3_native_render_scene_shafts")) {
+        SetBoolCvar("skate3_native_render_scene_shafts", value != 0);
+      }
+      if (HasCvar("skate3_native_render_scene_haze")) {
+        SetBoolCvar("skate3_native_render_scene_haze", value != 0);
+      }
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      volumetrics_ =
+          CvarDefaultBool("skate3_native_render_scene_shafts", true) ||
+          CvarDefaultBool("skate3_native_render_scene_haze", true);
+      if (HasCvar("skate3_native_render_scene_shafts")) {
+        SetBoolCvar("skate3_native_render_scene_shafts", volumetrics_);
+      }
+      if (HasCvar("skate3_native_render_scene_haze")) {
+        SetBoolCvar("skate3_native_render_scene_haze", volumetrics_);
+      }
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushDrawDistanceRow(std::vector<RowSpec>& rows) {
+  if (HasDrawDistanceCvars()) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Draw Distance";
+    row.desc =
+        "How far away small world objects, foliage and character detail "
+        "stay visible, as a multiple of the original console distances. "
+        "Higher settings draw more of the world and cost some "
+        "performance. Applies immediately.";
+    for (const char* label : kDrawDistanceLabels) {
+      row.options.push_back(label);
+    }
+    row.index = &draw_distance_index_;
+    row.on_enum_change = [this](int value) {
+      value = std::clamp(value, 0,
+                         static_cast<int>(kDrawDistanceScales.size()) - 1);
+      const std::string scale = std::to_string(kDrawDistanceScales[value]);
+      rex::cvar::SetFlagByName("skate3_draw_distance_scale", scale);
+      rex::cvar::SetFlagByName("skate3_lod_distance_scale", scale);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      draw_distance_index_ = NearestValueIndex(
+          kDrawDistanceScales,
+          CvarDefaultDouble("skate3_draw_distance_scale", 2.0));
+      const std::string scale =
+          std::to_string(kDrawDistanceScales[draw_distance_index_]);
+      rex::cvar::SetFlagByName("skate3_draw_distance_scale", scale);
+      rex::cvar::SetFlagByName("skate3_lod_distance_scale", scale);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushFpsCounterRow(std::vector<RowSpec>& rows) {
+  if (HasCvar("show_fps_counter")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "FPS Counter";
+    row.desc = "Show the framerate overlay in the corner. Applies immediately.";
+    row.options = {"Off", "On"};
+    row.flag = &fps_counter_;
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("show_fps_counter", value != 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      fps_counter_ = CvarDefaultBool("show_fps_counter", false);
+      SetBoolCvar("show_fps_counter", fps_counter_);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
 void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
   rows.clear();
   const bool pending = HasSettingsChanges();
@@ -1445,63 +1937,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
                               std::to_string(int(out_size.y)));
         rows.push_back(std::move(row));
       }
-      {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Render Scale";
-        row.desc =
-            "Internal 3D render resolution, as a multiple of the game's native 720p. "
-            "The image is always displayed at your monitor's native resolution - "
-            "higher settings supersample down to it.";
-        for (const char* label : kResolutionLabels) {
-          row.options.push_back(label);
-        }
-        row.index = &resolution_scale_index_;
-        row.reset = [this] {
-          resolution_scale_index_ = ResolutionIndexFromScale(
-              int32_t(CvarDefaultDouble("resolution_scale", 3.0)));
-        };
-        rows.push_back(std::move(row));
-      }
-      if (HasFrameCapControl()) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Framerate Cap";
-        row.desc =
-            "Limit how fast the game runs. A steady cap slightly below your display's "
-            "refresh rate gives the smoothest pacing on variable-refresh displays; "
-            "Auto tracks the current display and does exactly that. Frames above the "
-            "refresh rate cannot be shown and only make steady motion judder.";
-        if (FrameCapHasAuto()) {
-          // Same policy the guest pacer applies (see Window::AutoFrameCapHz).
-          const float auto_cap =
-              rex::ui::Window::AutoFrameCapHz(rex::ui::Window::CachedDisplayRefreshHz());
-          row.options.push_back(
-              auto_cap > 0.0f
-                  ? "Auto (" + std::to_string(int(auto_cap)) + " FPS)"
-                  : std::string("Auto"));
-        }
-        for (size_t i = 1; i < kFrameCapLabels.size(); ++i) {
-          row.options.push_back(kFrameCapLabels[i]);
-        }
-        row.options.push_back(kFrameCapLabels[0]);
-        row.index = &frame_cap_index_;
-        row.reset = [this] {
-          if (FrameCapHasAuto() &&
-              CvarDefaultBool("skate3_guest_fps_cap_auto", false)) {
-            frame_cap_index_ = 0;
-            return;
-          }
-          double rate = 0.0;
-          if (UseGuestFrameCap()) {
-            rate = CvarDefaultDouble("skate3_guest_fps_cap", 0.0);
-          } else if (CvarDefaultBool("d3d12_present_frame_limiter", false)) {
-            rate = CvarDefaultDouble("d3d12_present_frame_limiter_fps", 0.0);
-          }
-          frame_cap_index_ = FrameCapIndexFromRate(rate);
-        };
-        rows.push_back(std::move(row));
-      }
+      PushRenderScaleRow(rows);
+      PushFrameCapRow(rows);
       if (HasCvar("skate3_ultrawide")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -1575,27 +2012,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       // Preset row first: it writes every quality row below it, so the common
       // case is one choice rather than eight. Only offered when enough of
       // those rows exist for a preset to mean anything.
-      if (HasMsaaCvar() || HasShadowQualityCvars() ||
-          HasCvar("skate3_native_render_scene_ssao")) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Quality Preset";
-        row.desc =
-            "Sets everything below in one go. Changing any individual setting "
-            "afterwards switches this back to Custom.";
-        for (const GraphicsPreset& preset : kGraphicsPresets) {
-          row.options.push_back(preset.label);
-        }
-        // Recomputed every rebuild rather than remembered, so editing a row
-        // below drops this to Custom instead of continuing to claim a preset.
-        graphics_preset_index_ = DetectGraphicsPreset();
-        row.index = &graphics_preset_index_;
-        row.on_enum_change = [this](int value) { ApplyGraphicsPreset(value); };
-        row.reset = [this] {
-          graphics_preset_index_ = DetectGraphicsPreset();
-        };
-        rows.push_back(std::move(row));
-      }
+      PushQualityPresetRow(rows);
       if (HasRendererChoice()) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -1616,56 +2033,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasMsaaCvar()) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Anti-Aliasing (MSAA)";
-        row.desc =
-            "Multisampling for the native renderer. Smooths distant thin geometry "
-            "(railings, wires) that shimmers otherwise.";
-        for (const char* label : kMsaaLabels) {
-          row.options.push_back(label);
-        }
-        row.index = &msaa_index_;
-        row.reset = [this] {
-          msaa_index_ =
-              MsaaIndexFromSamples(int32_t(CvarDefaultDouble("skate3_native_render_scene_msaa", 4.0)));
-        };
-        rows.push_back(std::move(row));
-      }
-      if (HasShadowQualityCvars()) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Shadow Quality";
-        row.desc =
-            "Dynamic character/prop shadow resolution in the native renderer. "
-            "Auto follows the Render Scale setting; 512 matches the original "
-            "game's shadow maps.";
-        for (size_t i = 0; i < kShadowQualityLabels.size(); ++i) {
-          if (i == 1) {
-            // Auto = the game's 512 tiles at the render resolution scale;
-            // the renderer sizes the atlas from its scaled output (see the
-            // shadow_tile cvar), so the label follows the Render Scale
-            // row's STAGED selection: both apply on restart, and changing
-            // the scale updates what Auto reads as immediately.
-            const int scale_index = std::clamp(
-                resolution_scale_index_, 0,
-                static_cast<int>(kResolutionScales.size()) - 1);
-            const uint32_t auto_tile = std::min(
-                512u * uint32_t(kResolutionScales[scale_index]), 4096u);
-            row.options.push_back("Auto (" + std::to_string(auto_tile) + ")");
-          } else {
-            row.options.push_back(kShadowQualityLabels[i]);
-          }
-        }
-        row.index = &shadow_quality_index_;
-        row.reset = [this] {
-          shadow_quality_index_ = ShadowQualityIndexFrom(
-              CvarDefaultBool("skate3_native_render_scene_shadows", true),
-              int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_tile", 0.0)));
-        };
-        rows.push_back(std::move(row));
-      }
+      PushMsaaRow(rows);
+      PushShadowQualityRow(rows);
       if (HasCvar("skate3_native_render_scene_shadow_static_casters")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -1734,115 +2103,10 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasCvar("skate3_native_render_scene_ssao")) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Ambient Occlusion";
-        row.desc =
-            "Ground-truth ambient occlusion (GTAO): soft contact shading "
-            "where surfaces meet (under ledges, rails, vehicles, the "
-            "skater). Native renderer only; applies immediately.";
-        row.options = {"Off", "On"};
-        row.flag = &ssao_;
-        row.on_enum_change = [this](int value) {
-          SetBoolCvar("skate3_native_render_scene_ssao", value != 0);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        row.reset = [this] {
-          ssao_ = CvarDefaultBool("skate3_native_render_scene_ssao", true);
-          SetBoolCvar("skate3_native_render_scene_ssao", ssao_);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        rows.push_back(std::move(row));
-      }
-      if (HasCvar("skate3_native_render_scene_bloom")) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Bloom";
-        row.desc =
-            "Glow around bright light sources (lamps, neon, the sun and "
-            "sky glare), driven by real scene brightness. Most visible at "
-            "night. Applies immediately.";
-        row.options = {"Off", "On"};
-        row.flag = &bloom_;
-        row.on_enum_change = [this](int value) {
-          SetBoolCvar("skate3_native_render_scene_bloom", value != 0);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        row.reset = [this] {
-          bloom_ = CvarDefaultBool("skate3_native_render_scene_bloom", true);
-          SetBoolCvar("skate3_native_render_scene_bloom", bloom_);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        rows.push_back(std::move(row));
-      }
-      if (HasCvar("skate3_native_render_scene_shafts") ||
-          HasCvar("skate3_native_render_scene_haze")) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Volumetric Lighting";
-        row.desc =
-            "Sun shafts through buildings and trees plus directional "
-            "atmospheric haze, both following the time of day. Costs a "
-            "little performance. Applies immediately.";
-        row.options = {"Off", "On"};
-        row.flag = &volumetrics_;
-        row.on_enum_change = [this](int value) {
-          if (HasCvar("skate3_native_render_scene_shafts")) {
-            SetBoolCvar("skate3_native_render_scene_shafts", value != 0);
-          }
-          if (HasCvar("skate3_native_render_scene_haze")) {
-            SetBoolCvar("skate3_native_render_scene_haze", value != 0);
-          }
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        row.reset = [this] {
-          volumetrics_ =
-              CvarDefaultBool("skate3_native_render_scene_shafts", true) ||
-              CvarDefaultBool("skate3_native_render_scene_haze", true);
-          if (HasCvar("skate3_native_render_scene_shafts")) {
-            SetBoolCvar("skate3_native_render_scene_shafts", volumetrics_);
-          }
-          if (HasCvar("skate3_native_render_scene_haze")) {
-            SetBoolCvar("skate3_native_render_scene_haze", volumetrics_);
-          }
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        rows.push_back(std::move(row));
-      }
-      if (HasDrawDistanceCvars()) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Draw Distance";
-        row.desc =
-            "How far away small world objects, foliage and character detail "
-            "stay visible, as a multiple of the original console distances. "
-            "Higher settings draw more of the world and cost some "
-            "performance. Applies immediately.";
-        for (const char* label : kDrawDistanceLabels) {
-          row.options.push_back(label);
-        }
-        row.index = &draw_distance_index_;
-        row.on_enum_change = [this](int value) {
-          value = std::clamp(value, 0,
-                             static_cast<int>(kDrawDistanceScales.size()) - 1);
-          const std::string scale = std::to_string(kDrawDistanceScales[value]);
-          rex::cvar::SetFlagByName("skate3_draw_distance_scale", scale);
-          rex::cvar::SetFlagByName("skate3_lod_distance_scale", scale);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        row.reset = [this] {
-          draw_distance_index_ = NearestValueIndex(
-              kDrawDistanceScales,
-              CvarDefaultDouble("skate3_draw_distance_scale", 2.0));
-          const std::string scale =
-              std::to_string(kDrawDistanceScales[draw_distance_index_]);
-          rex::cvar::SetFlagByName("skate3_draw_distance_scale", scale);
-          rex::cvar::SetFlagByName("skate3_lod_distance_scale", scale);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        rows.push_back(std::move(row));
-      }
+      PushSsaoRow(rows);
+      PushBloomRow(rows);
+      PushVolumetricsRow(rows);
+      PushDrawDistanceRow(rows);
       if (HasCvar("skate3_draw_distance_stream_probe")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -1899,24 +2163,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       if (HasCvar("show_fps_counter") || HasCvar("skate3_native_render_mode_indicator")) {
         header("Interface");
       }
-      if (HasCvar("show_fps_counter")) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "FPS Counter";
-        row.desc = "Show the framerate overlay in the corner. Applies immediately.";
-        row.options = {"Off", "On"};
-        row.flag = &fps_counter_;
-        row.on_enum_change = [this](int value) {
-          SetBoolCvar("show_fps_counter", value != 0);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        row.reset = [this] {
-          fps_counter_ = CvarDefaultBool("show_fps_counter", false);
-          SetBoolCvar("show_fps_counter", fps_counter_);
-          SaveSimpleSettingsConfig(config_path_);
-        };
-        rows.push_back(std::move(row));
-      }
+      PushFpsCounterRow(rows);
       if (HasCvar("skate3_native_render_mode_indicator")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -1940,7 +2187,132 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       }
       break;
     }
-    case 1: {  // Controls
+    case 1: {  // Performance
+      // Read-only readouts, drawn as single-option enum rows: the steppers
+      // grey themselves out, and the row stays focusable so its description
+      // panel explains what the number means. perf_stats_ is sampled once per
+      // drawn frame in OnDraw, so every row here agrees with the others.
+      const SimpleSettingsPerfStats& perf = perf_stats_;
+      const double cap = ActiveFrameCapRate();
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Frame Rate";
+        row.desc =
+            "Frames the game produced per second, averaged over the last "
+            "moment. This is the game's own output rate, not the rate the "
+            "menu redraws at.";
+        if (cap >= 1.0) {
+          row.desc_extra = "Currently capped at " + std::to_string(int(cap + 0.5)) + " FPS.";
+        }
+        row.options.push_back(perf.valid ? std::to_string(int(perf.fps + 0.5)) + " FPS"
+                                         : std::string("--"));
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Frame Time";
+        row.desc =
+            "How long each frame takes, the same measurement as the frame "
+            "rate. 16.7 ms is 60 FPS, 33.3 ms is 30 FPS.";
+        row.options.push_back(perf.valid ? FormatMs(perf.frame_time_ms) : std::string("--"));
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "GPU Wait";
+        row.desc =
+            "How much of each frame the emulator spent waiting on the "
+            "graphics card. Close to the frame time means the GPU is the "
+            "limit and the quality settings below will buy frames; close to "
+            "zero means the emulation itself is the limit and they will not.";
+        row.options.push_back(perf.valid ? FormatMs(perf.wait_ms) : std::string("--"));
+        rows.push_back(std::move(row));
+      }
+      {
+        // Unconditional, showing "--" when the backend reports nothing: a row
+        // that comes and goes with the measurement would shift every row under
+        // it while the list is being navigated.
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "GPU Time";
+        row.desc =
+            "Time the graphics card itself spent on the measured frame, from "
+            "its first command to its last - idle gaps between submissions "
+            "included, so it can read a little higher than the work done.";
+        row.options.push_back(perf.gpu_ms > 0.0 ? FormatMs(perf.gpu_ms) : std::string("--"));
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "GPU Breakdown";
+        row.desc =
+            "Where the GPU time went. Draw is scene rendering (what render "
+            "scale, MSAA and shadows drive); resolve is copying render "
+            "targets; other covers barriers, ownership transfers and idle "
+            "gaps.";
+        if (perf.gpu_draw_ms + perf.gpu_resolve_ms + perf.gpu_dump_ms > 0.0) {
+          char buf[96];
+          std::snprintf(buf, sizeof(buf), "draw %.1f  res %.1f  other %.1f", perf.gpu_draw_ms,
+                        perf.gpu_resolve_ms,
+                        std::max(0.0, perf.gpu_ms - perf.gpu_draw_ms - perf.gpu_resolve_ms -
+                                          perf.gpu_dump_ms));
+          row.options.push_back(buf);
+        } else {
+          row.options.push_back("--");
+        }
+        rows.push_back(std::move(row));
+      }
+      {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Limited By";
+        row.desc =
+            "The one-line read on the numbers above, and the thing to fix "
+            "first. Turning quality down only helps while this says Graphics "
+            "card.";
+        std::string verdict = "--";
+        if (perf.valid && perf.frame_time_ms > 0.0) {
+          // A cap makes the producer block exactly the way a slow GPU does,
+          // so it has to be ruled out before the wait ratio means anything.
+          // The 4% band absorbs the jitter in a short averaging window.
+          const bool at_cap = cap >= 1.0 && perf.fps >= cap * 0.96;
+          const double wait_ratio = perf.wait_ms / perf.frame_time_ms;
+          if (at_cap) {
+            verdict = "Frame cap - headroom to spare";
+          } else if (wait_ratio >= 0.6) {
+            verdict = "Graphics card";
+          } else if (wait_ratio <= 0.2) {
+            verdict = "Emulation (CPU)";
+          } else {
+            verdict = "Mixed";
+          }
+        }
+        row.options.push_back(std::move(verdict));
+        rows.push_back(std::move(row));
+      }
+
+      header("Quality");
+      PushQualityPresetRow(rows);
+      PushRenderScaleRow(rows);
+      PushFrameCapRow(rows);
+      PushMsaaRow(rows);
+      PushShadowQualityRow(rows);
+      PushSsaoRow(rows);
+      PushBloomRow(rows);
+      PushVolumetricsRow(rows);
+      PushDrawDistanceRow(rows);
+
+      if (HasCvar("show_fps_counter")) {
+        header("Overlay");
+        PushFpsCounterRow(rows);
+      }
+      break;
+    }
+    case 2: {  // Controls
       header("Mouse & Keyboard");
       {
         RowSpec row;
@@ -1989,8 +2361,109 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasInputBackendChoice() || HasCvar("hid_rumble_enabled") || HasCvar("menu_chord")) {
+      if (HasInputBackendChoice() || HasCvar("hid_rumble_enabled") || HasCvar("menu_chord") ||
+          HasCvar("hid_stick_deadzone") || HasCvar("hid_invert_camera_y")) {
         header("Controller");
+      }
+      if (HasCvar("hid_invert_camera_y")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Invert Camera Y";
+        row.desc =
+            "Pushing the right stick up looks down instead of up. Applies "
+            "immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &invert_camera_y_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("hid_invert_camera_y", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          invert_camera_y_ = CvarDefaultBool("hid_invert_camera_y", false);
+          SetBoolCvar("hid_invert_camera_y", invert_camera_y_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("hid_swap_sticks")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Swap Sticks";
+        row.desc =
+            "Exchange the left and right thumbsticks, so the right stick "
+            "steers the skater and the left one moves the camera. Applies "
+            "immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &swap_sticks_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("hid_swap_sticks", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          swap_sticks_ = CvarDefaultBool("hid_swap_sticks", false);
+          SetBoolCvar("hid_swap_sticks", swap_sticks_);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("hid_stick_deadzone")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Stick Deadzone";
+        row.desc =
+            "Ignore small thumbstick movement near the centre, for a worn "
+            "controller that drifts on its own. None is what the console "
+            "did - raise this only if you need it, because it costs "
+            "precision in the flick tricks. Movement past the deadzone is "
+            "stretched back over the full range, so full deflection still "
+            "reaches full. Applies immediately.";
+        for (const char* label : kStickDeadzoneLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &stick_deadzone_index_;
+        row.on_enum_change = [this](int value) {
+          value = std::clamp(value, 0, static_cast<int>(kStickDeadzoneValues.size()) - 1);
+          rex::cvar::SetFlagByName("hid_stick_deadzone",
+                                   std::to_string(kStickDeadzoneValues[value]));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          stick_deadzone_index_ = NearestIntIndex(
+              kStickDeadzoneValues, int32_t(CvarDefaultDouble("hid_stick_deadzone", 0.0)));
+          rex::cvar::SetFlagByName(
+              "hid_stick_deadzone", std::to_string(kStickDeadzoneValues[stick_deadzone_index_]));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      if (HasCvar("hid_trigger_threshold")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Trigger Deadzone";
+        row.desc =
+            "How far a trigger must travel before it counts as pressed at "
+            "all. None is the console behaviour; raise it if a resting "
+            "trigger registers on its own. Applies immediately.";
+        for (const char* label : kTriggerThresholdLabels) {
+          row.options.push_back(label);
+        }
+        row.index = &trigger_threshold_index_;
+        row.on_enum_change = [this](int value) {
+          value = std::clamp(value, 0, static_cast<int>(kTriggerThresholdValues.size()) - 1);
+          rex::cvar::SetFlagByName("hid_trigger_threshold",
+                                   std::to_string(kTriggerThresholdValues[value]));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          trigger_threshold_index_ = NearestIntIndex(
+              kTriggerThresholdValues,
+              int32_t(CvarDefaultDouble("hid_trigger_threshold", 0.0)));
+          rex::cvar::SetFlagByName(
+              "hid_trigger_threshold",
+              std::to_string(kTriggerThresholdValues[trigger_threshold_index_]));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
       }
       if (HasInputBackendChoice()) {
         RowSpec row;
@@ -2033,38 +2506,73 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasCvar("menu_chord")) {
+      if (HasCvar("hid_rumble_scale")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
-        row.label = "Settings Menu Shortcut";
+        row.label = "Vibration Strength";
         row.desc =
-            "Controller button chord that opens this settings menu. Applies "
+            "Scales every rumble the game asks for. Below 100% softens the "
+            "constant road buzz without losing the bails; above it makes a "
+            "weak controller noticeable. Needs Vibration on. Applies "
             "immediately.";
-        for (const char* label : kMenuChordLabels) {
+        row.enabled = rumble_;
+        for (const char* label : kRumbleScaleLabels) {
           row.options.push_back(label);
         }
-        if (!chord_custom_.empty()) {
-          row.options.push_back("Custom: " + chord_custom_);
-        }
-        row.index = &chord_index_;
+        row.index = &rumble_scale_index_;
         row.on_enum_change = [this](int value) {
-          if (value < static_cast<int>(kMenuChordSpecs.size())) {
-            rex::cvar::SetFlagByName("menu_chord", kMenuChordSpecs[value]);
-          } else if (!chord_custom_.empty()) {
-            rex::cvar::SetFlagByName("menu_chord", chord_custom_);
-          }
+          value = std::clamp(value, 0, static_cast<int>(kRumbleScaleValues.size()) - 1);
+          rex::cvar::SetFlagByName("hid_rumble_scale",
+                                   std::to_string(kRumbleScaleValues[value]));
           SaveSimpleSettingsConfig(config_path_);
         };
         row.reset = [this] {
-          chord_index_ = 0;
-          rex::cvar::SetFlagByName("menu_chord", kMenuChordSpecs[0]);
+          rumble_scale_index_ = NearestIntIndex(
+              kRumbleScaleValues, int32_t(CvarDefaultDouble("hid_rumble_scale", 100.0)));
+          rex::cvar::SetFlagByName("hid_rumble_scale",
+                                   std::to_string(kRumbleScaleValues[rumble_scale_index_]));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      }
+      PushChordRow(rows, "Settings Menu Shortcut",
+                   "Controller button chord that opens this settings menu. "
+                   "Applies immediately.",
+                   "menu_chord", &chord_index_, &chord_custom_, false);
+      PushChordRow(rows, "Performance Menu Shortcut",
+                   "Controller button chord that opens the Performance page "
+                   "directly, for checking the frame rate without walking the "
+                   "menu. Applies immediately.",
+                   "perf_chord", &perf_chord_index_, &perf_chord_custom_, false);
+      PushChordRow(rows, "Level Picker Shortcut",
+                   "Controller button chord that opens the in-game level "
+                   "picker. The Guide button only reaches the game while "
+                   "Guide Button Passthrough is on. Applies immediately.",
+                   "picker_chord", &picker_chord_index_, &picker_chord_custom_, true);
+      if (HasCvar("guide_button")) {
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = "Guide Button Passthrough";
+        row.desc =
+            "Let the middle Xbox button reach the game instead of the "
+            "system. Needed for the Guide option on the shortcut above. "
+            "Applies immediately.";
+        row.options = {"Off", "On"};
+        row.flag = &guide_button_;
+        row.on_enum_change = [this](int value) {
+          SetBoolCvar("guide_button", value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this] {
+          guide_button_ = CvarDefaultBool("guide_button", false);
+          SetBoolCvar("guide_button", guide_button_);
           SaveSimpleSettingsConfig(config_path_);
         };
         rows.push_back(std::move(row));
       }
       break;
     }
-    case 2: {  // Audio
+    case 3: {  // Audio
       header("Output");
       if (HasCvar("audio_mute")) {
         RowSpec row;
@@ -2112,7 +2620,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       }
       break;
     }
-    case 3: {  // Profile
+    case 4: {  // Profile
       header("Local Profile");
       {
         RowSpec row;
@@ -2159,7 +2667,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       }
       break;
     }
-    case 4: {  // System
+    case 5: {  // System
       if (HasCvar("user_language")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -2355,6 +2863,13 @@ SimpleSettingsDialog::NavIntents SimpleSettingsDialog::GatherInput(ImGuiIO& io) 
 void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   if (!visible_) {
     return;
+  }
+
+  // Sampled once per drawn frame, before any row is built: BuildRows runs
+  // more than once per frame (measure, then draw), and polling inside it
+  // would let two rows report different moments.
+  if (poll_perf_stats_ && category_ == kPerformanceCategory) {
+    perf_stats_ = poll_perf_stats_();
   }
 
   ImFont* font = imgui_drawer()->ui_font() ? imgui_drawer()->ui_font() : ImGui::GetFont();

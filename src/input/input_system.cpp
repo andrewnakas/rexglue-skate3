@@ -15,6 +15,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -57,10 +58,35 @@ REXCVAR_DEFINE_STRING(menu_chord, "rb+start", "Input",
                       "dpad_right. Empty disables the chord.");
 REXCVAR_DEFINE_STRING(picker_chord, "guide", "Input",
                       "Controller button or chord that opens the in-game level picker. Same token set as menu_chord, plus 'guide' for the middle Xbox button (which needs guide_button=true to reach us at all). Empty disables it.");
+// Start + Select (Back). Deliberately a chord no game action uses, and one
+// that is reachable on a pad with no Guide button and no shoulder buttons
+// free - the settings chord already owns RB + Start.
+REXCVAR_DEFINE_STRING(perf_chord, "back+start", "Input",
+                      "Controller chord that opens the performance menu. Same token set as "
+                      "menu_chord. Empty disables it. Ignored when it is the same chord as "
+                      "menu_chord, which then wins.");
 REXCVAR_DEFINE_BOOL(hid_rumble_enabled, true, "Input", "Enable controller vibration");
 REXCVAR_DEFINE_UINT32(hid_rumble_min_motor_speed, 0x1000, "Input",
                       "Minimum XInput motor speed forwarded to host controllers")
     .range(0, 0xFFFF);
+REXCVAR_DEFINE_UINT32(hid_rumble_scale, 100, "Input",
+                      "Controller vibration strength, as a percentage of what the game asks "
+                      "for. 100 is unmodified; 0 is the same as turning vibration off.")
+    .range(0, 200);
+REXCVAR_DEFINE_UINT32(hid_stick_deadzone, 0, "Input",
+                      "Extra radial deadzone applied to both thumbsticks, in raw stick units "
+                      "(0-32767). 0 leaves the sticks exactly as the driver reports them, "
+                      "which is the console behaviour; raise it only to cancel drift. Input "
+                      "past the deadzone is rescaled so full deflection is still reachable.")
+    .range(0, 16000);
+REXCVAR_DEFINE_UINT32(hid_trigger_threshold, 0, "Input",
+                      "Trigger travel below this value (0-255) is reported as fully released. "
+                      "0 is the console behaviour.")
+    .range(0, 255);
+REXCVAR_DEFINE_BOOL(hid_invert_camera_y, false, "Input",
+                    "Invert the vertical axis of the right stick (camera).");
+REXCVAR_DEFINE_BOOL(hid_swap_sticks, false, "Input",
+                    "Swap the left and right thumbsticks.");
 namespace rex::input {
 namespace {
 
@@ -99,6 +125,71 @@ uint16_t ChordMaskFromSpec(std::string_view spec) {
     token.push_back(char(std::tolower(static_cast<unsigned char>(c))));
   }
   return mask;
+}
+
+// Radial deadzone with rescaling: everything inside the radius reads as
+// centred, and what is left outside it is stretched back over the full range
+// so the stick can still be pushed to 100%. Clamping instead of rescaling
+// would cost the player the top of their range.
+void ApplyStickDeadzone(int16_t& x, int16_t& y, float deadzone) {
+  if (deadzone <= 0.0f) {
+    return;
+  }
+  const float fx = float(x);
+  const float fy = float(y);
+  const float mag = std::sqrt(fx * fx + fy * fy);
+  if (mag <= deadzone) {
+    x = 0;
+    y = 0;
+    return;
+  }
+  constexpr float kMax = 32767.0f;
+  // A stick can report slightly past kMax on the diagonals; min() keeps the
+  // rescale from amplifying that into a wrap.
+  const float scaled = std::min(1.0f, (mag - deadzone) / std::max(1.0f, kMax - deadzone));
+  const float k = scaled * kMax / mag;
+  x = int16_t(std::clamp(fx * k, -32767.0f, 32767.0f));
+  y = int16_t(std::clamp(fy * k, -32767.0f, 32767.0f));
+}
+
+// The user-facing stick/trigger options, applied to the merged pad on its way
+// to the guest. Every one of them defaults to a no-op, so an untouched
+// install behaves exactly as the console did.
+void ApplyGamepadTuning(X_INPUT_GAMEPAD& pad) {
+  // The fields are big-endian wrappers, so every axis is read out into a
+  // native temporary, tuned, and written back once.
+  int16_t lx = pad.thumb_lx;
+  int16_t ly = pad.thumb_ly;
+  int16_t rx = pad.thumb_rx;
+  int16_t ry = pad.thumb_ry;
+
+  if (REXCVAR_GET(hid_swap_sticks)) {
+    std::swap(lx, rx);
+    std::swap(ly, ry);
+  }
+  if (REXCVAR_GET(hid_invert_camera_y)) {
+    // -32768 has no positive counterpart; clamping it to 32767 costs one unit
+    // at full deflection and avoids negation wrapping it back to itself.
+    ry = int16_t(-std::max<int32_t>(int32_t(ry), -32767));
+  }
+  const float deadzone = float(REXCVAR_GET(hid_stick_deadzone));
+  ApplyStickDeadzone(lx, ly, deadzone);
+  ApplyStickDeadzone(rx, ry, deadzone);
+
+  pad.thumb_lx = lx;
+  pad.thumb_ly = ly;
+  pad.thumb_rx = rx;
+  pad.thumb_ry = ry;
+
+  const uint32_t trigger_threshold = REXCVAR_GET(hid_trigger_threshold);
+  if (trigger_threshold > 0) {
+    if (uint32_t(pad.left_trigger) < trigger_threshold) {
+      pad.left_trigger = 0;
+    }
+    if (uint32_t(pad.right_trigger) < trigger_threshold) {
+      pad.right_trigger = 0;
+    }
+  }
 }
 
 }  // namespace
@@ -148,6 +239,10 @@ void InputSystem::SetMenuChordCallback(std::function<void()> callback) {
 
 void InputSystem::SetPickerChordCallback(std::function<void()> callback) {
   picker_chord_callback_ = std::move(callback);
+}
+
+void InputSystem::SetPerfChordCallback(std::function<void()> callback) {
+  perf_chord_callback_ = std::move(callback);
 }
 
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
@@ -248,6 +343,20 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   }
   menu_chord_down_ = menu_chord_down;
 
+  // The performance menu gets its own chord (Start + Select by default). A
+  // chord configured identically to the settings chord would otherwise open
+  // both screens off one press, so the settings chord wins and this one stays
+  // quiet - the settings menu offers Back + Start as a choice, which is
+  // exactly the collision this guards.
+  const uint16_t perf_chord_buttons = ChordMaskFromSpec(REXCVAR_GET(perf_chord));
+  const bool perf_chord_down =
+      perf_chord_buttons != 0 && perf_chord_buttons != menu_chord_buttons &&
+      (static_cast<uint16_t>(merged.gamepad.buttons) & perf_chord_buttons) == perf_chord_buttons;
+  if (perf_chord_down && !perf_chord_down_ && perf_chord_callback_) {
+    perf_chord_callback_();
+  }
+  perf_chord_down_ = perf_chord_down;
+
   // The level picker gets its own button. Defaults to the Guide (middle Xbox)
   // button, which only reaches us when guide_button is on - the SDL driver
   // drops it otherwise.
@@ -264,6 +373,11 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   if (active_callback_ && !active_callback_()) {
     std::memset(&merged.gamepad, 0, sizeof(merged.gamepad));
   }
+
+  // Applied last, on the guest-facing copy only: the chords above must read
+  // the pad exactly as the driver reported it, and the UI overlays take their
+  // own path through GetUiGamepadState().
+  ApplyGamepadTuning(merged.gamepad);
 
   if (out_state) {
     *out_state = merged;
@@ -313,8 +427,14 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   X_INPUT_VIBRATION filtered_vibration = {};
   if (REXCVAR_GET(hid_rumble_enabled)) {
     const uint32_t min_motor_speed = REXCVAR_GET(hid_rumble_min_motor_speed);
-    const auto filter_motor = [min_motor_speed](uint16_t speed) -> uint16_t {
-      return speed >= min_motor_speed ? speed : 0;
+    const uint32_t scale_percent = REXCVAR_GET(hid_rumble_scale);
+    // Scale first, then apply the floor: scaling a motor below the minimum
+    // speed it can actually turn at produces a buzz, not a weaker rumble, so
+    // the floor has to judge the value the pad will really be sent.
+    const auto filter_motor = [min_motor_speed, scale_percent](uint16_t speed) -> uint16_t {
+      const uint32_t scaled = (uint32_t(speed) * scale_percent) / 100u;
+      const uint16_t clamped = uint16_t(std::min<uint32_t>(scaled, 0xFFFFu));
+      return clamped >= min_motor_speed ? clamped : 0;
     };
     filtered_vibration.left_motor_speed =
         filter_motor(static_cast<uint16_t>(vibration->left_motor_speed));

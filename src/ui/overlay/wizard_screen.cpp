@@ -333,58 +333,117 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
   DrawAuroraBackdrop(dl, display, float(ImGui::GetTime()));
 
   // ---- Layout ----
+  // Metrics are designed at fit == 1.0 and scale down together when the block
+  // would otherwise run past the footer. The instruction steps make these
+  // screens considerably taller than the original two-paragraph wizard, and a
+  // phone in landscape has very little vertical room to give.
   const float margin_x = std::max(56.0f * s, display.x * 0.05f);
-  const float col_w = Snap(std::min(640.0f * s, display.x - 2.0f * margin_x));
-  const float col_x = Snap((display.x - col_w) * 0.5f);
-  const float row_h = Snap(52.0f * s);
-  const float row_gap = Snap(5.0f * s);
   const float footer_h = Snap(96.0f * base_s);
+  const float content_top = (98.0f + 74.0f) * s;
   const float content_bottom = display.y - footer_h - 18.0f * s;
-  const float title_size = font_px(42.0f * s);
-  const float label_size = font_px(22.0f * s);
-  const float desc_size = font_px(20.0f * s);
-  const float desc_line_h = Snap(desc_size * 1.35f);
-  const float para_gap = Snap(10.0f * s);
-  const float panel_pad = Snap(16.0f * s);
+  const float avail_h = content_bottom - content_top;
 
-  // Wrap the paragraph text up front so the panel (and the whole block) can
-  // be measured before anything draws.
-  const float wrap_w = col_w - 2.0f * panel_pad;
+  float col_w = 0.0f, col_x = 0.0f, row_h = 0.0f, row_gap = 0.0f;
+  float title_size = 0.0f, title_gap = 0.0f, label_size = 0.0f, desc_size = 0.0f;
+  float desc_line_h = 0.0f, para_gap = 0.0f, panel_pad = 0.0f;
+  float step_size = 0.0f, step_line_h = 0.0f, step_gap = 0.0f, step_indent = 0.0f;
+  float steps_title_h = 0.0f, steps_title_size = 0.0f;
+  float panel_h = 0.0f, steps_panel_h = 0.0f, total_h = 0.0f;
   std::vector<std::vector<std::pair<const char*, const char*>>> para_lines;
-  float text_h = 0.0f;
-  for (const WizardScreenSpec::Paragraph& para : spec.paragraphs) {
-    para_lines.push_back(WrapLines(font, desc_size, wrap_w, para.text));
-    if (text_h > 0.0f) {
-      text_h += para_gap;
-    }
-    text_h += float(para_lines.back().size()) * desc_line_h;
-  }
-  const float panel_h = Snap(text_h + 2.0f * panel_pad);
+  std::vector<std::vector<std::pair<const char*, const char*>>> step_lines;
 
-  float total_h = row_h + row_gap + panel_h;  // section bar + text panel
-  total_h += float(spec.info_rows.size()) * (row_gap + row_h);
-  if (spec.show_progress) {
-    total_h += row_gap + row_h;
+  // Numbered once, up front: WrapLines returns pointers into the strings it
+  // wraps, so the numbered text has to outlive every re-measure below.
+  std::vector<std::string> step_texts;
+  step_texts.reserve(spec.steps.size());
+  for (size_t i = 0; i < spec.steps.size(); ++i) {
+    step_texts.push_back(std::to_string(i + 1) + ".  " + spec.steps[i]);
   }
-  if (action_count) {
-    total_h += row_gap + Snap(13.0f * s);  // spacer before the actions
-    total_h += float(action_count) * (row_gap + row_h);
+
+  auto layout = [&](float fit) {
+    const float f = s * fit;
+    col_w = Snap(std::min(880.0f * f, display.x - 2.0f * margin_x));
+    col_x = Snap((display.x - col_w) * 0.5f);
+    row_h = Snap(58.0f * f);
+    row_gap = Snap(6.0f * f);
+    title_size = font_px(46.0f * f);
+    title_gap = Snap(74.0f * f);
+    label_size = font_px(24.0f * f);
+    desc_size = font_px(22.0f * f);
+    desc_line_h = Snap(desc_size * 1.35f);
+    steps_title_size = font_px(19.0f * f);
+    steps_title_h = Snap(steps_title_size * 1.9f);
+    step_size = font_px(20.0f * f);
+    step_line_h = Snap(step_size * 1.42f);
+    step_gap = Snap(step_line_h * 0.3f);
+    step_indent = Snap(step_size * 1.7f);
+    para_gap = Snap(10.0f * f);
+    panel_pad = Snap(18.0f * f);
+
+    const float wrap_w = col_w - 2.0f * panel_pad;
+    para_lines.clear();
+    float text_h = 0.0f;
+    for (const WizardScreenSpec::Paragraph& para : spec.paragraphs) {
+      para_lines.push_back(WrapLines(font, desc_size, wrap_w, para.text));
+      if (text_h > 0.0f) {
+        text_h += para_gap;
+      }
+      text_h += float(para_lines.back().size()) * desc_line_h;
+    }
+    panel_h = Snap(text_h + 2.0f * panel_pad);
+
+    // Steps hang off their number, so every line is wrapped to the indented
+    // width - the first line is then never tighter than what it measured.
+    step_lines.clear();
+    steps_panel_h = 0.0f;
+    if (!step_texts.empty()) {
+      float steps_h = spec.steps_title ? steps_title_h : 0.0f;
+      for (const std::string& text : step_texts) {
+        step_lines.push_back(WrapLines(font, step_size, wrap_w - step_indent, text));
+        steps_h += float(step_lines.back().size()) * step_line_h + step_gap;
+      }
+      steps_panel_h = Snap(steps_h - step_gap + 2.0f * panel_pad);
+    }
+
+    total_h = row_h + row_gap + panel_h;  // section bar + text panel
+    if (steps_panel_h > 0.0f) {
+      total_h += row_gap + steps_panel_h;
+    }
+    total_h += float(spec.info_rows.size()) * (row_gap + row_h);
+    if (spec.show_progress) {
+      total_h += row_gap + row_h;
+    }
+    if (action_count) {
+      total_h += row_gap + Snap(13.0f * f);  // spacer before the actions
+      total_h += float(action_count) * (row_gap + row_h);
+    }
+  };
+
+  float fit = 1.0f;
+  layout(fit);
+  while (total_h > avail_h && fit > 0.6f) {
+    fit = std::max(0.6f, fit - 0.04f);
+    layout(fit);
   }
+  // Content-scale: paddings and insets shrink with the rest of the block, so a
+  // fitted screen stays proportioned instead of growing fat margins. The
+  // footer legend deliberately stays at the base viewport scale.
+  const float sf = s * fit;
 
   // min after max: on very short windows the footer bound wins over the
   // keep-the-title-visible bound (std::clamp would be UB with inverted
   // bounds).
-  const float col_y = Snap(std::min(
-      std::max((display.y - total_h) * 0.5f, (98.0f + 74.0f) * s), content_bottom - total_h));
+  const float col_y = Snap(
+      std::min(std::max((display.y - total_h) * 0.5f, content_top), content_bottom - total_h));
 
   // ---- Title ----
-  dl->AddText(bold, title_size, ImVec2(col_x, Snap(col_y - 74.0f * s)), kColText, spec.title);
+  dl->AddText(bold, title_size, ImVec2(col_x, Snap(col_y - title_gap)), kColText, spec.title);
 
   float y = col_y;
 
   // ---- Section bar ----
   dl->AddRectFilled(ImVec2(col_x, y), ImVec2(col_x + col_w, y + row_h), kColAccent);
-  AddTextVCentered(dl, bold_ol, label_size, col_x + 18.0f * s, y + row_h * 0.5f, kColAccentDark,
+  AddTextVCentered(dl, bold_ol, label_size, col_x + 18.0f * sf, y + row_h * 0.5f, kColAccentDark,
                    spec.section);
   y += row_h + row_gap;
 
@@ -417,25 +476,51 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
   }
   y += panel_h + row_gap;
 
+  // ---- Instruction steps panel ----
+  if (steps_panel_h > 0.0f) {
+    dl->AddRectFilled(ImVec2(col_x, y), ImVec2(col_x + col_w, y + steps_panel_h), kColDescPanel);
+    dl->AddRect(ImVec2(col_x, y), ImVec2(col_x + col_w, y + steps_panel_h), kColRailBorder);
+    float text_y = y + panel_pad;
+    if (spec.steps_title) {
+      AddTextVCentered(dl, bold, steps_title_size, col_x + panel_pad,
+                       text_y + steps_title_h * 0.5f, kColAccent, spec.steps_title);
+      text_y += steps_title_h;
+    }
+    for (const auto& lines : step_lines) {
+      for (size_t l = 0; l < lines.size(); ++l) {
+        const std::string line(lines[l].first, lines[l].second);
+        // The number sits in the margin: only the first line starts at the
+        // panel edge, continuations align under the step's text.
+        const float x = col_x + panel_pad + (l == 0 ? 0.0f : step_indent);
+        dl->AddText(font, step_size,
+                    ImVec2(Snap(x), Snap(text_y + (step_line_h - step_size) * 0.5f)), kColText,
+                    line.c_str());
+        text_y += step_line_h;
+      }
+      text_y += step_gap;
+    }
+    y += steps_panel_h + row_gap;
+  }
+
   // ---- Info rows (read-only label/value) ----
   for (const WizardScreenSpec::InfoRow& row : spec.info_rows) {
     dl->AddRectFilled(ImVec2(col_x, y), ImVec2(col_x + col_w, y + row_h), kColPanel);
     dl->AddRect(ImVec2(col_x, y), ImVec2(col_x + col_w, y + row_h), kColPanelBorder);
     const float cy = y + row_h * 0.5f;
-    AddTextVCentered(dl, bold_ol, label_size, col_x + 18.0f * s, cy, kColRowText, row.label);
-    // Long paths shrink toward 15*s, then ellipsize from the FRONT - the
+    AddTextVCentered(dl, bold_ol, label_size, col_x + 18.0f * sf, cy, kColRowText, row.label);
+    // Long paths shrink toward 15*sf, then ellipsize from the FRONT - the
     // filename tail is the informative part. The step walks the unquantized
     // size so it always makes progress: font_px() snaps to buckets a little
     // over a pixel wide, so at small viewport scales a step is narrower than
     // one bucket and re-quantizing the previous result returns it unchanged.
     const float label_w = bold_ol->CalcTextSizeA(label_size, FLT_MAX, 0.0f, row.label).x;
-    const float max_w = col_w - 36.0f * s - label_w - 24.0f * s;
-    const float min_vsize = 15.0f * s;
-    float raw_vsize = 18.0f * s;
+    const float max_w = col_w - 36.0f * sf - label_w - 24.0f * sf;
+    const float min_vsize = 15.0f * sf;
+    float raw_vsize = 19.0f * sf;
     float vsize = font_px(raw_vsize);
     while (raw_vsize > min_vsize &&
            font->CalcTextSizeA(vsize, FLT_MAX, 0.0f, row.value.c_str()).x > max_w) {
-      raw_vsize = std::max(min_vsize, raw_vsize - 0.5f * s);
+      raw_vsize = std::max(min_vsize, raw_vsize - 0.5f * sf);
       vsize = font_px(raw_vsize);
     }
     std::string shown = row.value;
@@ -449,7 +534,7 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
       shown = "..." + shown;
     }
     const float shown_w = font->CalcTextSizeA(vsize, FLT_MAX, 0.0f, shown.c_str()).x;
-    AddTextVCentered(dl, font, vsize, col_x + col_w - 18.0f * s - shown_w, cy, kColRowTextDim,
+    AddTextVCentered(dl, font, vsize, col_x + col_w - 18.0f * sf - shown_w, cy, kColRowTextDim,
                      shown.c_str());
     y += row_h + row_gap;
   }
@@ -463,21 +548,21 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
     if (spec.progress_copied > 0) {
       bytes_text = FormatBytes(spec.progress_copied) + " / " + FormatBytes(spec.progress_total);
     }
-    const float bytes_size = font_px(17.0f * s);
+    const float bytes_size = font_px(18.0f * sf);
     const float bytes_w =
         bytes_text.empty()
             ? 0.0f
             : bold_ol->CalcTextSizeA(bytes_size, FLT_MAX, 0.0f, bytes_text.c_str()).x;
-    const float tx0 = Snap(col_x + 18.0f * s);
+    const float tx0 = Snap(col_x + 18.0f * sf);
     const float tx1 =
-        Snap(col_x + col_w - 18.0f * s - (bytes_w > 0.0f ? bytes_w + 16.0f * s : 0.0f));
-    dl->AddRectFilled(ImVec2(tx0, Snap(cy - 3.0f * s)), ImVec2(tx1, Snap(cy + 3.0f * s)),
+        Snap(col_x + col_w - 18.0f * sf - (bytes_w > 0.0f ? bytes_w + 16.0f * sf : 0.0f));
+    dl->AddRectFilled(ImVec2(tx0, Snap(cy - 3.0f * sf)), ImVec2(tx1, Snap(cy + 3.0f * sf)),
                       IM_COL32(0, 0, 0, 46));
     if (spec.progress_copied > 0 && spec.progress_total > 0) {
       const float frac = std::clamp(
           float(double(spec.progress_copied) / double(spec.progress_total)), 0.0f, 1.0f);
-      dl->AddRectFilled(ImVec2(tx0, Snap(cy - 3.0f * s)),
-                        ImVec2(Snap(tx0 + (tx1 - tx0) * frac), Snap(cy + 3.0f * s)),
+      dl->AddRectFilled(ImVec2(tx0, Snap(cy - 3.0f * sf)),
+                        ImVec2(Snap(tx0 + (tx1 - tx0) * frac), Snap(cy + 3.0f * sf)),
                         kColInteract);
     } else {
       // No bytes yet (connecting / spinning up): an indeterminate marching
@@ -490,12 +575,12 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
       const float b0 = std::max(tx0, band_x);
       const float b1 = std::min(tx1, band_x + band_w);
       if (b1 > b0) {
-        dl->AddRectFilled(ImVec2(Snap(b0), Snap(cy - 3.0f * s)),
-                          ImVec2(Snap(b1), Snap(cy + 3.0f * s)), kColInteract);
+        dl->AddRectFilled(ImVec2(Snap(b0), Snap(cy - 3.0f * sf)),
+                          ImVec2(Snap(b1), Snap(cy + 3.0f * sf)), kColInteract);
       }
     }
     if (!bytes_text.empty()) {
-      AddTextVCentered(dl, bold_ol, bytes_size, col_x + col_w - 18.0f * s - bytes_w, cy,
+      AddTextVCentered(dl, bold_ol, bytes_size, col_x + col_w - 18.0f * sf - bytes_w, cy,
                        kColRowText, bytes_text.c_str());
     }
     y += row_h + row_gap;
@@ -503,7 +588,7 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
 
   // ---- Action rows ----
   if (action_count) {
-    y += Snap(13.0f * s) + row_gap;
+    y += Snap(13.0f * sf) + row_gap;
     const float actions_y0 = y;
     for (int i = 0; i < action_count; ++i) {
       const float y0 = y;
@@ -521,7 +606,7 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
         dl->AddRectFilled(ImVec2(col_x, y0), ImVec2(col_x + col_w, y1),
                           hovered ? kColPanelHover : kColPanel);
         dl->AddRect(ImVec2(col_x, y0), ImVec2(col_x + col_w, y1), kColPanelBorder);
-        AddTextVCentered(dl, bold_ol, label_size, col_x + 18.0f * s, (y0 + y1) * 0.5f,
+        AddTextVCentered(dl, bold_ol, label_size, col_x + 18.0f * sf, (y0 + y1) * 0.5f,
                          kColRowText, spec.actions[i].c_str());
       }
       y += row_h + row_gap;
@@ -530,7 +615,7 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
     // menu's focused row; the focused label rides on top of it.
     {
       const float target = actions_y0 + float(focus_index) * (row_h + row_gap);
-      if (highlight_anim_y < 0.0f || std::abs(highlight_anim_y - target) > 160.0f * s) {
+      if (highlight_anim_y < 0.0f || std::abs(highlight_anim_y - target) > 160.0f * sf) {
         highlight_anim_y = target;
       }
       highlight_anim_y += (target - highlight_anim_y) * std::min(1.0f, io.DeltaTime * 22.0f);
@@ -539,8 +624,8 @@ int DrawWizardScreen(ImGuiDrawer* drawer, ImGuiIO& io, const WizardScreenSpec& s
       }
       const ImVec2 hi_min(col_x, Snap(highlight_anim_y));
       const ImVec2 hi_max(col_x + col_w, Snap(highlight_anim_y) + row_h);
-      DrawFocusHighlight(dl, hi_min, hi_max, s);
-      AddTextVCentered(dl, bold, label_size, col_x + 18.0f * s, (hi_min.y + hi_max.y) * 0.5f,
+      DrawFocusHighlight(dl, hi_min, hi_max, sf);
+      AddTextVCentered(dl, bold, label_size, col_x + 18.0f * sf, (hi_min.y + hi_max.y) * 0.5f,
                        kColSelText, spec.actions[focus_index].c_str());
     }
   } else {

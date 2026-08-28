@@ -740,6 +740,17 @@ bool Presenter::RefreshGuestOutput(
 }
 
 void Presenter::SetGuestFrameStatsEnabled(bool enabled) {
+  guest_frame_stats_policy_ = enabled;
+  UpdateGuestFrameStatsEnabled();
+}
+
+void Presenter::SetGuestFrameStatsHold(bool hold) {
+  guest_frame_stats_hold_ = hold;
+  UpdateGuestFrameStatsEnabled();
+}
+
+void Presenter::UpdateGuestFrameStatsEnabled() {
+  const bool enabled = guest_frame_stats_policy_ || guest_frame_stats_hold_;
   const bool was_enabled = GuestFrameStatsEnabled();
   if (enabled == was_enabled) {
     return;

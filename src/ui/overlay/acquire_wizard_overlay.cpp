@@ -25,6 +25,12 @@ AcquireWizardDialog::AcquireWizardDialog(ImGuiDrawer* drawer, Options options, F
       complete_(std::move(complete)),
       status_(options_.initial_status) {}
 
+void AcquireWizardDialog::SetInstructions(const char* steps_title,
+                                          std::vector<std::string> steps) {
+  steps_title_ = steps_title;
+  steps_ = std::move(steps);
+}
+
 void AcquireWizardDialog::OnClose() {
   if (work_thread_.joinable()) {
     work_thread_.join();
@@ -146,6 +152,14 @@ void AcquireWizardDialog::OnDraw(ImGuiIO& io) {
                                          : WizardScreenSpec::Emphasis::kDim});
   if (state_ == State::kFailed && !error_.empty()) {
     spec.paragraphs.push_back({error_, WizardScreenSpec::Emphasis::kDanger});
+  }
+  // The instructions only help while there is still a choice to make; once a
+  // download or install is under way they are just noise taking up the
+  // screen. They also do not apply to the automatic download at all, so they
+  // stay out of the way whenever that is still an option being acted on.
+  if (state_ == State::kWaitingForChoice || state_ == State::kFailed) {
+    spec.steps_title = steps_title_;
+    spec.steps = steps_;
   }
   if (!options_.target_directory.empty()) {
     spec.info_rows.push_back({"Install Directory", options_.target_directory});

@@ -40,6 +40,9 @@ class InputSystem : public system::IInputSystem {
   void SetMenuChordCallback(std::function<void()> callback);
   // Fired on the rising edge of the picker chord (default: Guide button).
   void SetPickerChordCallback(std::function<void()> callback);
+  // Fired on the rising edge of the performance-menu chord (default:
+  // Start + Select). Never fires while that chord equals the menu chord.
+  void SetPerfChordCallback(std::function<void()> callback);
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
@@ -58,7 +61,9 @@ class InputSystem : public system::IInputSystem {
   std::function<bool()> active_callback_ = nullptr;
   std::function<void()> menu_chord_callback_ = nullptr;
   std::function<void()> picker_chord_callback_ = nullptr;
+  std::function<void()> perf_chord_callback_ = nullptr;
   bool picker_chord_down_ = false;
+  bool perf_chord_down_ = false;
   bool menu_chord_down_ = false;
 };
 

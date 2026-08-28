@@ -374,6 +374,13 @@ class Presenter {
     return guest_frame_stats_enabled_.load(std::memory_order_relaxed);
   }
   void SetGuestFrameStatsEnabled(bool enabled);
+  // A second, independent request for the same stats, OR-ed with the flag
+  // above. The app sets the flag from its overlay policy; a screen that needs
+  // the numbers only while it is open (the Performance settings page) holds
+  // this instead, so closing it cannot switch off stats an overlay still
+  // wants, and opening it cannot leave the GPU timestamp queries behind these
+  // numbers running for the rest of the session.
+  void SetGuestFrameStatsHold(bool hold);
   // Reports time the guest output producer spent blocked waiting for the host
   // GPU; accumulated into the current frame's stats and reset at the next
   // RefreshGuestOutput. Thread-safe.
@@ -1061,6 +1068,13 @@ class Presenter {
   // high frame rates.
   static constexpr size_t kGuestFrameTimestampCount = 512;
   std::atomic<bool> guest_frame_stats_enabled_{false};
+  // The two inputs to guest_frame_stats_enabled_ (app policy, and a screen
+  // holding it open). Only ever touched from the UI thread.
+  bool guest_frame_stats_policy_ = false;
+  bool guest_frame_stats_hold_ = false;
+  // Recomputes guest_frame_stats_enabled_ from the two inputs above, resetting
+  // the sampling window whenever collection turns on.
+  void UpdateGuestFrameStatsEnabled();
   // Packed x/y/width/height as 4x16-bit, written by GetGuestOutputPaintFlow
   // (paint thread, const method - hence mutable), read from the UI thread via
   // GetLastGuestOutputPaintRect.

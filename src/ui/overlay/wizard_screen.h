@@ -37,6 +37,11 @@ struct WizardScreenSpec {
   const char* title = "";    // page title above the block
   const char* section = "";  // accent section bar label
   std::vector<Paragraph> paragraphs;
+  // Optional numbered instructions, drawn in their own panel under the
+  // paragraphs (e.g. how to copy a disc image onto the device). The heading
+  // is only drawn when there is at least one step.
+  const char* steps_title = nullptr;
+  std::vector<std::string> steps;
   std::vector<InfoRow> info_rows;
   bool show_progress = false;
   uint64_t progress_copied = 0;
