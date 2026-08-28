@@ -98,6 +98,31 @@ std::vector<std::string> ApplyIOSArgumentOverrides(std::vector<std::string> args
     return eq == std::string::npos ? arg : arg.substr(0, eq);
   };
 
+  // Collapse repeats WITHIN the file first, last line winning. CLI11 rejects a
+  // scalar option it sees twice, and that rejection is not local: the whole
+  // parse fails, so every compiled-in argument below is silently discarded and
+  // the app comes up on stock defaults. One duplicated line in this file is
+  // therefore enough to quietly undo all of the tuning it exists to carry -
+  // which is exactly what happened, and it cost an evening to find because the
+  // only evidence is one line in stderr.log.
+  {
+    std::vector<std::string> deduped;
+    deduped.reserve(overrides.size());
+    for (auto it = overrides.rbegin(); it != overrides.rend(); ++it) {
+      const std::string key = key_of(*it);
+      const bool already =
+          std::any_of(deduped.begin(), deduped.end(),
+                      [&](const std::string& kept) { return key_of(kept) == key; });
+      if (!already) {
+        deduped.push_back(*it);
+      } else {
+        std::fprintf(stderr, "ios_args: ignoring an earlier duplicate of %s\n", key.c_str());
+      }
+    }
+    std::reverse(deduped.begin(), deduped.end());
+    overrides = std::move(deduped);
+  }
+
   for (const std::string& override_arg : overrides) {
     const std::string key = key_of(override_arg);
     args.erase(std::remove_if(args.begin(), args.end(),
