@@ -46,6 +46,14 @@ namespace rex::graphics {
 
 class CommandProcessor;
 
+// iOS refuses GPU work from a backgrounded app: every vkQueueSubmit comes
+// back VK_ERROR_DEVICE_LOST with
+// kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted. That is not
+// a broken device and it resolves the moment the app is foreground again, so
+// the GPU layer needs to know which it is rather than counting failures.
+void SetAppForeground(bool foreground);
+bool IsAppForeground();
+
 class GraphicsSystem : public system::IGraphicsSystem {
  public:
   virtual ~GraphicsSystem();

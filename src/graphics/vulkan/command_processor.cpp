@@ -6713,6 +6713,26 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
 // gets a black screen with the audio still playing. Share the same budget so
 // one spurious loss costs a frame rather than the session.
 bool VulkanCommandProcessor::SoftenDeviceLoss(const char* stage) {
+  // A backgrounded app is REFUSED the GPU by iOS - every submit returns
+  // VK_ERROR_DEVICE_LOST with
+  // kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted, and they
+  // arrive as fast as the queue can be driven: eight of them inside 16 ms was
+  // enough to exhaust a budget meant for occasional drawable timeouts, and the
+  // app then killed itself with "Graphics device lost". None of that is a lost
+  // device, and it fixes itself the moment the app is foreground again, so it
+  // must never be counted or turned fatal.
+  if (!rex::graphics::IsAppForeground()) {
+    static std::atomic<uint32_t> s_bg{0};
+    const uint32_t n = s_bg.fetch_add(1, std::memory_order_relaxed);
+    if (n < 4 || (n & (n - 1)) == 0) {
+      REXGPU_WARN(
+          "GPU: {} reported a lost device while the app is in the background "
+          "(occurrence {}); iOS does not permit GPU work there - dropping it and "
+          "carrying on",
+          stage, n + 1);
+    }
+    return true;
+  }
   const int32_t budget = REXCVAR_GET(vulkan_device_lost_soft_retries);
   if (budget <= 0) {
     return false;

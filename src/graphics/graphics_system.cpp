@@ -362,6 +362,16 @@ void GraphicsSystem::Shutdown() {
   provider_.reset();
 }
 
+namespace {
+std::atomic<bool> g_app_foreground{true};
+}  // namespace
+
+void SetAppForeground(bool foreground) {
+  g_app_foreground.store(foreground, std::memory_order_relaxed);
+}
+
+bool IsAppForeground() { return g_app_foreground.load(std::memory_order_relaxed); }
+
 void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_responsible) {
   // TODO(Triang3l): Somehow gain exclusive ownership of the Provider (may be
   // used by the command processor, the presenter, and possibly anything else,
