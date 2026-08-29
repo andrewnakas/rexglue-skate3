@@ -1636,12 +1636,24 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
+    // The suspend count MUST be published in the same critical section that
+    // announces the thread has started. It used to be set in a second lock
+    // scope below, which left a window: Resume() waits for the start signal
+    // and then bails out with false if the count is still zero, so a Resume
+    // landing in that window did nothing at all - and the thread went on to
+    // set the count to 1 and wait for a resume that had already come and gone.
+    // The thread then never ran a single instruction. On iOS that is the boot
+    // that sits on a black screen with the FPS counter reading "--", because
+    // the guest main thread never starts; measured at roughly one launch in
+    // four, with the failure visible as XThread::Resume returning C0000001.
+    if (create_suspended) {
+      thread->handle_.suspend_count_ = 1;
+    }
     thread->handle_.state_signal_.notify_all();
   }
 
   if (create_suspended) {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-    thread->handle_.suspend_count_ = 1;
     thread->handle_.state_signal_.wait(lock,
                                        [thread] { return thread->handle_.suspend_count_ == 0; });
   }
