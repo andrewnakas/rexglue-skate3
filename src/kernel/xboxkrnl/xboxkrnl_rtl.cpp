@@ -399,7 +399,32 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
     // Create a full waiter.
-    xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
+    //
+    // This used to wait forever with no way to see it. A guest thread parked
+    // here is the shape of the freeze where the game keeps rendering but stops
+    // producing frames, and a stack alone cannot say WHICH lock or WHO holds
+    // it. Wait in bounded slices instead - identical blocking behaviour, since
+    // it keeps waiting until acquired - and name the lock and its owner if it
+    // takes long enough to be a hang rather than contention.
+    uint64_t slice = uint64_t(-10000000);  // 1s, relative 100ns units
+    uint32_t waited_s = 0;
+    for (;;) {
+      const uint32_t result = xeKeWaitForSingleObject(
+          reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, &slice);
+      if (result != X_STATUS_TIMEOUT) {
+        break;
+      }
+      ++waited_s;
+      // Geometric, so a genuinely stuck lock reports a handful of times rather
+      // than once a second forever.
+      if (waited_s == 5 || (waited_s > 5 && (waited_s & (waited_s - 1)) == 0)) {
+        REXLOG_WARN(
+            "RtlEnterCriticalSection: waiting {}s for cs={:08X} owner_thread={:08X} "
+            "lock_count={} recursion={} (this thread={:08X})",
+            waited_s, uint32_t(cs.guest_address()), uint32_t(cs->owning_thread),
+            int32_t(cs->lock_count), uint32_t(cs->recursion_count), cur_thread);
+      }
+    }
   }
 
   assert_true(cs->owning_thread == 0);

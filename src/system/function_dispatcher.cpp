@@ -69,11 +69,19 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
   static std::atomic<uint64_t> s_count{0};
   const uint64_t n = s_count.fetch_add(1, std::memory_order_relaxed);
   if (n < 8 || (n & (n - 1)) == 0) {
+    // The registers say WHY the pointer was bad, which the target alone cannot.
+    // The recompiled virtual-call shape is: r31 = object, r11 = *object (the
+    // vtable), r10 = vtable[n] (the method, which becomes ctr). So a poison
+    // value like BCBCBCBC in r31 means the object was freed, a plausible r31
+    // with a garbage r11 means its memory was never constructed, and a sane
+    // r11 with a garbage r10 means the vtable itself is wrong.
     REXCPU_ERROR(
         "Call to invalid or unregistered function at guest address 0x{:08X} "
         "(occurrence {}, guest lr=0x{:08X}); returning to the caller instead of "
-        "aborting - guest state is already wrong at this point",
-        ctx.last_indirect_target, n + 1, uint32_t(ctx.lr));
+        "aborting - guest state is already wrong at this point "
+        "| r3={:08X} r10={:08X} r11={:08X} r31={:08X}",
+        ctx.last_indirect_target, n + 1, uint32_t(ctx.lr), uint32_t(ctx.r3.u32),
+        uint32_t(ctx.r10.u32), uint32_t(ctx.r11.u32), uint32_t(ctx.r31.u32));
   }
 }
 
