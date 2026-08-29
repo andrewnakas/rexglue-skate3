@@ -85,8 +85,9 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 33> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 34> kOptionalSimpleSettingsCvars = {
     "skate3_diagnostics",
+    "skate3_native_render_scene_hdr",
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -139,9 +140,16 @@ constexpr std::array<int32_t, 4> kStaticShadowResSizes = {1024, 2048, 4096,
 
 // Draw distance: one multiplier applied to both the world detail cull and
 // the character LOD switch ranges (paired hot cvars in the app layer).
-constexpr std::array<const char*, 4> kDrawDistanceLabels = {"Original", "2x",
-                                                           "3x", "5x"};
-constexpr std::array<double, 4> kDrawDistanceScales = {1.0, 2.0, 3.0, 5.0};
+//
+// "Half" is below what the Xbox 360 itself drew, and it is here because on this
+// port the cost of draw distance is not where a desktop GPU would put it. The
+// guest issues the draws, so the multiplier lands on emulated CPU work: on a
+// weak GPU it measures as nothing (36.3 fps at half, 36.0 at a quarter), while
+// on a machine the CPU limits it is one of the largest levers there is. Phones
+// are the second case.
+constexpr std::array<const char*, 5> kDrawDistanceLabels = {"Half", "Original",
+                                                            "2x", "3x", "5x"};
+constexpr std::array<double, 5> kDrawDistanceScales = {0.5, 1.0, 2.0, 3.0, 5.0};
 
 // World streaming: pre-load radius in metres for neighbouring world cells
 // (0 = the game's own cell-boundary streaming).
@@ -169,26 +177,36 @@ struct GraphicsPreset {
   bool volumetrics;
   bool shadow_pcss;
   bool static_shadows;
+  bool hdr;
 };
 
-constexpr std::array<GraphicsPreset, 5> kGraphicsPresets = {{
+constexpr std::array<GraphicsPreset, 6> kGraphicsPresets = {{
     {"Custom", "Your own mix of the settings below.", 0, 0, 0, 0, 0, false, false, false, false,
-     false},
+     false, false},
+    // Everything off, including the two things no other preset touches: the
+    // HDR intermediate and half the console's draw distance. It is deliberately
+    // uglier than Performance rather than slightly faster than it - the point
+    // is to have a rung that gives up the picture entirely, for a phone or a
+    // handheld that cannot hold any of the others.
+    {"Potato",
+     "Every frame the machine has, and the picture last. No shadows, no "
+     "effects, no HDR, and half the original draw distance.",
+     0, 0, 0, 0, 0, false, false, false, false, false, false},
     {"Performance",
-     "Highest frame rate. Shadows on, screen-space effects off, original draw "
-     "distance.",
-     0, 0, 3, 0, 0, false, false, false, false, true},
+     "Highest frame rate with the picture intact. Shadows on, screen-space "
+     "effects off, original draw distance.",
+     0, 0, 3, 0, 1, false, false, false, false, true, true},
     {"Balanced",
      "Ambient occlusion and bloom on with 2x MSAA, original draw distance.",
-     0, 1, 3, 1, 0, true, true, false, false, true},
+     0, 1, 3, 1, 1, true, true, false, false, true, true},
     {"Quality",
      "Everything on at native resolution: AO, bloom, sun shafts, soft shadows "
      "and double draw distance.",
-     0, 1, 5, 1, 1, true, true, true, true, true},
+     0, 1, 5, 1, 2, true, true, true, true, true, true},
     {"Ultra",
      "Quality plus 2x render scale and 4x MSAA. Four times the pixels in every "
      "full-screen target - expect to drop below 60 on modest GPUs.",
-     1, 2, 5, 2, 1, true, true, true, true, true},
+     1, 2, 5, 2, 2, true, true, true, true, true, true},
 }};
 
 // Audio device buffer sizes in sample frames (0 = backend default).
@@ -1261,6 +1279,8 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
   diagnostics_ = HasCvar("skate3_diagnostics") && rex::cvar::Query<bool>("skate3_diagnostics");
+  hdr_ = !HasCvar("skate3_native_render_scene_hdr") ||
+         rex::cvar::Query<bool>("skate3_native_render_scene_hdr");
   audio_mute_ = HasCvar("audio_mute") && rex::cvar::Query<bool>("audio_mute");
   rumble_ = HasCvar("hid_rumble_enabled") && rex::cvar::Query<bool>("hid_rumble_enabled");
   mnk_sensitivity_ = HasCvar("mnk_sensitivity")
@@ -1500,9 +1520,105 @@ int SimpleSettingsDialog::DetectGraphicsPreset() const {
     if (HasCvar("skate3_native_render_scene_shadow_static_casters") &&
         static_shadows_ != p.static_shadows)
       continue;
+    if (HasCvar("skate3_native_render_scene_hdr") && hdr_ != p.hdr) continue;
     return static_cast<int>(i);
   }
   return 0;
+}
+
+namespace {
+
+std::string Lowered(std::string_view value) {
+  std::string out(value);
+  std::transform(out.begin(), out.end(), out.begin(),
+                 [](unsigned char c) { return char(std::tolower(c)); });
+  return out;
+}
+
+// Write one preset cvar, unless the operator named that one by hand.
+//
+// The rule matters more than it looks, and it cannot be inferred from the
+// value: a flag set to the same thing it already defaulted to is
+// indistinguishable from one nobody touched. A preset that simply writes
+// everything will therefore overwrite the single setting an experiment is
+// varying, without saying so. That has already happened on this codebase - a
+// sweep in which four configurations "agreed" at 36 fps, for the excellent
+// reason that the preset had overwritten the MSAA each of them was supposed to
+// be testing, and the conclusion drawn from it was backwards.
+void SetPresetCvar(std::string_view name, const std::string& value) {
+  if (!HasCvar(name)) {
+    return;
+  }
+  if (rex::cvar::WasExplicitlySet(name)) {
+    REXLOG_INFO("Video preset: keeping {}={}, which was set explicitly", name,
+                rex::cvar::GetFlagByName(name));
+    return;
+  }
+  rex::cvar::SetFlagByName(name, value);
+}
+
+const char* BoolText(bool value) { return value ? "true" : "false"; }
+
+}  // namespace
+
+std::vector<std::string> GraphicsPresetNames() {
+  std::vector<std::string> names;
+  names.reserve(kGraphicsPresets.size() - 1);
+  for (size_t i = 1; i < kGraphicsPresets.size(); ++i) {
+    names.push_back(Lowered(kGraphicsPresets[i].label));
+  }
+  return names;
+}
+
+bool ApplyGraphicsPresetByName(std::string_view name) {
+  const std::string wanted = Lowered(name);
+  // From 1: Custom is a description of the current settings, not a request.
+  size_t index = 0;
+  for (size_t i = 1; i < kGraphicsPresets.size(); ++i) {
+    if (Lowered(kGraphicsPresets[i].label) == wanted) {
+      index = i;
+      break;
+    }
+  }
+  if (index == 0) {
+    return false;
+  }
+  const GraphicsPreset& p = kGraphicsPresets[index];
+
+  // The same cvars SaveVideo and ApplyGraphicsPreset write between them, in one
+  // place, because this path has no dialog to hold the intermediate state.
+  const std::string resolution = std::to_string(kResolutionScales[p.resolution_scale]);
+  SetPresetCvar("resolution_scale", resolution);
+  SetPresetCvar("draw_resolution_scale_x", resolution);
+  SetPresetCvar("draw_resolution_scale_y", resolution);
+  SetPresetCvar("skate3_native_render_scene_msaa", std::to_string(kMsaaSamples[p.msaa]));
+
+  // Index 0 of the shadow table is "Off", which is a toggle rather than a tile
+  // size - so the size is only meaningful when shadows are on.
+  SetPresetCvar("skate3_native_render_scene_shadows", BoolText(p.shadow_quality != 0));
+  if (p.shadow_quality != 0) {
+    SetPresetCvar("skate3_native_render_scene_shadow_tile",
+                  std::to_string(kShadowQualityTiles[p.shadow_quality]));
+  }
+  SetPresetCvar("skate3_native_render_scene_shadow_static_size",
+                std::to_string(kStaticShadowResSizes[p.static_shadow_res]));
+
+  const std::string draw_distance = std::to_string(kDrawDistanceScales[p.draw_distance]);
+  SetPresetCvar("skate3_draw_distance_scale", draw_distance);
+  SetPresetCvar("skate3_lod_distance_scale", draw_distance);
+
+  SetPresetCvar("skate3_native_render_scene_ssao", BoolText(p.ssao));
+  SetPresetCvar("skate3_native_render_scene_bloom", BoolText(p.bloom));
+  // One row drives the shafts + haze pair; mirror that here rather than giving
+  // this path its own idea of what "volumetrics" covers.
+  SetPresetCvar("skate3_native_render_scene_shafts", BoolText(p.volumetrics));
+  SetPresetCvar("skate3_native_render_scene_haze", BoolText(p.volumetrics));
+  SetPresetCvar("skate3_native_render_scene_shadow_pcss", BoolText(p.shadow_pcss));
+  SetPresetCvar("skate3_native_render_scene_shadow_static_casters", BoolText(p.static_shadows));
+  SetPresetCvar("skate3_native_render_scene_hdr", BoolText(p.hdr));
+
+  REXLOG_INFO("Video preset: {}", p.label);
+  return true;
 }
 
 void SimpleSettingsDialog::ApplyGraphicsPreset(int preset) {
@@ -1528,6 +1644,7 @@ void SimpleSettingsDialog::ApplyGraphicsPreset(int preset) {
   volumetrics_ = p.volumetrics;
   shadow_pcss_ = p.shadow_pcss;
   static_shadows_ = p.static_shadows;
+  hdr_ = p.hdr;
   draw_distance_index_ = p.draw_distance;
 
   if (HasCvar("skate3_native_render_scene_ssao")) {
@@ -1548,6 +1665,12 @@ void SimpleSettingsDialog::ApplyGraphicsPreset(int preset) {
   }
   if (HasCvar("skate3_native_render_scene_shadow_static_casters")) {
     SetBoolCvar("skate3_native_render_scene_shadow_static_casters", static_shadows_);
+  }
+  // No row of its own: HDR is a preset-level decision. Turning it off changes
+  // the whole tonemap rather than removing one effect, which is not a knob to
+  // hand somebody without the rest of the Potato bundle around it.
+  if (HasCvar("skate3_native_render_scene_hdr")) {
+    SetBoolCvar("skate3_native_render_scene_hdr", hdr_);
   }
   if (HasCvar("skate3_draw_distance_scale")) {
     const std::string scale = std::to_string(kDrawDistanceScales[std::clamp(
@@ -1863,8 +1986,10 @@ void SimpleSettingsDialog::PushDrawDistanceRow(std::vector<RowSpec>& rows) {
     row.desc =
         "How far away small world objects, foliage and character detail "
         "stay visible, as a multiple of the original console distances. "
-        "Higher settings draw more of the world and cost some "
-        "performance. Applies immediately.";
+        "Higher settings draw more of the world and cost some performance; "
+        "Half draws less of it than the console did, and is the setting that "
+        "buys the most back on a machine the emulation limits. Applies "
+        "immediately.";
     for (const char* label : kDrawDistanceLabels) {
       row.options.push_back(label);
     }

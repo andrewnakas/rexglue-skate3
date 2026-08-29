@@ -189,6 +189,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool mode_indicator_ = true;
   bool fps_counter_ = false;
   bool diagnostics_ = false;
+  bool hdr_ = true;
   bool audio_mute_ = false;
   bool rumble_ = true;
   float mnk_sensitivity_ = 1.0f;
@@ -249,5 +250,18 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   float mouse_x_ = -1.0f;        // last mouse position, to detect real motion
   float mouse_y_ = -1.0f;
 };
+
+// Apply a named video preset straight to the cvars, with no settings dialog in
+// existence. Same table the in-game Preset row uses, so a preset named on the
+// command line and one picked from the menu cannot mean different things.
+//
+// Anything the operator named explicitly is left alone - see
+// rex::cvar::WasExplicitlySet. Returns false, and changes nothing, if the name
+// is not a preset. "Custom" is not a preset for this purpose: it describes a
+// state rather than requesting one.
+bool ApplyGraphicsPresetByName(std::string_view name);
+
+// The names ApplyGraphicsPresetByName accepts, lowercased, in menu order.
+std::vector<std::string> GraphicsPresetNames();
 
 }  // namespace rex::ui
