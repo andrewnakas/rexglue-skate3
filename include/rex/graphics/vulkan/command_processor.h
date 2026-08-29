@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -536,7 +537,19 @@ class VulkanCommandProcessor : public CommandProcessor {
                                          const VkDescriptorImageInfo* sampler_image_info,
                                          VkWriteDescriptorSet* descriptor_set_writes_out);
 
+  // Latching this stops every future submission (BeginSubmission returns
+  // false) for the rest of the process: the guest then blocks forever waiting
+  // on GPU progress that can never arrive, which reads to a player as a black
+  // screen with the audio still playing. On MoltenVK a VK_ERROR_DEVICE_LOST is
+  // usually a CAMetalDrawable wait that timed out rather than a dead GPU -
+  // VulkanPresenter::SoftenDeviceLoss says so and drops the frame instead - so
+  // the same budget is applied here before the latch is allowed to stick.
   bool device_lost_ = false;
+  std::chrono::steady_clock::time_point soft_device_loss_window_start_{};
+  uint32_t soft_device_loss_count_ = 0;
+  // Returns true when this loss should be treated as transient (drop the work
+  // and carry on) rather than latching device_lost_.
+  bool SoftenDeviceLoss(const char* stage);
 
   bool cache_clear_requested_ = false;
 

@@ -61,6 +61,10 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+// Defined by the presenter; shared so one spurious MoltenVK device loss is
+// budgeted the same way on both sides of the GPU.
+REXCVAR_DECLARE(int32_t, vulkan_device_lost_soft_retries);
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -6700,6 +6704,40 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   sample_counts->StencilFail_B = 0;
 }
 
+// A lost device reported by MoltenVK is usually a CAMetalDrawable wait that
+// expired on a long frame, not a dead GPU. The presenter has said so for a
+// while and drops the frame (VulkanPresenter::SoftenDeviceLoss); the command
+// processor instead latched device_lost_, and that latch is permanent -
+// BeginSubmission then refuses every submission for the rest of the process,
+// the guest blocks forever on GPU progress that cannot arrive, and the player
+// gets a black screen with the audio still playing. Share the same budget so
+// one spurious loss costs a frame rather than the session.
+bool VulkanCommandProcessor::SoftenDeviceLoss(const char* stage) {
+  const int32_t budget = REXCVAR_GET(vulkan_device_lost_soft_retries);
+  if (budget <= 0) {
+    return false;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (soft_device_loss_window_start_ == std::chrono::steady_clock::time_point{} ||
+      now - soft_device_loss_window_start_ >= std::chrono::seconds(30)) {
+    soft_device_loss_window_start_ = now;
+    soft_device_loss_count_ = 0;
+  }
+  if (soft_device_loss_count_ >= uint32_t(budget)) {
+    REXGPU_ERROR(
+        "GPU: {} reported a lost device {} times within 30s - past the soft-retry budget, "
+        "treating it as a real device loss",
+        stage, soft_device_loss_count_);
+    return false;
+  }
+  ++soft_device_loss_count_;
+  REXGPU_WARN(
+      "GPU: {} reported a lost device; dropping the work ({} of {} allowed in this 30s window). "
+      "On MoltenVK this is normally a CAMetalDrawable wait that timed out, not a dead device.",
+      stage, soft_device_loss_count_, budget);
+  return true;
+}
+
 void VulkanCommandProcessor::InitializeTrace() {
   CommandProcessor::InitializeTrace();
 
@@ -6774,7 +6812,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
       fences_awaited += await_submission - submission_completed_;
     } else {
       REXGPU_ERROR("Failed to await submission completion Vulkan fences");
-      if (wait_result == VK_ERROR_DEVICE_LOST) {
+      if (wait_result == VK_ERROR_DEVICE_LOST && !SoftenDeviceLoss("Awaiting submission fences")) {
         device_lost_ = true;
       }
     }
@@ -6786,7 +6824,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     VkResult fence_status =
         dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
     if (fence_status != VK_SUCCESS) {
-      if (fence_status == VK_ERROR_DEVICE_LOST) {
+      // This path used to latch device_lost_ with no log at all, so a session
+      // that lost every future submission here left nothing in the log to say
+      // why the screen went black.
+      if (fence_status == VK_ERROR_DEVICE_LOST &&
+          !SoftenDeviceLoss("Polling submission fences")) {
         device_lost_ = true;
       }
       break;
@@ -7306,7 +7348,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
-      if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
+      if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_ &&
+          !SoftenDeviceLoss("Submitting a command buffer")) {
         device_lost_ = true;
         if (graphics_system_) {
           graphics_system_->OnHostGpuLossFromAnyThread(true);
