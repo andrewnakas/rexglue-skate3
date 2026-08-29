@@ -224,6 +224,18 @@ std::vector<std::string> BuildIOSArguments() {
       // Together with [pace] and the "guest frame cap is now" line it shows
       // the cap, the rate the display accepts, and what actually came out.
       "--presenter_present_cadence_log=true",
+      // Breaks one paint into acquire / record / end-command-buffer / submit /
+      // present microseconds, averaged over 120 frames. This is the instrument
+      // that says WHERE a frame goes when [pace] reports 33 ms while the GPU
+      // span is 4.6 ms and the command processor never waits on a fence - the
+      // state an A17 Pro is in as of 2026-08-28. Compiled in rather than left
+      // to Documents/user/ios_args.txt because the people who can reproduce
+      // this are strangers on the internet, and one duplicated key in that
+      // file silently discards every argument the app was built with.
+      //
+      // Averaged, so it is one line per 120 frames - about four seconds at the
+      // rate this fires at, and INFO never flushes inline.
+      "--vulkan_present_timing_log=true",
       // Explicit rather than relying on the default: [pace] and [cp-sum] are
       // INFO, and a settings.toml left at 'warning' on a device hides them
       // with no indication that anything was suppressed. Costs nothing -

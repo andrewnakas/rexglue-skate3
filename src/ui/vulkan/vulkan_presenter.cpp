@@ -1499,6 +1499,29 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.compositeAlpha =
         VkCompositeAlphaFlagBitsKHR(uint32_t(1) << composite_alpha_shift);
   }
+  // Which modes the surface OFFERED, not just the one picked. Diagnosing the
+  // iOS 30 fps stall came down to whether MoltenVK ever advertised anything
+  // but FIFO, and that had to be inferred from the selection order below plus
+  // two cvar defaults - three things that could each drift. Log the list so
+  // the next reader reads it instead of reconstructing it.
+  {
+    std::string offered;
+    for (VkPresentModeKHR mode : present_modes) {
+      const char* name = nullptr;
+      switch (mode) {
+        case VK_PRESENT_MODE_IMMEDIATE_KHR: name = "IMMEDIATE"; break;
+        case VK_PRESENT_MODE_MAILBOX_KHR: name = "MAILBOX"; break;
+        case VK_PRESENT_MODE_FIFO_KHR: name = "FIFO"; break;
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR: name = "FIFO_RELAXED"; break;
+        default: break;
+      }
+      if (!offered.empty()) {
+        offered += ", ";
+      }
+      offered += name ? std::string(name) : std::to_string(uint32_t(mode));
+    }
+    REXLOG_INFO("VulkanPresenter: surface offers present modes: {}", offered);
+  }
   // As presentation is usually controlled by the GPU command processor, it's
   // better to use modes that allow as quick acquisition as possible to avoid
   // interfering with GPU command processing, and also to allow tearing so

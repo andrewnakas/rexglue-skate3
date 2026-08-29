@@ -62,13 +62,15 @@ REXCVAR_DEFINE_DOUBLE(video_mode_refresh_rate, 60.0, "GPU", "Guest video mode re
 
 namespace {
 // Ceiling applied to the refresh rate the platform reports, in Hz (0 = trust
-// the platform). See display_presentable_refresh_cap_hz below for why iOS
-// needs one.
-#if REX_PLATFORM_IOS
-constexpr double kDefaultPresentableRefreshCapHz = 60.0;
-#else
+// the platform). See display_presentable_refresh_cap_hz below.
+//
+// iOS needed 60 here for exactly as long as the bundle lacked
+// CADisableMinimumFrameDurationOnPhone. It now sets it, so a ProMotion iPhone
+// really can present 120 and clamping would report a rate that is no longer
+// true. What keeps the guest at 60 is the frame cap, not this - see
+// AutoFrameCapHz, which applies that as policy rather than pretending the
+// display cannot go faster.
 constexpr double kDefaultPresentableRefreshCapHz = 0.0;
-#endif
 }  // namespace
 
 REXCVAR_DEFINE_DOUBLE(
@@ -144,7 +146,14 @@ float Window::AutoFrameCapHz(float refresh_hz) {
   // BuildIOSArguments ships skate3_guest_fps_cap=60 with auto off, and that
   // is what holds a locked 60 on an iPhone 13 mini (p50 16.7 ms). Auto now
   // agrees with it instead of undercutting it.
-  return std::floor(refresh_hz);
+  //
+  // Capped at 60 on top of that, as policy rather than capability. The bundle
+  // opts into 120 on ProMotion (see Info.plist.in), but it does so to stop iOS
+  // halving 60 down to 30 on touch - not because the guest should run at 120.
+  // An uncapped iOS run was measured decaying 57 -> 54 -> 29 -> 4.8 -> 0.2 fps
+  // as the kernel started killing daemons, so letting Auto ask for 120 here
+  // would hand a player a setting that destroys the session.
+  return std::min(60.0f, std::floor(refresh_hz));
 #else
   // 4 FPS of margin or 5% of the refresh rate, whichever is larger (see the
   // declaration): 4 FPS is 6.7% of headroom at 60 Hz but only 0.2 ms of
