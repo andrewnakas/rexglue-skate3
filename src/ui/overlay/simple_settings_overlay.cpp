@@ -1321,6 +1321,20 @@ void SimpleSettingsDialog::Hide() {
   if (!visible_) {
     return;
   }
+  // Closing the menu SAVES. It used to discard: every row outside the video
+  // group wrote itself to disk the moment it changed, but resolution, frame
+  // cap, MSAA, shadows, FOV and the rest were staged in the dialog and only
+  // committed by Apply & Restart - so changing them and closing the menu threw
+  // them away with no warning. On a phone that is the normal way to leave, and
+  // Apply & Restart could not be reached or pressed there at all, which made
+  // those settings effectively unsettable.
+  //
+  // Safe to do unconditionally: Show() calls LoadSettingsFromCvars(), so the
+  // staged values always start as the live ones and an untouched menu writes
+  // back what was already there. Settings needing a restart still need one -
+  // but they are now remembered, and take effect on the next launch instead of
+  // vanishing.
+  SaveVideo();
   visible_ = false;
   editing_text_ = false;
   SetDrawActive(false);
@@ -3824,8 +3838,9 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     }
     if (pending) {
       AddTextJustified(dl, font, desc_size, ImVec2(text_x, text_y), wrap_w, kColWarn,
-                       (std::string("Changes are applied after a restart. Use ") +
-                        kApplyActionName + " when ready.")
+                       (std::string("Saved. These settings need a restart, so they take "
+                                    "effect next time you open the game - or use ") +
+                        kApplyActionName + " to do it now.")
                            .c_str());
     }
   }
