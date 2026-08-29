@@ -130,6 +130,9 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void PushBloomRow(std::vector<RowSpec>& rows);
   void PushVolumetricsRow(std::vector<RowSpec>& rows);
   void PushDrawDistanceRow(std::vector<RowSpec>& rows);
+  // System page. Not shared with Video/Performance: this one is not a quality
+  // setting, it is the switch that makes the build instrument itself.
+  void PushDiagnosticsRow(std::vector<RowSpec>& rows);
   void PushFpsCounterRow(std::vector<RowSpec>& rows);
   // One controller-chord row. `allow_guide` offers the Guide button, which
   // only the level picker can use.
@@ -185,6 +188,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   int stream_probe_index_ = 0;
   bool mode_indicator_ = true;
   bool fps_counter_ = false;
+  bool diagnostics_ = false;
   bool audio_mute_ = false;
   bool rumble_ = true;
   float mnk_sensitivity_ = 1.0f;

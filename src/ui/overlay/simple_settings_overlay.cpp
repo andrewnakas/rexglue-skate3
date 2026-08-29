@@ -85,7 +85,8 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 32> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 33> kOptionalSimpleSettingsCvars = {
+    "skate3_diagnostics",
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -1259,6 +1260,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
+  diagnostics_ = HasCvar("skate3_diagnostics") && rex::cvar::Query<bool>("skate3_diagnostics");
   audio_mute_ = HasCvar("audio_mute") && rex::cvar::Query<bool>("audio_mute");
   rumble_ = HasCvar("hid_rumble_enabled") && rex::cvar::Query<bool>("hid_rumble_enabled");
   mnk_sensitivity_ = HasCvar("mnk_sensitivity")
@@ -1904,6 +1906,36 @@ void SimpleSettingsDialog::PushFpsCounterRow(std::vector<RowSpec>& rows) {
     row.reset = [this] {
       fps_counter_ = CvarDefaultBool("show_fps_counter", false);
       SetBoolCvar("show_fps_counter", fps_counter_);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+void SimpleSettingsDialog::PushDiagnosticsRow(std::vector<RowSpec>& rows) {
+  if (HasCvar("skate3_diagnostics")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Diagnostics";
+    row.desc =
+        "Record performance detail to the log file. Costs frames - leave it off "
+        "unless somebody asked you for a log.";
+    row.desc_extra =
+        "The instruments this turns on time every frame, not just the ones they "
+        "report, so they are off in a normal build. Turn this on, play until the "
+        "problem happens, then send the log.";
+    row.options = {"Off", "On"};
+    row.flag = &diagnostics_;
+    // The app's own change callback does the work - it owns the list of
+    // instruments and the log level. This row only moves the switch, so the
+    // menu and a --skate3_diagnostics on the command line cannot disagree.
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("skate3_diagnostics", value != 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      diagnostics_ = CvarDefaultBool("skate3_diagnostics", false);
+      SetBoolCvar("skate3_diagnostics", diagnostics_);
       SaveSimpleSettingsConfig(config_path_);
     };
     rows.push_back(std::move(row));
@@ -2764,6 +2796,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
+      header("Diagnostics");
+      PushDiagnosticsRow(rows);
       header("Session");
       {
         RowSpec row;
