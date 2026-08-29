@@ -110,12 +110,27 @@ uint64_t ElapsedUs(std::chrono::steady_clock::time_point start,
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
 }
 
-void AccumulateAndMaybeLogPresentTiming(bool execute_ui_drawers, uint64_t acquire_us,
+// A clock read on the present path, but only when somebody is going to read the
+// answer. There are ten of these in PaintAndPresentImpl and they used to be
+// taken unconditionally, with the "is the breakdown switched on" test happening
+// afterwards inside the accumulator - so every player paid for an instrument
+// almost none of them would ever look at. Zero when off; the accumulator is
+// handed the same flag, so it never divides a real interval into a zero one.
+std::chrono::steady_clock::time_point TimingNow(bool enabled) {
+  return enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+}
+
+void AccumulateAndMaybeLogPresentTiming(bool enabled, bool execute_ui_drawers,
+                                        uint64_t acquire_us,
                                         uint64_t consume_and_record_us,
                                         uint64_t end_command_buffer_us, uint64_t submit_us,
                                         uint64_t present_us, uint64_t total_us) {
   static VulkanPresentTimingStats stats;
-  if (!REXCVAR_GET(vulkan_present_timing_log)) {
+  // The caller's flag, not a fresh REXCVAR_GET: if the cvar were flipped on
+  // partway through a present, the clocks for the earlier stages would still be
+  // the zero time point and this would accumulate a frame that appears to have
+  // taken decades.
+  if (!enabled) {
     stats = {};
     return;
   }
@@ -1767,7 +1782,8 @@ bool VulkanPresenter::SoftenDeviceLoss(const char* stage) {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
-  const auto timing_start = std::chrono::steady_clock::now();
+  const bool timing_on = REXCVAR_GET(vulkan_present_timing_log);
+  const auto timing_start = TimingNow(timing_on);
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
   uint64_t current_paint_submission_index =
@@ -1839,11 +1855,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
-  const auto timing_acquire_start = std::chrono::steady_clock::now();
+  const auto timing_acquire_start = TimingNow(timing_on);
   VkResult acquire_result =
       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
                                 VK_NULL_HANDLE, &swapchain_image_index);
-  const auto timing_acquire_end = std::chrono::steady_clock::now();
+  const auto timing_acquire_end = TimingNow(timing_on);
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -2460,9 +2476,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   dfn.vkCmdEndRenderPass(draw_command_buffer);
 
-  const auto timing_end_command_buffer_start = std::chrono::steady_clock::now();
+  const auto timing_end_command_buffer_start = TimingNow(timing_on);
   dfn.vkEndCommandBuffer(draw_command_buffer);
-  const auto timing_end_command_buffer_end = std::chrono::steady_clock::now();
+  const auto timing_end_command_buffer_end = TimingNow(timing_on);
 
   VkPipelineStageFlags acquire_semaphore_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   VkCommandBuffer command_buffers[2];
@@ -2501,7 +2517,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   submit_info.pCommandBuffers = command_buffers;
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = &present_semaphore;
-  const auto timing_submit_start = std::chrono::steady_clock::now();
+  const auto timing_submit_start = TimingNow(timing_on);
   {
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         paint_context_.submission_tracker.AcquireFenceToAdvanceSubmission());
@@ -2544,7 +2560,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       return PaintResult::kNotPresentedConnectionOutdated;
     }
   }
-  const auto timing_submit_end = std::chrono::steady_clock::now();
+  const auto timing_submit_end = TimingNow(timing_on);
 
   VkPresentInfoKHR present_info;
   present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -2556,15 +2572,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pImageIndices = &swapchain_image_index;
   present_info.pResults = nullptr;
   VkResult present_result;
-  const auto timing_present_start = std::chrono::steady_clock::now();
+  const auto timing_present_start = TimingNow(timing_on);
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
-  const auto timing_present_end = std::chrono::steady_clock::now();
+  const auto timing_present_end = TimingNow(timing_on);
   AccumulateAndMaybeLogPresentTiming(
-      execute_ui_drawers, ElapsedUs(timing_acquire_start, timing_acquire_end),
+      timing_on, execute_ui_drawers, ElapsedUs(timing_acquire_start, timing_acquire_end),
       ElapsedUs(timing_acquire_end, timing_submit_start),
       ElapsedUs(timing_end_command_buffer_start, timing_end_command_buffer_end),
       ElapsedUs(timing_submit_start, timing_submit_end),
