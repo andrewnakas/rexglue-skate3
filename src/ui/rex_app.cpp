@@ -847,8 +847,19 @@ void ReXApp::LaunchModule() {
       }
     }
 
+    // Launch is silent between the shader-storage line and the guest's first
+    // instruction, and roughly one boot in four stops somewhere in here with
+    // the guest never running at all. These three lines say which step.
+    REXLOG_INFO("KernelState: module launch - post-launch hooks");
     OnPostLaunchModule(main_thread.get());
-    main_thread->Resume();
+    REXLOG_INFO("KernelState: module launch - resuming the guest main thread (thread id {})",
+                main_thread->thread_id());
+    // The result was thrown away here, and PosixCondition::Resume returns
+    // false whenever the thread was not actually suspended - so a launch that
+    // never started the guest looked identical in the log to one that did.
+    const X_STATUS resume_status = main_thread->Resume();
+    REXLOG_INFO("KernelState: module launch - guest main thread resume returned {:08X}",
+                uint32_t(resume_status));
 
     module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
       main_thread->Wait(0, 0, 0, nullptr);
