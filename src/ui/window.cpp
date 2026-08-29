@@ -111,6 +111,13 @@ void Window::UpdateCachedDisplayRefresh() {
   if (reported_hz <= 0.0f) {
     return;
   }
+  // Log the panel rate once, unconditionally: the clamp message below only
+  // appears when a ceiling actually bites, so a support log from an ordinary
+  // 60 Hz device otherwise says nothing about what it refreshes at.
+  static std::atomic<bool> s_reported_logged{false};
+  if (!s_reported_logged.exchange(true, std::memory_order_relaxed)) {
+    REXLOG_INFO("Window: display refresh reported as {:.0f} Hz", reported_hz);
+  }
   // Publish what can be PRESENTED at, not what the panel can refresh at - the
   // frame pacer and the settings UI both want the former, and on iOS they
   // differ (see display_presentable_refresh_cap_hz).

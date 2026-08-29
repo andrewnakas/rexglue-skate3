@@ -53,6 +53,11 @@
 #include <sys/utsname.h>
 #endif
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
+
 #if REX_PLATFORM_WIN32
 #include <windows.h>
 #else
@@ -215,6 +220,54 @@ void LogLinuxRuntimeDiagnostics() {
   LogEnvIfSet("VK_DRIVER_FILES");
 }
 
+#endif
+
+#if defined(__APPLE__)
+// The device model is not otherwise recoverable from a support log: a whole
+// session once went into inferring one iPhone from a screen resolution and
+// another from a GPU name.
+std::string SysctlString(const char* name) {
+  size_t size = 0;
+  if (sysctlbyname(name, nullptr, &size, nullptr, 0) != 0 || size == 0) {
+    return {};
+  }
+  std::string value(size, '\0');
+  if (sysctlbyname(name, value.data(), &size, nullptr, 0) != 0) {
+    return {};
+  }
+  value.resize(strnlen(value.c_str(), value.size()));
+  return value;
+}
+
+void LogAppleRuntimeDiagnostics() {
+  REXLOG_INFO("Apple runtime diagnostics:");
+  const auto machine = SysctlString("hw.machine");
+  const auto model = SysctlString("hw.model");
+  REXLOG_INFO("  Device: hw.machine={} hw.model={}", machine.empty() ? "unknown" : machine,
+              model.empty() ? "unknown" : model);
+
+  uint64_t memsize = 0;
+  size_t memsize_len = sizeof(memsize);
+  if (sysctlbyname("hw.memsize", &memsize, &memsize_len, nullptr, 0) == 0) {
+    REXLOG_INFO("  Memory: {} MB", memsize / (1024 * 1024));
+  }
+  const auto osversion = SysctlString("kern.osversion");
+  const auto osrelease = SysctlString("kern.osrelease");
+  REXLOG_INFO("  OS: kern.osversion={} kern.osrelease={}", osversion.empty() ? "unknown" : osversion,
+              osrelease.empty() ? "unknown" : osrelease);
+
+  // LiveContainer runs the app inside another app's container, and does not
+  // reliably deliver foreground/background events - which changes how the
+  // presentation gate behaves. The raw HOME path is the evidence; the verdict
+  // below is only a hint.
+  const char* home = std::getenv("HOME");
+  REXLOG_INFO("  HOME: {}", home ? home : "(unset)");
+  const bool live_container =
+      std::getenv("LC_HOME_PATH") != nullptr || std::getenv("LC_APP_GROUP_PATH") != nullptr;
+  if (live_container) {
+    REXLOG_INFO("  Container: LiveContainer detected (LC_* environment present)");
+  }
+}
 #endif
 
 // Once a close is requested the process must terminate even if a teardown
@@ -459,6 +512,9 @@ bool ReXApp::SetupEnvironment() {
   REXLOG_INFO("  Cache root:     {}", cache_root_.string());
 #if REX_PLATFORM_LINUX
   LogLinuxRuntimeDiagnostics();
+#endif
+#if defined(__APPLE__)
+  LogAppleRuntimeDiagnostics();
 #endif
 
   return true;
