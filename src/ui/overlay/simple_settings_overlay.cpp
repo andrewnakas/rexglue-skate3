@@ -1335,6 +1335,8 @@ void SimpleSettingsDialog::Hide() {
   // but they are now remembered, and take effect on the next launch instead of
   // vanishing.
   SaveVideo();
+  video_dirty_ = false;
+  video_dirty_age_ = 0.0f;
   visible_ = false;
   editing_text_ = false;
   SetDrawActive(false);
@@ -3078,7 +3080,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   auto enum_value = [](const RowSpec& row) -> int {
     return row.flag ? (*row.flag ? 1 : 0) : (row.index ? *row.index : 0);
   };
-  auto set_enum_value = [](RowSpec& row, int value) {
+  auto set_enum_value = [this](RowSpec& row, int value) {
     if (row.flag) {
       *row.flag = value != 0;
     } else if (row.index) {
@@ -3087,6 +3089,11 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     if (row.on_enum_change) {
       row.on_enum_change(value);
     }
+    // Persist shortly after the change settles, not just on close: a hang or a
+    // force-quit with the menu still open used to lose the edit, and on this
+    // port a hang while the menu is open is not hypothetical.
+    video_dirty_ = true;
+    video_dirty_age_ = 0.0f;
   };
   // Range semantics: directional stepping (dpad/arrows/chevrons)
   // CLAMPS at the ends - the matching chevron greys out there - while
@@ -3101,6 +3108,8 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       set_enum_value(row, std::clamp(value + dir, 0, count - 1));
     } else if (row.kind == RowSpec::kSlider && row.value) {
       *row.value = std::clamp(*row.value + dir * row.step, row.min, row.max);
+      video_dirty_ = true;
+      video_dirty_age_ = 0.0f;
       if (row.on_value_change) {
         row.on_value_change();
       }
@@ -3897,6 +3906,18 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       dl->AddText(bold, label_text_size, ImVec2(Snap(x), Snap(cy - label_extent.y * 0.5f)),
                   kColLegendLabel, glyph.label);
       x += label_extent.x + 26.0f * fs;
+    }
+  }
+
+  // Flush a pending edit once it has settled. Debounced rather than written on
+  // every step so that holding a direction through six options, or dragging the
+  // FOV slider, is one write instead of dozens of them to flash.
+  if (video_dirty_) {
+    video_dirty_age_ += io.DeltaTime;
+    if (video_dirty_age_ >= 0.4f) {
+      SaveVideo();
+      video_dirty_ = false;
+      video_dirty_age_ = 0.0f;
     }
   }
 

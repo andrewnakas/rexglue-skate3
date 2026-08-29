@@ -234,6 +234,10 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   float press_start_x_ = 0.0f;
   float press_start_y_ = 0.0f;
   float drag_start_scroll_ = 0.0f;  // content_scroll_ when the press began
+  // Staged video/quality edits are written shortly after they settle, so a hang
+  // or a force-quit with the menu open cannot lose them. Hide() flushes too.
+  bool video_dirty_ = false;
+  float video_dirty_age_ = 0.0f;
   // Swallow the first frame's cursor delta after Show: the pre-open cursor
   // position (or a cursor-mode warp) otherwise reads as mouse motion and
   // steals focus from the rail to whatever row it lands on.
