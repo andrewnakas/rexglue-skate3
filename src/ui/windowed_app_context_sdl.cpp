@@ -1,4 +1,5 @@
 #include <rex/ui/windowed_app_context_sdl.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/ui/window_sdl.h>
 
 #include <rex/logging.h>
@@ -66,6 +67,9 @@ int SDLWindowedAppContext::RunMainLoop() {
             // by the time a queued event is dispatched the app is already
             // suspended.
             SDLWindow::SetAllSurfacesPresentable(false, "entering the background");
+            // iOS revokes GPU access here; the command processor must stop
+            // treating the resulting submit failures as a dead device.
+            rex::graphics::SetAppForeground(false);
             [[fallthrough]];
           case SDL_EVENT_LOW_MEMORY:
             // Jetsam evicts suspended processes largest-first, and this one
@@ -88,6 +92,7 @@ int SDLWindowedAppContext::RunMainLoop() {
           case SDL_EVENT_WILL_ENTER_FOREGROUND:
           case SDL_EVENT_DID_ENTER_FOREGROUND:
             SDLWindow::SetAllSurfacesPresentable(true, "returning to the foreground");
+            rex::graphics::SetAppForeground(true);
             break;
           default:
             break;
