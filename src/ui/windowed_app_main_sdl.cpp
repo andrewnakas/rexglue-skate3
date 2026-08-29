@@ -210,10 +210,13 @@ std::vector<std::string> BuildIOSArguments() {
       // question as settled - that is where the lock contention would show, and
       // this measurement was taken at a menu.
       "--vulkan_mvk_synchronous_queue_submits=false",
-      // Per-window frame breakdown. One formatted line every 600 guest frames
-      // is far too little traffic to distort what it measures, and without it
-      // there is no way to tell a build that helped from one that did not.
-      "--skate3_native_render_scene_perf_log=true",
+      // Per-window frame breakdown. The formatted line is genuinely cheap -
+      // one every 600 guest frames - but the accounting behind it is not, and
+      // that part ran whether or not the line was ever printed. Off by default
+      // now; skate3_diagnostics turns it back on, and the Diagnostics switch on
+      // the System page turns THAT on without a rebuild, which is what this was
+      // compiled in to achieve in the first place.
+      "--skate3_native_render_scene_perf_log=false",
       // Mitigation for the WorldPresentation cross-thread use-after-free.
       "--skate3_instance_free_defer_ms=250",
 
@@ -248,24 +251,32 @@ std::vector<std::string> BuildIOSArguments() {
       // line every ten seconds or so, which cannot distort what it measures.
       // Together with [pace] and the "guest frame cap is now" line it shows
       // the cap, the rate the display accepts, and what actually came out.
-      "--presenter_present_cadence_log=true",
+      //
+      // The statistics behind it, though, are accumulated on every single
+      // guest-output refresh, so leaving this on bills every player for an
+      // instrument almost none of them will ever read. Under skate3_diagnostics.
+      "--presenter_present_cadence_log=false",
       // Breaks one paint into acquire / record / end-command-buffer / submit /
       // present microseconds, averaged over 120 frames. This is the instrument
       // that says WHERE a frame goes when [pace] reports 33 ms while the GPU
       // span is 4.6 ms and the command processor never waits on a fence - the
-      // state an A17 Pro is in as of 2026-08-28. Compiled in rather than left
-      // to Documents/user/ios_args.txt because the people who can reproduce
-      // this are strangers on the internet, and one duplicated key in that
-      // file silently discards every argument the app was built with.
+      // state an A17 Pro is in as of 2026-08-28. This used to be compiled ON,
+      // because the people who can reproduce that are strangers on the internet
+      // and one duplicated key in Documents/user/ios_args.txt silently discards
+      // every argument the app was built with - so asking them to edit that
+      // file was never a plan. The Diagnostics switch on the System page is the
+      // answer to it instead: one toggle, no file, no rebuild.
       //
-      // Averaged, so it is one line per 120 frames - about four seconds at the
-      // rate this fires at, and INFO never flushes inline.
-      "--vulkan_present_timing_log=true",
-      // Explicit rather than relying on the default: [pace] and [cp-sum] are
-      // INFO, and a settings.toml left at 'warning' on a device hides them
-      // with no indication that anything was suppressed. Costs nothing -
-      // log_flush_level=warn above means INFO never flushes inline.
-      "--log_level=info",
+      // Off matters here more than for the others, because the breakdown is ten
+      // steady_clock reads per present taken BEFORE anything checks whether the
+      // log is on.
+      "--vulkan_present_timing_log=false",
+      // Warn, not info. [pace] and [cp-sum] are INFO and so are silent by
+      // default now, which is the point: a shipped build should not narrate its
+      // own frame timing to flash. skate3_diagnostics raises this back to info
+      // along with the instruments that write at that level, so the switch
+      // produces a usable support log rather than an empty one.
+      "--log_level=warn",
 
       // ---- Cache budgets --------------------------------------------------
       // These default to 1280 and 1024 MB, which is 2.3 GB of caches before
