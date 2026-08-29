@@ -14,6 +14,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 
 #include <CLI/CLI.hpp>
@@ -363,6 +364,26 @@ bool SetFlagByName(std::string_view name, std::string_view value) {
   }
 
   return success;
+}
+
+namespace {
+// Names only, and never cleared: this is a record of what the operator asked
+// for at startup, not a mutable view of the registry.
+std::set<std::string, std::less<>>& ExplicitlySetNames() {
+  static std::set<std::string, std::less<>> names;
+  return names;
+}
+}  // namespace
+
+void NoteExplicitlySet(std::string_view name) {
+  std::lock_guard lock(GetRegistryMutex());
+  ExplicitlySetNames().emplace(name);
+}
+
+bool WasExplicitlySet(std::string_view name) {
+  std::lock_guard lock(GetRegistryMutex());
+  const auto& names = ExplicitlySetNames();
+  return names.find(name) != names.end();
 }
 
 std::string GetFlagByName(std::string_view name) {

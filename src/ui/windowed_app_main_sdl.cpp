@@ -131,6 +131,15 @@ std::vector<std::string> ApplyIOSArgumentOverrides(std::vector<std::string> args
   }
   args.insert(args.end(), overrides.begin(), overrides.end());
 
+  // These, and not the compiled-in arguments above them, are the operator's
+  // intent on this platform: BuildIOSArguments is a set of shipped defaults
+  // that reaches cvar::Init through the same argv. Anything applying a bundle
+  // of settings later - a video preset - has to leave these alone.
+  for (const std::string& override_arg : overrides) {
+    // key_of keeps the "--" it added above; the registry holds bare names.
+    rex::cvar::NoteExplicitlySet(std::string_view(key_of(override_arg)).substr(2));
+  }
+
   // Say so. An override that silently fails to apply is indistinguishable from
   // one that applied and did nothing, and telling those apart by watching frame
   // times is exactly the guessing this file exists to avoid. Logging is not up
@@ -520,6 +529,20 @@ int main(int argc, char** argv) {
   }
   argc = int(ios_argv.size());
   argv = ios_argv.data();
+#endif
+
+#if !REX_PLATFORM_IOS
+  // Everywhere else the command line IS the operator, so record it before it is
+  // parsed. Done here rather than inside cvar::Init because on iOS the same
+  // argv also carries BuildIOSArguments' defaults, which must not count.
+  for (int i = 1; i < argc; ++i) {
+    std::string_view arg(argv[i]);
+    if (arg.rfind("--", 0) != 0) {
+      continue;
+    }
+    arg.remove_prefix(2);
+    rex::cvar::NoteExplicitlySet(arg.substr(0, arg.find('=')));
+  }
 #endif
 
   auto remaining = rex::cvar::Init(argc, argv);

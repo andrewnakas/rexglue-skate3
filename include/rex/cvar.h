@@ -170,6 +170,23 @@ void UnregisterFlag(std::string_view name);
 bool SetFlagByName(std::string_view name, std::string_view value);
 std::string GetFlagByName(std::string_view name);
 
+/**
+ * Whether the operator named this flag on purpose, as opposed to it carrying a
+ * shipped default.
+ *
+ * There is no way to infer this from the value: a flag set to the same thing it
+ * already defaulted to is indistinguishable from one nobody touched, and that
+ * is exactly the case something applying a bundle of settings must not
+ * overwrite. So it is recorded at the point the argument is read instead.
+ *
+ * The distinction is per-platform and only the caller knows it. On a desktop it
+ * is the process command line. On iOS the command line also carries the
+ * compiled-in defaults from BuildIOSArguments, which are NOT operator intent -
+ * there it is the keys in Documents/user/ios_args.txt.
+ */
+void NoteExplicitlySet(std::string_view name);
+bool WasExplicitlySet(std::string_view name);
+
 // Typed registry query. Cross-DLL access path that does not require linking
 // the DLL where the cvar is defined. Slower than REXCVAR_GET (string parse +
 // hash lookup), so prefer REXCVAR_GET when the defining DLL is already on the
