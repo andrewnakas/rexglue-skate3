@@ -189,7 +189,6 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool mode_indicator_ = true;
   bool fps_counter_ = false;
   bool diagnostics_ = false;
-  bool hdr_ = true;
   bool audio_mute_ = false;
   bool rumble_ = true;
   float mnk_sensitivity_ = 1.0f;

@@ -85,9 +85,8 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 34> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 33> kOptionalSimpleSettingsCvars = {
     "skate3_diagnostics",
-    "skate3_native_render_scene_hdr",
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -177,36 +176,41 @@ struct GraphicsPreset {
   bool volumetrics;
   bool shadow_pcss;
   bool static_shadows;
-  bool hdr;
 };
 
 constexpr std::array<GraphicsPreset, 6> kGraphicsPresets = {{
     {"Custom", "Your own mix of the settings below.", 0, 0, 0, 0, 0, false, false, false, false,
-     false, false},
-    // Everything off, including the two things no other preset touches: the
-    // HDR intermediate and half the console's draw distance. It is deliberately
-    // uglier than Performance rather than slightly faster than it - the point
-    // is to have a rung that gives up the picture entirely, for a phone or a
-    // handheld that cannot hold any of the others.
+     false},
+    // Everything off, plus the thing no other preset touches: half the
+    // console's draw distance. Deliberately uglier than Performance rather than
+    // slightly faster than it - the point is a rung that gives up the picture
+    // entirely, for a phone that cannot hold any of the others.
+    //
+    // It does NOT turn off skate3_native_render_scene_hdr, though that reads
+    // like the obvious next thing to switch off. That cvar is an A/B parity
+    // toggle, not a quality setting: it is latched for the whole pipeline
+    // family, so changing it rebuilds every PSO, shader variant and render
+    // target, and off has never been exercised on iOS at all. It was in this
+    // preset briefly and the first device that ran it flickered.
     {"Potato",
      "Every frame the machine has, and the picture last. No shadows, no "
-     "effects, no HDR, and half the original draw distance.",
-     0, 0, 0, 0, 0, false, false, false, false, false, false},
+     "effects, and half the original draw distance.",
+     0, 0, 0, 0, 0, false, false, false, false, false},
     {"Performance",
      "Highest frame rate with the picture intact. Shadows on, screen-space "
      "effects off, original draw distance.",
-     0, 0, 3, 0, 1, false, false, false, false, true, true},
+     0, 0, 3, 0, 1, false, false, false, false, true},
     {"Balanced",
      "Ambient occlusion and bloom on with 2x MSAA, original draw distance.",
-     0, 1, 3, 1, 1, true, true, false, false, true, true},
+     0, 1, 3, 1, 1, true, true, false, false, true},
     {"Quality",
      "Everything on at native resolution: AO, bloom, sun shafts, soft shadows "
      "and double draw distance.",
-     0, 1, 5, 1, 2, true, true, true, true, true, true},
+     0, 1, 5, 1, 2, true, true, true, true, true},
     {"Ultra",
      "Quality plus 2x render scale and 4x MSAA. Four times the pixels in every "
      "full-screen target - expect to drop below 60 on modest GPUs.",
-     1, 2, 5, 2, 2, true, true, true, true, true, true},
+     1, 2, 5, 2, 2, true, true, true, true, true},
 }};
 
 // Audio device buffer sizes in sample frames (0 = backend default).
@@ -1279,8 +1283,6 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
   diagnostics_ = HasCvar("skate3_diagnostics") && rex::cvar::Query<bool>("skate3_diagnostics");
-  hdr_ = !HasCvar("skate3_native_render_scene_hdr") ||
-         rex::cvar::Query<bool>("skate3_native_render_scene_hdr");
   audio_mute_ = HasCvar("audio_mute") && rex::cvar::Query<bool>("audio_mute");
   rumble_ = HasCvar("hid_rumble_enabled") && rex::cvar::Query<bool>("hid_rumble_enabled");
   mnk_sensitivity_ = HasCvar("mnk_sensitivity")
@@ -1520,7 +1522,6 @@ int SimpleSettingsDialog::DetectGraphicsPreset() const {
     if (HasCvar("skate3_native_render_scene_shadow_static_casters") &&
         static_shadows_ != p.static_shadows)
       continue;
-    if (HasCvar("skate3_native_render_scene_hdr") && hdr_ != p.hdr) continue;
     return static_cast<int>(i);
   }
   return 0;
@@ -1615,7 +1616,6 @@ bool ApplyGraphicsPresetByName(std::string_view name) {
   SetPresetCvar("skate3_native_render_scene_haze", BoolText(p.volumetrics));
   SetPresetCvar("skate3_native_render_scene_shadow_pcss", BoolText(p.shadow_pcss));
   SetPresetCvar("skate3_native_render_scene_shadow_static_casters", BoolText(p.static_shadows));
-  SetPresetCvar("skate3_native_render_scene_hdr", BoolText(p.hdr));
 
   REXLOG_INFO("Video preset: {}", p.label);
   return true;
@@ -1644,7 +1644,6 @@ void SimpleSettingsDialog::ApplyGraphicsPreset(int preset) {
   volumetrics_ = p.volumetrics;
   shadow_pcss_ = p.shadow_pcss;
   static_shadows_ = p.static_shadows;
-  hdr_ = p.hdr;
   draw_distance_index_ = p.draw_distance;
 
   if (HasCvar("skate3_native_render_scene_ssao")) {
@@ -1665,12 +1664,6 @@ void SimpleSettingsDialog::ApplyGraphicsPreset(int preset) {
   }
   if (HasCvar("skate3_native_render_scene_shadow_static_casters")) {
     SetBoolCvar("skate3_native_render_scene_shadow_static_casters", static_shadows_);
-  }
-  // No row of its own: HDR is a preset-level decision. Turning it off changes
-  // the whole tonemap rather than removing one effect, which is not a knob to
-  // hand somebody without the rest of the Potato bundle around it.
-  if (HasCvar("skate3_native_render_scene_hdr")) {
-    SetBoolCvar("skate3_native_render_scene_hdr", hdr_);
   }
   if (HasCvar("skate3_draw_distance_scale")) {
     const std::string scale = std::to_string(kDrawDistanceScales[std::clamp(
