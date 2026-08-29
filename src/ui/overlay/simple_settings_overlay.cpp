@@ -32,8 +32,39 @@
 #include <rex/ui/window.h>
 #include <toml++/toml.hpp>
 
+namespace {
+// Phones and tablets are held far closer to the eye than a monitor, but they
+// also pack more pixels into far less glass - so a pixel-derived scale, which
+// is what the overlay uses, comes out much too small on them. 1.0 elsewhere.
+#if REX_PLATFORM_IOS
+constexpr double kDefaultMenuScale = 1.4;
+#else
+constexpr double kDefaultMenuScale = 1.0;
+#endif
+}  // namespace
+
+REXCVAR_DEFINE_DOUBLE(menu_scale, kDefaultMenuScale, "UI",
+                      "Size of the settings menu, as a multiple of its normal size. The "
+                      "menu's metrics are authored for a 1080p monitor and scaled by pixel "
+                      "height, which is the wrong measure on a handheld: an iPhone 13 mini "
+                      "renders the same 1080 lines onto 5.4 inches of glass, so the text "
+                      "arrives at roughly a third of the angular size and is genuinely hard "
+                      "to read. Nothing in the pixel count can detect that, so iOS defaults "
+                      "to 1.4. Raise it if the menu is still small on your device.")
+    .range(0.5, 3.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::ui {
 namespace {
+
+// iOS forbids an app relaunching itself, so there the action saves and quits
+// and the player reopens it by hand. Naming it "Restart" there promised
+// something that silently did not happen.
+#if REX_PLATFORM_IOS
+constexpr const char* kApplyActionName = "Apply & Quit";
+#else
+constexpr const char* kApplyActionName = "Apply & Restart";
+#endif
 
 constexpr std::array<int32_t, 3> kResolutionScales = {1, 2, 3};
 constexpr std::array<const char*, 3> kResolutionLabels = {"720p (1x)", "1440p (2x)",
@@ -1889,7 +1920,11 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.desc =
             "Which graphics API the game renders through. Both perform "
             "similarly - try the other one if you run into driver issues. "
+#if REX_PLATFORM_IOS
+            "Applied with Apply & Quit.";
+#else
             "Applied with Apply & Restart.";
+#endif
         row.options = {"DirectX 12", "Vulkan"};
         row.index = &graphics_api_index_;
         row.reset = [this] {
@@ -2696,7 +2731,11 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.label = "Game Language";
         row.desc =
             "Language the game boots in. Skate 3 reads this once at startup, so "
+#if REX_PLATFORM_IOS
+            "changing it needs Apply & Quit.";
+#else
             "changing it needs Apply & Restart.";
+#endif
         for (const char* label : kLanguageLabels) {
           row.options.push_back(label);
         }
@@ -2713,7 +2752,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       {
         RowSpec row;
         row.kind = RowSpec::kAction;
-        row.label = "Apply & Restart";
+        row.label = kApplyActionName;
         row.desc = pending
                        ? "Save the pending changes and restart the game to apply them."
                        : "No pending changes. Adjust a setting first, then apply it here.";
@@ -2923,7 +2962,14 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   // Uniform scale: design metrics are authored for 1080p. The menu proper
   // renders at a slightly reduced scale; the footer legend
   // keeps the base viewport scale.
-  const float base_s = std::clamp(frame_size.y / 1080.0f, 0.6f, 3.0f);
+  // The scale is derived from PIXELS, which is the right answer for a monitor
+  // and the wrong one for a phone: a 13 mini presents a 1080-tall image on a
+  // 5.4" panel, so metrics authored for a 24" 1080p display land at roughly a
+  // third of the angular size and the menu is genuinely hard to read. Nothing
+  // in the pixel count can tell you that - only the physical size can, and
+  // there is no portable way to ask. Hence a platform multiplier.
+  const float base_s =
+      std::clamp(frame_size.y / 1080.0f, 0.6f, 3.0f) * float(REXCVAR_GET(menu_scale));
   const float s = base_s * kMenuScale;
 
   // Quantize font sizes so the EM (size * upm / (hhea ascent - descent) -
@@ -3778,7 +3824,9 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     }
     if (pending) {
       AddTextJustified(dl, font, desc_size, ImVec2(text_x, text_y), wrap_w, kColWarn,
-                       "Changes are applied after a restart. Use Apply & Restart when ready.");
+                       (std::string("Changes are applied after a restart. Use ") +
+                        kApplyActionName + " when ready.")
+                           .c_str());
     }
   }
 
@@ -3793,16 +3841,18 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       glyphs.push_back({"Y", "Reset to Default", true});
       glyphs.push_back({"LB / RB", "Category", false});
       if (pending) {
-        glyphs.push_back({"X", "Apply & Restart", true});
+        glyphs.push_back({"X", kApplyActionName, true});
       }
     } else {
       glyphs.push_back({"Enter", "Select", false});
       glyphs.push_back({"Esc", "Back", false});
       glyphs.push_back({"R", "Reset to Default", false});
       glyphs.push_back({"Q / E", "Category", false});
+#if !REX_PLATFORM_IOS
       if (pending) {
-        glyphs.push_back({"F", "Apply & Restart", false});
+        glyphs.push_back({"F", kApplyActionName, false});
       }
+#endif
     }
     float x = rail_x;
     float glyph_size = font_px(15.0f * fs);

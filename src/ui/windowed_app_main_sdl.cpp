@@ -185,6 +185,31 @@ std::vector<std::string> BuildIOSArguments() {
       // somewhere else and does not fault. The alternative that also worked
       // was synchronous submits, which costs half the frame rate.
       "--vulkan_mvk_present_with_command_buffer=true",
+      // EXACTLY DOUBLE THE FRAME RATE. Measured on an iPhone 13 mini,
+      // 2026-08-28, same device, same scene, this line the only difference:
+      //
+      //   sync  (the old compiled default)   fps 30.5-31.0  p50 33.3ms
+      //   async (this)                       fps 58.6-59.6  p50 16.7ms
+      //   avg_submit_us                      16200  ->  2
+      //
+      // MoltenVK encodes a VkCommandBuffer into a MTLCommandBuffer inline
+      // inside vkQueueSubmit, and that encode costs a whole frame. Synchronous
+      // submits run it on the calling thread, so the paint thread spends the
+      // entire 16.7 ms budget inside the submit and can only ever produce every
+      // second vblank. Moving it off-thread makes the submit free.
+      //
+      // The comment further down this file argues the opposite, having measured
+      // async as WORSE for frame-to-frame consistency (a device-level lock held
+      // across the encode stalling resource creation). That is not what this
+      // measurement shows - async was also steadier, sd 0.53-1.9 ms against
+      // 3.5-65 ms. Note the earlier finding was made at a time when this was
+      // being set from device-args/ios_args.txt, which is why the dev phone has
+      // carried `=false` for months while every shipped build ran `=true`: the
+      // 13 mini's "locked 60" was measured on a configuration no player had.
+      // Retest under heavy world streaming before treating the consistency
+      // question as settled - that is where the lock contention would show, and
+      // this measurement was taken at a menu.
+      "--vulkan_mvk_synchronous_queue_submits=false",
       // Per-window frame breakdown. One formatted line every 600 guest frames
       // is far too little traffic to distort what it measures, and without it
       // there is no way to tell a build that helped from one that did not.
