@@ -224,6 +224,16 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   float content_scroll_ = 0.0f;       // scroll TARGET, locked to row boundaries
   float content_scroll_anim_ = -1.0f;  // drawn scroll, chases the target
   float wheel_accum_ = 0.0f;           // fractional wheel deltas -> whole notches
+  // Drag-to-scroll. The content column could only be scrolled by moving the
+  // selection or by a wheel, and a touchscreen has neither - so on iOS every
+  // row below the fold was simply unreachable, including the FPS counter on
+  // the Performance page. A press that travels turns into a scroll; one that
+  // does not is a click, which is why activation waits for the release.
+  bool press_dragged_ = false;      // this press has moved past the threshold
+  bool drag_in_content_ = false;    // ...and it started inside the content column
+  float press_start_x_ = 0.0f;
+  float press_start_y_ = 0.0f;
+  float drag_start_scroll_ = 0.0f;  // content_scroll_ when the press began
   // Swallow the first frame's cursor delta after Show: the pre-open cursor
   // position (or a cursor-mode warp) otherwise reads as mouse motion and
   // steals focus from the rail to whatever row it lands on.

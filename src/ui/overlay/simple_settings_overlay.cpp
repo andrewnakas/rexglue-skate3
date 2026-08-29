@@ -3204,7 +3204,22 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       std::abs(mouse.x - mouse_x_) > 2.0f || std::abs(mouse.y - mouse_y_) > 2.0f;
   mouse_x_ = mouse.x;
   mouse_y_ = mouse.y;
-  const bool clicked = ImGui::IsMouseClicked(0);
+  // Activation happens on RELEASE, and only if the press stayed put. A touch
+  // that travels is a scroll gesture (see the content column below), and
+  // activating on the press frame would toggle whatever row the finger
+  // happened to land on before it started moving. For a mouse this is also
+  // the conventional behaviour - press, slide off, release, nothing happens.
+  const float drag_threshold = 8.0f * s;
+  if (ImGui::IsMouseClicked(0)) {
+    press_start_x_ = mouse.x;
+    press_start_y_ = mouse.y;
+    press_dragged_ = false;
+  }
+  if (ImGui::IsMouseDown(0) && (std::abs(mouse.x - press_start_x_) > drag_threshold ||
+                                std::abs(mouse.y - press_start_y_) > drag_threshold)) {
+    press_dragged_ = true;
+  }
+  const bool clicked = ImGui::IsMouseReleased(0) && !press_dragged_;
   auto mouse_in = [&mouse](float x0, float y0, float x1, float y1) {
     return mouse.x >= x0 && mouse.x < x1 && mouse.y >= y0 && mouse.y < y1;
   };
@@ -3371,6 +3386,21 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   } else {
     wheel_accum_ = 0.0f;
   }
+  // Drag to scroll, which on a touchscreen is the ONLY way to reach a row
+  // below the fold - there is no wheel and no selection to move.
+  if (ImGui::IsMouseClicked(0)) {
+    drag_in_content_ =
+        mouse_in(content_x, columns_y, content_x + content_w, content_view_bottom);
+    drag_start_scroll_ = content_scroll_;
+  }
+  if (!ImGui::IsMouseDown(0)) {
+    drag_in_content_ = false;
+  }
+  // Content follows the finger 1:1, so the row under it stays under it.
+  const bool dragging = drag_in_content_ && press_dragged_;
+  if (dragging) {
+    content_scroll_ = drag_start_scroll_ - (mouse.y - press_start_y_);
+  }
   // Keep the focused row in view when navigating.
   if (zone_ == FocusZone::kContent && row_index_ >= 0 && (in.move_y != 0 || in.select)) {
     float y0 = row_y[row_index_];
@@ -3384,11 +3414,15 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   // Lock the resting position onto whole-row boundaries (rows and the view
   // share the same pitch, so max_scroll is itself a pitch multiple).
   content_scroll_ = std::clamp(content_scroll_, 0.0f, max_scroll);
-  content_scroll_ =
-      std::clamp(std::round(content_scroll_ / row_pitch) * row_pitch, 0.0f, max_scroll);
+  if (!dragging) {
+    content_scroll_ =
+        std::clamp(std::round(content_scroll_ / row_pitch) * row_pitch, 0.0f, max_scroll);
+  }
   // The drawn offset chases the locked target so scrolling slides smoothly
   // instead of rows popping between aligned positions.
-  if (content_scroll_anim_ < 0.0f) {
+  if (content_scroll_anim_ < 0.0f || dragging) {
+    // While dragging, the drawn position IS the target - chasing it would put
+    // the content behind the finger.
     content_scroll_anim_ = content_scroll_;
   }
   content_scroll_anim_ +=
