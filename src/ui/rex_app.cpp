@@ -495,10 +495,17 @@ bool ReXApp::SetupEnvironment() {
     REXLOG_INFO("Loaded config: {}", config_path_.filename().string());
 
   // Include the build title so support logs identify the exact build.
+  //
+  // WARN, and not because starting up is a problem. The shipped log level is
+  // warn, and a log whose first line does not say which build wrote it makes
+  // every other line in it unattributable - which is the exact failure v2.4.7
+  // was released to fix for crash reports. This is the one line that has to
+  // survive whatever level the log is set to, so it is logged at a level that
+  // survives. Nothing else in this banner needs that.
   if (auto build_title = GetBuildTitle(); !build_title.empty()) {
-    REXLOG_INFO("{} starting {}", GetName(), build_title);
+    REXLOG_WARN("{} starting {}", GetName(), build_title);
   } else {
-    REXLOG_INFO("{} starting", GetName());
+    REXLOG_WARN("{} starting", GetName());
   }
   if (!game_data_root_.empty()) {
     REXLOG_INFO("  Game directory: {}", game_data_root_.string());
