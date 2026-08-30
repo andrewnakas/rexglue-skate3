@@ -189,6 +189,11 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool mode_indicator_ = true;
   bool fps_counter_ = false;
   bool diagnostics_ = false;
+  // Apply confirmation. The apply action does not "apply" in any recoverable
+  // sense - on iOS it QUITS the app - and it is reachable from one gamepad
+  // button with no travel, so it asks first.
+  bool confirm_apply_ = false;
+  int confirm_button_ = 0;  // 0 = keep playing, 1 = apply
   bool audio_mute_ = false;
   bool rumble_ = true;
   float mnk_sensitivity_ = 1.0f;

@@ -41,7 +41,40 @@ constexpr double kDefaultMenuScale = 1.4;
 #else
 constexpr double kDefaultMenuScale = 1.0;
 #endif
+// A phone is not a small monitor. The three-column layout below (categories |
+// settings | description) is a desktop shape: at the iOS scale its two side
+// columns and the margins already account for most of a 1920-wide frame, so
+// the settings themselves get a narrow middle strip and the stepper circles
+// land at roughly a third of the 44pt Apple asks for. Raising menu_scale
+// cannot fix that - the columns just hit their clamps sooner.
+//
+// So on touch platforms the side columns go away entirely and the settings run
+// the full width. Categories move to a header that can be tapped through, and
+// the description moves under the list.
+// Off by default everywhere, including iOS: the three-column layout is the one
+// that was kept after seeing both on a phone. The single-column mode stays
+// available for a smaller screen than a 13 mini, or for anyone who would
+// rather have six large rows than twelve ordinary ones.
+constexpr bool kDefaultMenuCompact = false;
+
+// Touch sizing is a SEPARATE question from column count, and it survives the
+// layout choice. A finger needs a target a cursor does not, so the stepper
+// circles grow on a touch platform whichever layout is in use - they were the
+// part that was genuinely hard to hit, not the columns.
+#if REX_PLATFORM_IOS
+constexpr bool kTouchTargets = true;
+#else
+constexpr bool kTouchTargets = false;
+#endif
 }  // namespace
+
+REXCVAR_DEFINE_BOOL(menu_compact, kDefaultMenuCompact, "UI",
+                    "Single-column settings menu: full-width rows about half again as "
+                    "tall, categories in a header you tap through, and the description "
+                    "under the list instead of beside it. Fewer settings visible at once - "
+                    "roughly six rather than twelve - in exchange for much larger targets. "
+                    "Off (the default) is the three-column layout.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_DOUBLE(menu_scale, kDefaultMenuScale, "UI",
                       "Size of the settings menu, as a multiple of its normal size. The "
@@ -2925,7 +2958,10 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
                        ? "Save the pending changes and restart the game to apply them."
                        : "No pending changes. Adjust a setting first, then apply it here.";
         row.enabled = pending;
-        row.action = [this] { ApplyAndRestart(); };
+        row.action = [this] {
+          confirm_apply_ = true;
+          confirm_button_ = 0;
+        };
         rows.push_back(std::move(row));
       }
       {
@@ -2943,6 +2979,22 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.label = "Close Settings";
         row.desc = "Return to the game.";
         row.action = [this] { Hide(); };
+        rows.push_back(std::move(row));
+      }
+      // The compact layout has no rail for this to sit in, so it becomes a
+      // row - which also gives it a full-width target instead of a small one.
+      if (REXCVAR_GET(menu_compact)) {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "Close Game";
+        row.desc = "Quit Skate 3. Unsaved game progress is lost.";
+        row.danger = true;
+        row.action = [this] {
+          if (close_game_) {
+            Hide();
+            close_game_();
+          }
+        };
         rows.push_back(std::move(row));
       }
       break;
@@ -3108,6 +3160,8 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   ImFont* bold_ol = imgui_drawer()->ui_font_semibold_on_light()
                         ? imgui_drawer()->ui_font_semibold_on_light()
                         : bold;
+  ImFont* font_ol =
+      imgui_drawer()->ui_font_on_light() ? imgui_drawer()->ui_font_on_light() : font;
 
   // Layout frame: the letterboxed game image when the presenter reports one,
   // the full window otherwise (boot, no guest output yet). On non-16:9
@@ -3169,6 +3223,14 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   // ---- Input ----
   NavIntents in = GatherInput(io);
+  // While the confirmation is up it owns every input: the menu behind it is
+  // frozen rather than hidden, so the change being applied stays readable.
+  const bool confirm_open = confirm_apply_;
+  NavIntents confirm_in{};
+  if (confirm_open) {
+    confirm_in = in;
+    in = NavIntents{};
+  }
   if (editing_text_) {
     // The text field owns navigation; pad B cancels the edit.
     if (in.back) {
@@ -3330,7 +3392,13 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       row_activated_this_frame = true;
     }
     if (in.back) {
-      zone_ = FocusZone::kRail;
+      // No rail to fall back to in compact, so Back closes the menu - the same
+      // thing it does from the rail on a desktop.
+      if (REXCVAR_GET(menu_compact)) {
+        Hide();
+      } else {
+        zone_ = FocusZone::kRail;
+      }
     }
   }
   if (in.reset_default && zone_ == FocusZone::kContent && row_index_ >= 0 &&
@@ -3338,7 +3406,8 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     rows[row_index_].reset();
   }
   if (in.apply_restart && HasSettingsChanges()) {
-    ApplyAndRestart();
+    confirm_apply_ = true;
+    confirm_button_ = 0;
   }
   if (!visible_) {
     return;  // an action above closed the dialog
@@ -3359,31 +3428,46 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   // ---- Layout ----
   // Positional metrics are snapped to whole pixels (see Snap).
-  const float margin_x = Snap(std::max(56.0f * s, frame_size.x * 0.05f));
+  const bool compact = REXCVAR_GET(menu_compact);
+  const float margin_x = compact ? Snap(std::max(22.0f * s, frame_size.x * 0.025f))
+                                 : Snap(std::max(56.0f * s, frame_size.x * 0.05f));
   const float title_size = font_px(42.0f * s);
-  // Rail and description columns are equal-width.
-  const float rail_w = Snap(300.0f * s);
-  const float desc_w = Snap(300.0f * s);
-  const float col_gap = Snap(14.0f * s);
+  // Rail and description columns are equal-width. Both collapse in compact.
+  const float rail_w = compact ? 0.0f : Snap(300.0f * s);
+  const float col_gap = compact ? 0.0f : Snap(14.0f * s);
   const float footer_h = Snap(96.0f * base_s);
   const float content_bottom = Snap(frame_bottom - footer_h - 18.0f * s);
-  float content_w = frame_size.x - 2.0f * margin_x - rail_w - desc_w - 2.0f * col_gap;
-  content_w = Snap(std::clamp(content_w, 300.0f * s, 800.0f * s));
+  // Compact: one column, edge to edge. The whole point is row width, so
+  // nothing is capped and nothing is centered - a capped column on a phone is
+  // just a narrower column.
+  const float side_cols = compact ? 0.0f : Snap(300.0f * s) + rail_w + 2.0f * col_gap;
+  float content_w = frame_size.x - 2.0f * margin_x - side_cols;
+  if (!compact) {
+    content_w = Snap(std::clamp(content_w, 300.0f * s, 800.0f * s));
+  } else {
+    content_w = Snap(content_w);
+  }
   // The column widths are capped, so on wide displays the block would hug the
   // left margin - center the whole menu instead.
-  const float menu_total_w = rail_w + content_w + desc_w + 2.0f * col_gap;
+  const float menu_total_w = rail_w + content_w + (compact ? 0.0f : Snap(300.0f * s)) +
+                             2.0f * col_gap;
   const float rail_x =
       Snap(frame_pos.x + std::max(margin_x, (frame_size.x - menu_total_w) * 0.5f));
   const float content_x = rail_x + rail_w + col_gap;
-  const float desc_x = content_x + content_w + col_gap;
-  const float menu_right = desc_x + desc_w;
+  // Compact stacks the description under the list rather than beside it, so it
+  // shares the content column's x and width and gets its own y (desc_y).
+  const float desc_w = compact ? content_w : Snap(300.0f * s);
+  const float desc_x = compact ? content_x : (content_x + content_w + col_gap);
+  const float menu_right = compact ? (content_x + content_w) : (desc_x + desc_w);
 
-  const float row_h = Snap(52.0f * s);
+  // Touch targets, not cursor targets: a 52*s row is about 4mm of glass on a
+  // 13 mini once a 1080-line image is scaled onto 5.4 inches.
+  const float row_h = Snap((compact ? 76.0f : (kTouchTargets ? 62.0f : 52.0f)) * s);
   const float header_h = row_h;  // section bars match setting rows
   // Gap is 1 design px tighter than the 6*s focus ring, so the ring slightly
   // overlaps neighbours - it draws above them.
   const float row_gap = Snap(5.0f * s);
-  const float rail_item_h = Snap(52.0f * s);
+  const float rail_item_h = Snap((kTouchTargets ? 62.0f : 52.0f) * s);
   const float label_size = font_px(22.0f * s);
   const float value_size = font_px(22.0f * s);
   const float desc_size = font_px(20.0f * s);
@@ -3394,19 +3478,37 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   // close to the footer. Capacity is measured from the classic flow anchor
   // (title at 13% of the frame) so the slot count keeps its tuned value...
   const float row_pitch = row_h + row_gap;
+  // Compact: the category strip replaces the rail, so it needs its own band,
+  // and the description needs a fixed one under the list. Everything left over
+  // is rows - which is the whole trade, fewer but much larger.
+  const float tab_h = Snap(72.0f * s);
+  const float compact_desc_h = Snap(124.0f * s);
+  const float compact_title_y = Snap(frame_pos.y + 24.0f * s);
+  const float compact_tab_y = Snap(compact_title_y + title_size + 14.0f * s);
+  const float compact_columns_y = Snap(compact_tab_y + tab_h + 16.0f * s);
+  const float compact_rows_bottom = Snap(content_bottom - compact_desc_h - 14.0f * s);
+
   const float columns_y_flow = Snap(Snap(frame_pos.y + frame_size.y * 0.13f) + 74.0f * s);
-  const int view_rows = std::clamp(
-      static_cast<int>((content_bottom - columns_y_flow + row_gap) / row_pitch) - 1, 1,
-      kMaxViewRows);
+  const int view_rows =
+      compact ? std::clamp(static_cast<int>((compact_rows_bottom - compact_columns_y +
+                                             row_gap) /
+                                            row_pitch),
+                           1, kMaxViewRows)
+              : std::clamp(static_cast<int>((content_bottom - columns_y_flow + row_gap) /
+                                            row_pitch) -
+                               1,
+                           1, kMaxViewRows);
   const float content_view_h = view_rows * row_pitch - row_gap;
   // ...but the block itself is re-anchored so those slots sit vertically
   // CENTERED in the frame (the flow layout read visibly low). The title rides
   // 74*s above the block, the footer stays put; clamps keep the title
   // on-screen and the block clear of the footer.
-  const float columns_y = Snap(std::clamp(
-      frame_pos.y + (frame_size.y - content_view_h) * 0.5f,
-      std::min(frame_pos.y + 98.0f * s, columns_y_flow), content_bottom - content_view_h));
-  const float title_y = Snap(columns_y - 74.0f * s);
+  const float columns_y =
+      compact ? compact_columns_y
+              : Snap(std::clamp(frame_pos.y + (frame_size.y - content_view_h) * 0.5f,
+                                std::min(frame_pos.y + 98.0f * s, columns_y_flow),
+                                content_bottom - content_view_h));
+  const float title_y = compact ? compact_title_y : Snap(columns_y - 74.0f * s);
   const float content_view_bottom = columns_y + content_view_h;
   // Description panel height - also anchors Close Game's bottom edge. When
   // the category rail is long enough to push Close Game below the panel's
@@ -3416,13 +3518,17 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       Snap(columns_y + category_count * (rail_item_h + row_gap) - row_gap +
            45.0f * s) +
       rail_item_h;
-  const float desc_panel_h = Snap(std::min(
-      content_bottom - columns_y,
-      std::max(320.0f * s, rail_close_bottom - columns_y)));
+  const float desc_panel_h =
+      compact ? compact_desc_h
+              : Snap(std::min(content_bottom - columns_y,
+                              std::max(320.0f * s, rail_close_bottom - columns_y)));
+  // Beside the list on a desktop, under it on a phone.
+  const float desc_y = compact ? Snap(content_view_bottom + 14.0f * s) : columns_y;
 
   const ImVec2 mouse = io.MousePos;
   const bool mouse_moved =
-      std::abs(mouse.x - mouse_x_) > 2.0f || std::abs(mouse.y - mouse_y_) > 2.0f;
+      (std::abs(mouse.x - mouse_x_) > 2.0f || std::abs(mouse.y - mouse_y_) > 2.0f) &&
+      !confirm_open;
   mouse_x_ = mouse.x;
   mouse_y_ = mouse.y;
   // Activation happens on RELEASE, and only if the press stayed put. A touch
@@ -3440,7 +3546,8 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
                                 std::abs(mouse.y - press_start_y_) > drag_threshold)) {
     press_dragged_ = true;
   }
-  const bool clicked = ImGui::IsMouseReleased(0) && !press_dragged_;
+  const bool raw_clicked = ImGui::IsMouseReleased(0) && !press_dragged_;
+  const bool clicked = raw_clicked && !confirm_open;
   auto mouse_in = [&mouse](float x0, float y0, float x1, float y1) {
     return mouse.x >= x0 && mouse.x < x1 && mouse.y >= y0 && mouse.y < y1;
   };
@@ -3483,7 +3590,51 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     dl->AddText(bold, chip_size, ImVec2(Snap(chip_x0 + chip_pad), Snap(chip_y0 + 6.0f * s)),
                 kColWarn, chip_text);
   }
-  // ---- Left rail ----
+  // ---- Categories ----
+  // Compact draws them as a header strip that is tapped through; the desktop
+  // rail below is skipped entirely. Focus never lives on the strip - there is
+  // no room for a second focus zone on a phone and no need for one, since the
+  // shoulder buttons already page categories - so zone_ is pinned to the list.
+  if (compact) {
+    zone_ = FocusZone::kContent;
+    const float arrow_w = Snap(tab_h);
+    const float strip_x0 = content_x;
+    const float strip_x1 = content_x + content_w;
+    const ImVec2 lp0(strip_x0, compact_tab_y), lp1(strip_x0 + arrow_w, compact_tab_y + tab_h);
+    const ImVec2 rp0(strip_x1 - arrow_w, compact_tab_y), rp1(strip_x1, compact_tab_y + tab_h);
+    const bool l_hover = mouse_in(lp0.x, lp0.y, lp1.x, lp1.y);
+    const bool r_hover = mouse_in(rp0.x, rp0.y, rp1.x, rp1.y);
+    if (clicked && (l_hover || r_hover)) {
+      category_ = (category_ + (r_hover ? 1 : category_count - 1)) % category_count;
+      rail_sel_ = category_;
+      row_index_ = 0;
+      content_scroll_ = 0.0f;
+      content_scroll_anim_ = 0.0f;
+      highlight_anim_y_ = -1.0f;
+    }
+    DrawHardRoundedFill(dl, ImVec2(strip_x0, compact_tab_y),
+                        ImVec2(strip_x1, compact_tab_y + tab_h), 8.0f * s, kColRailPanel);
+    // Whole-square hit targets, so the tap area is the strip end rather than
+    // the glyph. The circle is only what it looks like.
+    DrawChevron(dl, ImVec2(lp0.x + arrow_w * 0.5f, compact_tab_y + tab_h * 0.5f),
+                Snap(17.0f * s), true, l_hover ? kColInteractHover : kColInteract, kColWhite,
+                true);
+    DrawChevron(dl, ImVec2(rp1.x - arrow_w * 0.5f, compact_tab_y + tab_h * 0.5f),
+                Snap(17.0f * s), false, r_hover ? kColInteractHover : kColInteract, kColWhite,
+                true);
+    AddTextCentered(dl, bold, font_px(26.0f * s),
+                    ImVec2(Snap((strip_x0 + strip_x1) * 0.5f),
+                           Snap(compact_tab_y + tab_h * 0.5f)),
+                    kColText, kCategories[category_].name);
+    // Position dots, so it reads as "one of six" rather than a lone label.
+    const float dot_r = Snap(3.0f * s);
+    const float dot_gap = Snap(14.0f * s);
+    float dot_x = Snap((strip_x0 + strip_x1) * 0.5f - (category_count - 1) * dot_gap * 0.5f);
+    for (int i = 0; i < category_count; ++i) {
+      dl->AddCircleFilled(ImVec2(dot_x + i * dot_gap, Snap(compact_tab_y + tab_h - 12.0f * s)),
+                          dot_r, i == category_ ? kColAccent : kColChevDisabledOnDark, 12);
+    }
+  } else {
   float rail_focus_target = -1.0f;
   for (int i = 0; i < category_count; ++i) {
     float y0 = columns_y + i * (rail_item_h + row_gap);
@@ -3577,6 +3728,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
                      focused ? IM_COL32(255, 250, 249, 255) : kColDanger, "Close Game");
   }
 
+  }
   // ---- Content column ----
   // Row geometry (in unscrolled space).
   std::vector<float> row_y(rows.size());
@@ -3677,7 +3829,11 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   }
 
   const float value_w = std::min(390.0f * s, content_w * 0.5f);
-  const float chevron_r = 13.0f * s;
+  // 13*s is a cursor target: on a 13 mini it lands around 2mm of glass, about a
+  // third of the 44pt minimum. Compact gets a real one, and the hit padding
+  // scales with it instead of being a flat 4px.
+  const float chevron_r = (kTouchTargets || compact ? 23.0f : 13.0f) * s;
+  const float chevron_pad = (kTouchTargets || compact) ? Snap(16.0f * s) : 4.0f;
 
   // Rows draw whenever they touch the view: at rest the pitch-locked scroll
   // means nothing is ever cut, and mid-animation the edge rows slide in and
@@ -3771,11 +3927,11 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         // greyed-out stepper must be swallowed, not fall through to the
         // row-body wrap-around cycle below.
         const bool left_hit =
-            mouse_in(left_center.x - chevron_r - 4.0f, cy - chevron_r - 4.0f,
-                     left_center.x + chevron_r + 4.0f, cy + chevron_r + 4.0f);
+            mouse_in(left_center.x - chevron_r - chevron_pad, cy - chevron_r - chevron_pad,
+                     left_center.x + chevron_r + chevron_pad, cy + chevron_r + chevron_pad);
         const bool right_hit =
-            mouse_in(right_center.x - chevron_r - 4.0f, cy - chevron_r - 4.0f,
-                     right_center.x + chevron_r + 4.0f, cy + chevron_r + 4.0f);
+            mouse_in(right_center.x - chevron_r - chevron_pad, cy - chevron_r - chevron_pad,
+                     right_center.x + chevron_r + chevron_pad, cy + chevron_r + chevron_pad);
         bool left_hover = can_left && left_hit;
         bool right_hover = can_right && right_hit;
         const ImU32 chev_disabled = focused ? kColChevDisabledOnDark : kColChevDisabled;
@@ -3952,13 +4108,13 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   {
     const float panel_h = desc_panel_h;
     const float header_bar_h = row_h;  // header bar matches a settings row
-    dl->AddRectFilled(ImVec2(desc_x, columns_y), ImVec2(desc_x + desc_w, columns_y + header_bar_h),
+    dl->AddRectFilled(ImVec2(desc_x, desc_y), ImVec2(desc_x + desc_w, desc_y + header_bar_h),
                       kColAccent, 0.0f);
-    AddTextVCentered(dl, bold_ol, label_size, desc_x + 18.0f * s, columns_y + header_bar_h * 0.5f,
+    AddTextVCentered(dl, bold_ol, label_size, desc_x + 18.0f * s, desc_y + header_bar_h * 0.5f,
                      kColAccentDark, "Description");
-    dl->AddRectFilled(ImVec2(desc_x, columns_y + header_bar_h),
-                      ImVec2(desc_x + desc_w, columns_y + panel_h), kColDescPanel, 0.0f);
-    dl->AddRect(ImVec2(desc_x, columns_y), ImVec2(desc_x + desc_w, columns_y + panel_h),
+    dl->AddRectFilled(ImVec2(desc_x, desc_y + header_bar_h),
+                      ImVec2(desc_x + desc_w, desc_y + panel_h), kColDescPanel, 0.0f);
+    dl->AddRect(ImVec2(desc_x, desc_y), ImVec2(desc_x + desc_w, desc_y + panel_h),
                 kColRailBorder, 0.0f);
 
     const char* desc_text = kCategories[category_].desc;
@@ -3979,7 +4135,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       }
     }
     float text_x = Snap(desc_x + 14.0f * s);
-    float text_y = Snap(columns_y + header_bar_h + 14.0f * s);
+    float text_y = Snap(desc_y + header_bar_h + 14.0f * s);
     float wrap_w = desc_w - 28.0f * s;
     text_y = Snap(text_y +
                   AddTextJustified(dl, font, desc_size, ImVec2(text_x, text_y), wrap_w,
@@ -4058,6 +4214,112 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       dl->AddText(bold, label_text_size, ImVec2(Snap(x), Snap(cy - label_extent.y * 0.5f)),
                   kColLegendLabel, glyph.label);
       x += label_extent.x + 26.0f * fs;
+    }
+  }
+
+  // ---- Apply confirmation --------------------------------------------
+  // Drawn last so it sits above the menu, and over its own scrim so the
+  // frozen menu behind it reads as unavailable rather than merely inactive.
+  //
+  // This exists because the action is not reversible and does not announce
+  // itself. On iOS it is called "Apply & Quit" and it means it: the app
+  // closes. It is also bound to a bare gamepad X, so the distance between
+  // browsing the menu and losing the session was one mis-press.
+  if (confirm_apply_) {
+    const bool ios_quits = REX_PLATFORM_IOS != 0;
+
+    const float card_w = Snap(std::min(820.0f * s, frame_size.x - 96.0f * s));
+    const float pad = Snap(34.0f * s);
+    const float btn_h = Snap(96.0f * s);   // a comfortable finger, not a cursor
+    const float btn_gap = Snap(18.0f * s);
+    const float title_sz = font_px(34.0f * s);
+    const float body_sz = font_px(21.0f * s);
+    const float btn_sz = font_px(24.0f * s);
+
+    const char* heading = ios_quits ? "Apply and close the game?" : "Apply and restart?";
+    const char* body =
+        ios_quits
+            ? "These settings only take effect when the game starts, so Skate 3 has "
+              "to close. Your progress and settings are saved - open it again to "
+              "carry on."
+            : "These settings only take effect when the game starts, so it will "
+              "restart now. Your progress and settings are saved.";
+    const char* yes_label = kApplyActionName;
+    const char* no_label = "Keep Playing";
+
+    const float text_w = card_w - 2.0f * pad;
+    const ImVec2 body_extent =
+        font->CalcTextSizeA(body_sz, FLT_MAX, text_w, body);
+    const float card_h =
+        Snap(pad + title_sz * 1.25f + 16.0f * s + body_extent.y + pad + btn_h + pad);
+    const float card_x = Snap(frame_pos.x + (frame_size.x - card_w) * 0.5f);
+    const float card_y = Snap(frame_pos.y + (frame_size.y - card_h) * 0.5f);
+
+    // Scrim over the whole window, not just the frame: the letterboxed bars
+    // are still screen, and a half-dimmed screen reads as a glitch.
+    dl->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize, IM_COL32(4, 6, 8, 170));
+    DrawHardRoundedFill(dl, ImVec2(card_x, card_y), ImVec2(card_x + card_w, card_y + card_h),
+                        10.0f * s, kColPanel);
+
+    AddTextVCentered(dl, bold_ol, title_sz, card_x + pad, card_y + pad + title_sz * 0.5f,
+                     kColRowText, heading);
+    dl->AddText(font_ol, body_sz,
+                ImVec2(Snap(card_x + pad), Snap(card_y + pad + title_sz * 1.25f + 16.0f * s)),
+                kColRowText, body, nullptr, text_w);
+
+    // Two equal targets. "Keep Playing" is first and focused by default: the
+    // safe option should be the one a reflex press lands on.
+    const float btn_w = Snap((card_w - 2.0f * pad - btn_gap) * 0.5f);
+    const float btn_y = Snap(card_y + card_h - pad - btn_h);
+    const float no_x = Snap(card_x + pad);
+    const float yes_x = Snap(no_x + btn_w + btn_gap);
+
+    const bool no_hover = mouse_in(no_x, btn_y, no_x + btn_w, btn_y + btn_h);
+    const bool yes_hover = mouse_in(yes_x, btn_y, yes_x + btn_w, btn_y + btn_h);
+    if (no_hover || yes_hover) {
+      confirm_button_ = yes_hover ? 1 : 0;
+    }
+    if (confirm_in.move_x != 0) {
+      confirm_button_ = confirm_button_ == 0 ? 1 : 0;
+    }
+
+    for (int b = 0; b < 2; ++b) {
+      const float bx = b == 0 ? no_x : yes_x;
+      const bool is_focus = confirm_button_ == b;
+      const bool is_hover = b == 0 ? no_hover : yes_hover;
+      const ImVec2 p0(bx, btn_y), p1(bx + btn_w, btn_y + btn_h);
+      // The destructive option carries the colour; the safe one stays neutral.
+      const ImU32 fill = b == 1 ? (is_hover ? kColInteractHover : kColInteract)
+                                : (is_hover ? kColPanelHover : kColSelFill);
+      DrawHardRoundedFill(dl, p0, p1, 8.0f * s, fill);
+      if (is_focus) {
+        DrawFocusHighlight(dl, p0, p1, s);
+      }
+      AddTextCentered(dl, bold, btn_sz,
+                      ImVec2(Snap(bx + btn_w * 0.5f), Snap(btn_y + btn_h * 0.5f)),
+                      b == 1 ? kColWhite : kColSelText, b == 1 ? yes_label : no_label);
+    }
+
+    const bool activated =
+        confirm_in.select || (raw_clicked && (no_hover || yes_hover));
+    // Back/B cancels, and so does a tap anywhere outside the card - the
+    // gesture everyone already tries on a phone.
+    const bool cancelled =
+        confirm_in.back ||
+        (raw_clicked && !no_hover && !yes_hover &&
+         !mouse_in(card_x, card_y, card_x + card_w, card_y + card_h));
+
+    if (cancelled) {
+      confirm_apply_ = false;
+    } else if (activated) {
+      const bool yes = raw_clicked ? yes_hover : confirm_button_ == 1;
+      confirm_apply_ = false;
+      if (yes) {
+        ApplyAndRestart();
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        return;  // the app is going away; touch nothing else this frame
+      }
     }
   }
 
