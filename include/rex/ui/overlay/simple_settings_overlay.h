@@ -133,6 +133,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // System page. Not shared with Video/Performance: this one is not a quality
   // setting, it is the switch that makes the build instrument itself.
   void PushDiagnosticsRow(std::vector<RowSpec>& rows);
+  void PushMenuScaleRow(std::vector<RowSpec>& rows);
+  void PushTouchControlsRow(std::vector<RowSpec>& rows);
   void PushFpsCounterRow(std::vector<RowSpec>& rows);
   // One controller-chord row. `allow_guide` offers the Guide button, which
   // only the level picker can use.
@@ -189,6 +191,8 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool mode_indicator_ = true;
   bool fps_counter_ = false;
   bool diagnostics_ = false;
+  bool touch_controls_ = true;
+  int menu_scale_index_ = 1;
   // Apply confirmation. The apply action does not "apply" in any recoverable
   // sense - on iOS it QUITS the app - and it is reachable from one gamepad
   // button with no travel, so it asks first.

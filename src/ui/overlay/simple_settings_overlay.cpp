@@ -57,6 +57,18 @@ constexpr double kDefaultMenuScale = 1.0;
 // rather have six large rows than twelve ordinary ones.
 constexpr bool kDefaultMenuCompact = false;
 
+// Rows that only mean something where there is a desktop window system - a
+// window you can move, more than one monitor, a mouse. On a phone they are
+// inert at best and misleading at worst: the `monitor` cvar is read only by
+// window_win.cpp and window_gtk.cpp, so on the SDL path it does nothing at all,
+// and vsync is force-set by BuildIOSArguments, which beats settings.toml - so
+// the row appears to change something and is silently reverted next launch.
+#if REX_PLATFORM_IOS
+constexpr bool kDesktopWindowing = false;
+#else
+constexpr bool kDesktopWindowing = true;
+#endif
+
 // Touch sizing is a SEPARATE question from column count, and it survives the
 // layout choice. A finger needs a target a cursor does not, so the stepper
 // circles grow on a touch platform whichever layout is in use - they were the
@@ -118,8 +130,10 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 33> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 35> kOptionalSimpleSettingsCvars = {
     "skate3_diagnostics",
+    "menu_scale",
+    "touch_controls",
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -152,6 +166,12 @@ constexpr std::array<std::string_view, 33> kOptionalSimpleSettingsCvars = {
     "audio_mute",
     "audio_device_sample_frames",
     "user_language"};
+
+// Menu size multipliers. iOS defaults to 1.4 (see kDefaultMenuScale); the list
+// spans small screens through to reading it at arm's length on a TV.
+constexpr std::array<const char*, 6> kMenuScaleLabels = {"Small", "Normal", "Large",
+                                                         "Larger", "Huge", "Biggest"};
+constexpr std::array<double, 6> kMenuScales = {0.8, 1.0, 1.2, 1.4, 1.7, 2.0};
 
 // MSAA sample counts for the native scene renderer.
 constexpr std::array<const char*, 4> kMsaaLabels = {"Off", "2x", "4x", "8x"};
@@ -1316,6 +1336,10 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
   diagnostics_ = HasCvar("skate3_diagnostics") && rex::cvar::Query<bool>("skate3_diagnostics");
+  touch_controls_ = !HasCvar("touch_controls") || rex::cvar::Query<bool>("touch_controls");
+  menu_scale_index_ = HasCvar("menu_scale")
+                          ? NearestValueIndex(kMenuScales, rex::cvar::Query<double>("menu_scale"))
+                          : 1;
   audio_mute_ = HasCvar("audio_mute") && rex::cvar::Query<bool>("audio_mute");
   rumble_ = HasCvar("hid_rumble_enabled") && rex::cvar::Query<bool>("hid_rumble_enabled");
   mnk_sensitivity_ = HasCvar("mnk_sensitivity")
@@ -2063,6 +2087,59 @@ void SimpleSettingsDialog::PushFpsCounterRow(std::vector<RowSpec>& rows) {
   }
 }
 
+void SimpleSettingsDialog::PushMenuScaleRow(std::vector<RowSpec>& rows) {
+  if (!HasCvar("menu_scale")) {
+    return;
+  }
+  RowSpec row;
+  row.kind = RowSpec::kEnum;
+  row.label = "Menu Size";
+  row.desc =
+      "How large this menu is drawn. Its layout is authored for a 1080p monitor "
+      "and scaled by pixel height, which comes out small on a handheld - raise "
+      "it if the text is hard to read. Applies immediately.";
+  for (const char* label : kMenuScaleLabels) {
+    row.options.push_back(label);
+  }
+  row.index = &menu_scale_index_;
+  row.on_enum_change = [this](int value) {
+    value = std::clamp(value, 0, static_cast<int>(kMenuScales.size()) - 1);
+    rex::cvar::SetFlagByName("menu_scale", std::to_string(kMenuScales[value]));
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  row.reset = [this] {
+    menu_scale_index_ = NearestValueIndex(kMenuScales, CvarDefaultDouble("menu_scale", 1.0));
+    rex::cvar::SetFlagByName("menu_scale", std::to_string(kMenuScales[menu_scale_index_]));
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  rows.push_back(std::move(row));
+}
+
+void SimpleSettingsDialog::PushTouchControlsRow(std::vector<RowSpec>& rows) {
+  if (!HasCvar("touch_controls")) {
+    return;
+  }
+  RowSpec row;
+  row.kind = RowSpec::kEnum;
+  row.label = "On-Screen Controls";
+  row.desc =
+      "Show the touch pad overlay and drive the game from it. It already steps "
+      "aside while a physical controller is connected, so this is for turning it "
+      "off entirely.";
+  row.options = {"Off", "On"};
+  row.flag = &touch_controls_;
+  row.on_enum_change = [this](int value) {
+    SetBoolCvar("touch_controls", value != 0);
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  row.reset = [this] {
+    touch_controls_ = CvarDefaultBool("touch_controls", true);
+    SetBoolCvar("touch_controls", touch_controls_);
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  rows.push_back(std::move(row));
+}
+
 void SimpleSettingsDialog::PushDiagnosticsRow(std::vector<RowSpec>& rows) {
   if (HasCvar("skate3_diagnostics")) {
     RowSpec row;
@@ -2112,7 +2189,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
   switch (category) {
     case 0: {  // Video
       header("Display");
-      if (HasGraphicsApiChoice()) {
+      if (kDesktopWindowing && HasGraphicsApiChoice()) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "Graphics API";
@@ -2132,7 +2209,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (!device_list_.device_names.empty() && HasCvar(device_list_.cvar_name)) {
+      if (kDesktopWindowing && !device_list_.device_names.empty() && HasCvar(device_list_.cvar_name)) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "Graphics Device";
@@ -2153,7 +2230,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      {
+      if (kDesktopWindowing) {
         // Read-only: where frames are actually displayed, so the difference
         // from Render Scale (the internal render size) is visible in the
         // menu. Single option = the steppers grey out on their own; the row
@@ -2190,7 +2267,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      {
+      if (kDesktopWindowing) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "Fullscreen";
@@ -2200,7 +2277,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] { fullscreen_ = CvarDefaultBool("fullscreen", true); };
         rows.push_back(std::move(row));
       }
-      if (HasCvar("monitor")) {
+      if (kDesktopWindowing && HasCvar("monitor")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "Monitor";
@@ -2214,7 +2291,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      {
+      if (kDesktopWindowing) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "V-Sync";
@@ -2227,7 +2304,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] { vsync_ = CvarDefaultBool("vsync", false); };
         rows.push_back(std::move(row));
       }
-      {
+      if (kDesktopWindowing) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "VRR / Tearing";
@@ -2569,8 +2646,11 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       break;
     }
     case 2: {  // Controls
+      // First on the page: on a phone it is the only input device most
+      // players have, and it was not reachable from the menu at all before.
+      PushTouchControlsRow(rows);
       header("Mouse & Keyboard");
-      {
+      if (kDesktopWindowing) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "Mouse & Keyboard Mode";
@@ -2580,7 +2660,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.reset = [this] { mnk_mode_ = CvarDefaultBool("mnk_mode", false); };
         rows.push_back(std::move(row));
       }
-      {
+      if (kDesktopWindowing) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "Capture Mouse";
@@ -2594,7 +2674,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasCvar("mnk_sensitivity")) {
+      if (kDesktopWindowing && HasCvar("mnk_sensitivity")) {
         RowSpec row;
         row.kind = RowSpec::kSlider;
         row.label = "Mouse Sensitivity";
@@ -2721,7 +2801,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasInputBackendChoice()) {
+      if (kDesktopWindowing && HasInputBackendChoice()) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
         row.label = "Controller Backend";
@@ -2947,6 +3027,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
+      header("Interface");
+      PushMenuScaleRow(rows);
       header("Diagnostics");
       PushDiagnosticsRow(rows);
       header("Session");
