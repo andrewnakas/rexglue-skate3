@@ -1,6 +1,7 @@
 #include <rex/input/touch_input_driver.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -9,6 +10,21 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+
+REXCVAR_DEFINE_DOUBLE(touch_stick_size, 1.25, "Input",
+                      "Size of the on-screen thumbsticks, as a multiple of the original. "
+                      "Bigger sticks give the thumb more room and are easier to land on "
+                      "without looking.")
+    .range(0.75, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(touch_stick_saturation, 0.72, "Input",
+                      "How far the thumb has to travel for FULL stick deflection, as a "
+                      "fraction of the stick's radius. 1.0 means the very edge, which is "
+                      "what made a hard turn hard to reach - the thumb runs out of comfort "
+                      "before the stick runs out of travel. Lower saturates sooner.")
+    .range(0.4, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(touch_controls, true, "Input",
                     "Show on-screen touch controls and drive the guest pad from them while no "
@@ -177,8 +193,14 @@ TouchVisualState Sample() {
     // Offset from the stick's centre, normalised to its radius and clamped to
     // the unit circle. y is flipped: screen y grows downward, a thumbstick's
     // does not.
-    float dx = (f.x - c.centre_x) * aspect / c.radius;
-    float dy = -(f.y - c.centre_y) / c.radius;
+    // Normalise against a FRACTION of the radius, so full deflection arrives
+    // before the rim. Dividing by the radius itself meant a hard turn needed
+    // the thumb at the very edge of the well - reachable on paper, awkward in
+    // practice, and the thing players reported as not being able to turn fully.
+    const float travel = c.radius * std::clamp(float(REXCVAR_GET(touch_stick_saturation)),
+                                               0.4f, 1.0f);
+    float dx = (f.x - c.centre_x) * aspect / travel;
+    float dy = -(f.y - c.centre_y) / travel;
     const float len = std::sqrt(dx * dx + dy * dy);
     if (len > 1.0f) {
       dx /= len;
@@ -206,7 +228,25 @@ const TouchControl* TouchLayout(size_t* count_out) {
   if (count_out != nullptr) {
     *count_out = std::size(kLayout);
   }
-  return kLayout;
+  // The sticks are resized here rather than at each use site so that the
+  // renderer, the hit test and the deflection maths cannot disagree about how
+  // big a stick is - they all read this.
+  static std::array<TouchControl, std::size(kLayout)> scaled;
+  static float applied = -1.0f;
+  const float scale = float(REXCVAR_GET(touch_stick_size));
+  if (scale != applied) {
+    applied = scale;
+    for (size_t i = 0; i < std::size(kLayout); ++i) {
+      scaled[i] = kLayout[i];
+      if (scaled[i].is_stick) {
+        // Capped so a large stick cannot walk off the bottom of the screen:
+        // the centre sits at 0.72 of the height and the radius is a fraction of
+        // the shorter side, so anything past ~0.27 would clip.
+        scaled[i].radius = std::min(kLayout[i].radius * scale, 0.26f);
+      }
+    }
+  }
+  return scaled.data();
 }
 
 TouchVisualState GetTouchVisualState() { return Sample(); }

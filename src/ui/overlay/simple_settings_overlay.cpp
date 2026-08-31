@@ -130,10 +130,11 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 35> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 36> kOptionalSimpleSettingsCvars = {
     "skate3_diagnostics",
     "menu_scale",
     "touch_controls",
+    "touch_stick_size",
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -172,6 +173,11 @@ constexpr std::array<std::string_view, 35> kOptionalSimpleSettingsCvars = {
 constexpr std::array<const char*, 6> kMenuScaleLabels = {"Small", "Normal", "Large",
                                                          "Larger", "Huge", "Biggest"};
 constexpr std::array<double, 6> kMenuScales = {0.8, 1.0, 1.2, 1.4, 1.7, 2.0};
+
+// On-screen thumbstick size, as a multiple of the original.
+constexpr std::array<const char*, 5> kTouchStickLabels = {"Small", "Normal", "Large",
+                                                          "Larger", "Huge"};
+constexpr std::array<double, 5> kTouchStickSizes = {0.85, 1.0, 1.25, 1.5, 1.8};
 
 // MSAA sample counts for the native scene renderer.
 constexpr std::array<const char*, 4> kMsaaLabels = {"Off", "2x", "4x", "8x"};
@@ -1337,6 +1343,10 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
   diagnostics_ = HasCvar("skate3_diagnostics") && rex::cvar::Query<bool>("skate3_diagnostics");
   touch_controls_ = !HasCvar("touch_controls") || rex::cvar::Query<bool>("touch_controls");
+  touch_stick_index_ =
+      HasCvar("touch_stick_size")
+          ? NearestValueIndex(kTouchStickSizes, rex::cvar::Query<double>("touch_stick_size"))
+          : 1;
   menu_scale_index_ = HasCvar("menu_scale")
                           ? NearestValueIndex(kMenuScales, rex::cvar::Query<double>("menu_scale"))
                           : 1;
@@ -2140,6 +2150,36 @@ void SimpleSettingsDialog::PushTouchControlsRow(std::vector<RowSpec>& rows) {
   rows.push_back(std::move(row));
 }
 
+void SimpleSettingsDialog::PushTouchStickSizeRow(std::vector<RowSpec>& rows) {
+  if (!HasCvar("touch_stick_size")) {
+    return;
+  }
+  RowSpec row;
+  row.kind = RowSpec::kEnum;
+  row.label = "Stick Size";
+  row.desc =
+      "How big the two on-screen thumbsticks are. Larger sticks give your thumb "
+      "more room and are easier to find without looking down. Applies "
+      "immediately.";
+  for (const char* label : kTouchStickLabels) {
+    row.options.push_back(label);
+  }
+  row.index = &touch_stick_index_;
+  row.on_enum_change = [this](int value) {
+    value = std::clamp(value, 0, static_cast<int>(kTouchStickSizes.size()) - 1);
+    rex::cvar::SetFlagByName("touch_stick_size", std::to_string(kTouchStickSizes[value]));
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  row.reset = [this] {
+    touch_stick_index_ =
+        NearestValueIndex(kTouchStickSizes, CvarDefaultDouble("touch_stick_size", 1.25));
+    rex::cvar::SetFlagByName("touch_stick_size",
+                             std::to_string(kTouchStickSizes[touch_stick_index_]));
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  rows.push_back(std::move(row));
+}
+
 void SimpleSettingsDialog::PushDiagnosticsRow(std::vector<RowSpec>& rows) {
   if (HasCvar("skate3_diagnostics")) {
     RowSpec row;
@@ -2649,6 +2689,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       // First on the page: on a phone it is the only input device most
       // players have, and it was not reachable from the menu at all before.
       PushTouchControlsRow(rows);
+      PushTouchStickSizeRow(rows);
       header("Mouse & Keyboard");
       if (kDesktopWindowing) {
         RowSpec row;
