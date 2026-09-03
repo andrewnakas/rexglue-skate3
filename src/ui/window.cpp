@@ -140,8 +140,12 @@ float Window::AutoFrameCapHz(float refresh_hz) {
   if (refresh_hz < 30.0f) {
     return 0.0f;
   }
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
   // No margin here. The margin below buys slack against TEARING - a present
+  // arriving inside the panel's minimum refresh period. On Android the
+  // presenter runs FIFO (see BuildAndroidArguments: vsync on, no immediate or
+  // mailbox), which is display-synced by definition, so the same reasoning as
+  // iOS applies there.
   // arriving inside the panel's minimum refresh period - and that cannot
   // happen on iOS: CAMetalLayer has no displaySyncEnabled (it is macOS-only),
   // so presents are always display-synced whatever present mode MoltenVK

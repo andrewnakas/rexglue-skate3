@@ -19,6 +19,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/atomic_ref.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
@@ -1491,11 +1492,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       auto* slot =
           reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
       const uint32_t current = xenos::GpuSwap(
-          std::atomic_ref<uint32_t>(*slot).load(std::memory_order_acquire),
+          rex::AtomicRef<uint32_t>(*slot).load(std::memory_order_acquire),
           static_cast<xenos::Endian>(poll_reg_addr & 0x3));
       if ((current & mask) != ref) {
         const uint32_t published = (current & ~mask) | (ref & mask);
-        std::atomic_ref<uint32_t>(*slot).store(
+        rex::AtomicRef<uint32_t>(*slot).store(
             xenos::GpuSwap(published, static_cast<xenos::Endian>(poll_reg_addr & 0x3)),
             std::memory_order_release);
         static uint64_t s_acked = 0;
@@ -1519,7 +1520,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       // compiler every right to hoist it out of the loop and the CPU no reason
       // to observe the other thread's store. SyncMemory() only ever ran on the
       // sleeping branch below, so the busy-wait branch had no barrier at all.
-      value = std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(
+      value = rex::AtomicRef<uint32_t>(*reinterpret_cast<uint32_t*>(
                                             memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3))))
                   .load(std::memory_order_acquire);
       trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr & ~uint32_t(0x3)), sizeof(uint32_t));

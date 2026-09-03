@@ -408,6 +408,24 @@ void SDLWindow::SetAllSurfacesPresentable(bool presentable, const char* reason) 
   }
 }
 
+#if REX_PLATFORM_ANDROID
+void SDLWindow::DetachAllSurfaces(const char* reason) {
+  for (auto& [window_id, window] : WindowMap()) {
+    window->OnSurfaceChanged(false);
+  }
+  REXLOG_INFO("surface detached from every window: {}", reason);
+}
+
+void SDLWindow::ReattachAllSurfaces(const char* reason) {
+  for (auto& [window_id, window] : WindowMap()) {
+    window->OnSurfaceChanged(true);
+    // Nothing else will ask: the paints requested while detached were dropped.
+    window->RequestPaint();
+  }
+  REXLOG_INFO("surface reattached to every window: {}", reason);
+}
+#endif
+
 void SDLWindow::HandleSDLEvent(const SDL_Event& event) {
   SDL_WindowID window_id = 0;
   switch (event.type) {
@@ -616,7 +634,10 @@ std::unique_ptr<Surface> SDLWindow::CreateSurfaceImpl(Surface::TypeFlags allowed
   auto* native_window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
       SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
   if (!native_window) {
-    REXLOG_ERROR("SDLWindow: no ANativeWindow behind the SDL window");
+    // Not an error while the activity is in the background: SDL clears the
+    // pointer when Android destroys the surface and stores a new one when the
+    // activity returns, at which point ReattachAllSurfaces asks again.
+    REXLOG_WARN("SDLWindow: no ANativeWindow behind the SDL window yet");
     return nullptr;
   }
   return std::make_unique<AndroidNativeWindowSurface>(native_window);

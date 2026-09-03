@@ -20,7 +20,7 @@
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
 #include <rex/input/touch_input_driver.h>
 #endif
 #include <rex/logging.h>
@@ -499,7 +499,7 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
 }
 
 void SDLInputDriver::NotifyTouchOfControllersLocked() {
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
   // The on-screen controls exist only to stand in for a pad that is not
   // there, so they follow this driver's view of what is attached.
   bool any = false;

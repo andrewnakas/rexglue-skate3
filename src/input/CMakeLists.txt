@@ -19,7 +19,7 @@ else()
 endif()
 
 # On-screen controls: only where there is a touchscreen and no other pad.
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
     target_sources(rexinput PRIVATE touch/touch_input_driver.cpp)
 endif()
 

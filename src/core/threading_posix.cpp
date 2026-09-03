@@ -46,6 +46,11 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #if REX_PLATFORM_ANDROID
 #include <dlfcn.h>
+#include <sys/resource.h>
+
+#include <charconv>
+#include <cstring>
+#include <string_view>
 
 #include <rex/main_android.h>
 #include <rex/string/util.h>
@@ -72,6 +77,109 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #else
 #define REX_HAS_SIGEV_THREAD_ID 0
 #endif
+
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_STRING(
+    android_thread_placement_map, "", "Threading",
+    "Per-thread CPU placement on Android, as "
+    "\"prefix=cpu:<cores>[,nice:<n>];prefix=...\" matched against the thread "
+    "name (first matching prefix wins; empty disables the feature). <cores> is "
+    "a '+'-separated list of core indices or ranges, e.g. cpu:4-7 for the big "
+    "cores of a 1+3+4 Snapdragon or cpu:0+2-3. nice runs from -20 (most urgent) "
+    "to 19; Android refuses SCHED_FIFO for apps, so nice is the only priority "
+    "lever. Without a map the scheduler is free to park the six hot guest "
+    "threads on the efficiency cores while the frame waits for them.");
+
+namespace {
+
+// Applied to the CALLING thread only, from the self-naming paths, like the
+// Apple QoS map below: a thread names itself before it enters its start
+// routine, which is the one moment its role is known while its own affinity
+// and nice can still be set without racing it.
+bool ParseInt(std::string_view s, int& out) {
+  return !s.empty() && std::from_chars(s.data(), s.data() + s.size(), out).ec == std::errc();
+}
+
+void ApplyPlacementForCurrentThreadName(std::string_view name) {
+  if (name.empty()) {
+    return;
+  }
+  const std::string& map = REXCVAR_GET(android_thread_placement_map);
+  if (map.empty()) {
+    return;
+  }
+  std::string_view rest(map);
+  while (!rest.empty()) {
+    const size_t sep = rest.find(';');
+    const std::string_view entry = rest.substr(0, sep);
+    rest = sep == std::string_view::npos ? std::string_view() : rest.substr(sep + 1);
+
+    const size_t eq = entry.find('=');
+    if (eq == std::string_view::npos) {
+      continue;
+    }
+    const std::string_view prefix = entry.substr(0, eq);
+    std::string_view spec = entry.substr(eq + 1);
+    if (prefix.empty() || name.compare(0, prefix.size(), prefix) != 0) {
+      continue;
+    }
+
+    // First match wins, so the map reads as an ordered rule list.
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    bool have_cpus = false;
+    bool have_nice = false;
+    int nice_value = 0;
+    while (!spec.empty()) {
+      const size_t comma = spec.find(',');
+      const std::string_view field = spec.substr(0, comma);
+      spec = comma == std::string_view::npos ? std::string_view() : spec.substr(comma + 1);
+      if (field.rfind("cpu:", 0) == 0) {
+        std::string_view list = field.substr(4);
+        while (!list.empty()) {
+          const size_t plus = list.find('+');
+          const std::string_view range = list.substr(0, plus);
+          list = plus == std::string_view::npos ? std::string_view() : list.substr(plus + 1);
+          const size_t dash = range.find('-');
+          int lo = 0;
+          int hi = 0;
+          if (dash == std::string_view::npos) {
+            if (!ParseInt(range, lo)) {
+              continue;
+            }
+            hi = lo;
+          } else if (!ParseInt(range.substr(0, dash), lo) ||
+                     !ParseInt(range.substr(dash + 1), hi)) {
+            continue;
+          }
+          for (int cpu = std::max(lo, 0); cpu <= hi && cpu < CPU_SETSIZE; ++cpu) {
+            CPU_SET(cpu, &cpus);
+            have_cpus = true;
+          }
+        }
+      } else if (field.rfind("nice:", 0) == 0) {
+        have_nice = ParseInt(field.substr(5), nice_value);
+      }
+    }
+
+    const pid_t tid = gettid();
+    if (have_cpus && sched_setaffinity(tid, sizeof(cpus), &cpus) != 0) {
+      // EINVAL is the usual failure: the requested cores are outside the
+      // cpuset Android put this process in (a background app gets the small
+      // cores only). Logged and ignored - the thread still runs.
+      REXSYS_WARN("thread placement: \"{}\" affinity failed: {}", name, std::strerror(errno));
+    }
+    if (have_nice && setpriority(PRIO_PROCESS, tid, nice_value) != 0) {
+      REXSYS_WARN("thread placement: \"{}\" nice {} failed: {}", name, nice_value,
+                  std::strerror(errno));
+    }
+    REXSYS_INFO("thread placement: \"{}\" -> {}", name, entry);
+    return;
+  }
+}
+
+}  // namespace
+#endif  // REX_PLATFORM_ANDROID
 
 #if defined(__APPLE__)
 REXCVAR_DEFINE_STRING(
@@ -927,6 +1035,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #endif
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
+      // Same hook as the Apple QoS map: a thread's role is known here, while
+      // it can still place itself. Naming from another thread places nothing.
+      if (pthread_equal(thread_, pthread_self())) {
+        ApplyPlacementForCurrentThreadName(name);
+      }
 #endif
     }
   }
@@ -1740,6 +1853,7 @@ void set_current_thread_name(const std::string_view name) {
   if (!android_pthread_getname_np_ && current_thread_) {
     current_thread_->condition().SetAndroidPreApi26Name(name);
   }
+  ApplyPlacementForCurrentThreadName(name);
 #endif
 }
 

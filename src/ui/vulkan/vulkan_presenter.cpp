@@ -875,7 +875,13 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // The retirement or destruction of the swapchain here will also cause
   // awaiting completion of the usage of the swapchain and the surface on the
   // GPU.
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+  // Android: the ANativeWindow behind the SDL window is destroyed whenever the
+  // activity leaves the foreground and a NEW one is handed out on return. A
+  // VkSurfaceKHR is bound to one window for life, so a reconnect that reaches
+  // this point must always start from a fresh surface; reusing the old one
+  // fails forever with VK_ERROR_SURFACE_LOST_KHR - a black screen after Home.
+  //
   // Native macOS fullscreen transitions can reconfigure the CAMetalLayer behind
   // MoltenVK without making the existing VkSurface visibly recoverable. Rebind
   // from the layer instead of preserving the old surface through the transition.

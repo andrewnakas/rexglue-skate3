@@ -53,7 +53,37 @@ function(rexglue_apply_target_settings target_name)
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
             target_compile_options(${target_name} PRIVATE -mcmodel=large)
         elseif(_rexglue_target_processor MATCHES "aarch64|ARM64")
-            target_compile_options(${target_name} PRIVATE -march=armv8-a)
+            if(ANDROID)
+                # The recompiled guest code is the bulk of this binary and of
+                # the frame, and it is exactly the branchy load-modify-store
+                # shape whose throughput a scheduling model decides. Default to
+                # a generic ARMv8.2 baseline - every 64-bit Android SoC since
+                # about 2018: LSE atomics, FP16, dot product - and let a preset
+                # name one core when the build is for a single device.
+                #
+                # Any ARMv9 core name MUST carry +nosve+nosve2: the Snapdragon
+                # 8 Gen 1 exposes neither despite its Cortex-X2/A710 cores
+                # (verified from /proc/cpuinfo on a Galaxy S23 FE), and a
+                # stray SVE instruction in 7.7M lines of guest code is a SIGILL
+                # somewhere in the first minute of play.
+                set(REXGLUE_ANDROID_ARM_MCPU "" CACHE STRING
+                    "-mcpu for the Android arm64 guest code (empty = generic -march)")
+                set(REXGLUE_ANDROID_ARM_MARCH "armv8.2-a+crypto+fp16+dotprod" CACHE STRING
+                    "-march for the Android arm64 guest code when REXGLUE_ANDROID_ARM_MCPU is empty")
+                if(REXGLUE_ANDROID_ARM_MCPU)
+                    target_compile_options(${target_name} PRIVATE
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=${REXGLUE_ANDROID_ARM_MCPU}>)
+                else()
+                    target_compile_options(${target_name} PRIVATE
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-march=${REXGLUE_ANDROID_ARM_MARCH}>)
+                endif()
+                # LSE is in the baseline either way, so emit the atomics inline
+                # rather than through the runtime-dispatched outline helpers.
+                target_compile_options(${target_name} PRIVATE
+                    $<$<COMPILE_LANGUAGE:C,CXX>:-mno-outline-atomics>)
+            else()
+                target_compile_options(${target_name} PRIVATE -march=armv8-a)
+            endif()
         endif()
     endif()
 

@@ -38,6 +38,19 @@ class SDLWindow final : public Window {
   // so the window map needs no lock of its own.
   static void SetAllSurfacesPresentable(bool presentable, const char* reason);
 
+#if REX_PLATFORM_ANDROID
+  // Android destroys the ANativeWindow behind the SDL window whenever the
+  // activity leaves the foreground and hands out a NEW one on return. The
+  // presenter's VkSurfaceKHR is bound to the old pointer, so every open window
+  // drops its surface before the old window dies and creates a fresh one once
+  // SDL has stored the new pointer. Both go through Window::OnSurfaceChanged,
+  // the mechanism Xenia's own Android window used for exactly this. UI thread
+  // only, like SetAllSurfacesPresentable, and for the same reason: they are
+  // called from the lifecycle event watch.
+  static void DetachAllSurfaces(const char* reason);
+  static void ReattachAllSurfaces(const char* reason);
+#endif
+
   void SetTextInputActive(bool active) override;
 
   // Recomputes this window's surface presentability from SDL_GetWindowFlags.

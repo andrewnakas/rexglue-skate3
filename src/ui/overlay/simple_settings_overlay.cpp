@@ -36,7 +36,7 @@ namespace {
 // Phones and tablets are held far closer to the eye than a monitor, but they
 // also pack more pixels into far less glass - so a pixel-derived scale, which
 // is what the overlay uses, comes out much too small on them. 1.0 elsewhere.
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
 constexpr double kDefaultMenuScale = 1.4;
 #else
 constexpr double kDefaultMenuScale = 1.0;
@@ -63,7 +63,7 @@ constexpr bool kDefaultMenuCompact = false;
 // window_win.cpp and window_gtk.cpp, so on the SDL path it does nothing at all,
 // and vsync is force-set by BuildIOSArguments, which beats settings.toml - so
 // the row appears to change something and is silently reverted next launch.
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
 constexpr bool kDesktopWindowing = false;
 #else
 constexpr bool kDesktopWindowing = true;
@@ -73,7 +73,7 @@ constexpr bool kDesktopWindowing = true;
 // layout choice. A finger needs a target a cursor does not, so the stepper
 // circles grow on a touch platform whichever layout is in use - they were the
 // part that was genuinely hard to hit, not the columns.
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
 constexpr bool kTouchTargets = true;
 #else
 constexpr bool kTouchTargets = false;

@@ -71,6 +71,17 @@
 #define REX_PLATFORM_LINUX 0
 #endif
 
+// A phone or tablet: touch input, one full-screen window, an app sandbox with
+// no desktop file dialogs, and a settings menu sized for fingers. iOS and
+// Android share every one of those traits even though one is Darwin and the
+// other is Linux, so code that is about the device class rather than the OS
+// tests this instead of REX_PLATFORM_IOS.
+#if REX_PLATFORM_IOS || REX_PLATFORM_ANDROID
+#define REX_PLATFORM_MOBILE 1
+#else
+#define REX_PLATFORM_MOBILE 0
+#endif
+
 #if defined(__clang__)
 #define REX_COMPILER_CLANG 1
 #elif defined(__GNUC__)

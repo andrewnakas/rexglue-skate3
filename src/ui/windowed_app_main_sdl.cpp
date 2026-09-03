@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -45,10 +46,16 @@ REXCVAR_DEFINE_INT32(vulkan_mvk_log_level, 1, "GPU/Vulkan",
 #include <rex/main_android.h>
 #endif
 
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
 // SDL's iOS entry point also goes through SDL_main.
 #include <SDL3/SDL_main.h>
+#if REX_PLATFORM_IOS
 #include <CoreFoundation/CoreFoundation.h>
+#endif
+#if REX_PLATFORM_ANDROID
+#include <sys/sysinfo.h>
+#include <system_error>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
@@ -65,8 +72,9 @@ namespace {
 // blank lines and `#` comments ignored, and any `--key=` it names replaces the
 // built-in entry for that key rather than sitting alongside it. Nothing is
 // required to be in the file, and a file that is not there costs nothing.
-std::vector<std::string> ApplyIOSArgumentOverrides(std::vector<std::string> args,
-                                                   const std::filesystem::path& override_file) {
+std::vector<std::string> ApplyArgumentFileOverrides(std::vector<std::string> args,
+                                                    const std::filesystem::path& override_file,
+                                                    const char* tag) {
   std::ifstream in(override_file);
   if (!in) {
     return args;
@@ -118,7 +126,7 @@ std::vector<std::string> ApplyIOSArgumentOverrides(std::vector<std::string> args
       if (!already) {
         deduped.push_back(*it);
       } else {
-        std::fprintf(stderr, "ios_args: ignoring an earlier duplicate of %s\n", key.c_str());
+        std::fprintf(stderr, "%s: ignoring an earlier duplicate of %s\n", tag, key.c_str());
       }
     }
     std::reverse(deduped.begin(), deduped.end());
@@ -147,16 +155,17 @@ std::vector<std::string> ApplyIOSArgumentOverrides(std::vector<std::string> args
   // times is exactly the guessing this file exists to avoid. Logging is not up
   // yet at this point - these arguments are what configures it - so this goes
   // to stderr, which iOS has already been pointed at Documents/stderr.log.
-  std::fprintf(stderr, "ios_args: applied %zu override(s) from %s\n", overrides.size(),
+  std::fprintf(stderr, "%s: applied %zu override(s) from %s\n", tag, overrides.size(),
                override_file.c_str());
   for (const std::string& override_arg : overrides) {
-    std::fprintf(stderr, "ios_args:   %s\n", override_arg.c_str());
+    std::fprintf(stderr, "%s:   %s\n", tag, override_arg.c_str());
   }
   std::fflush(stderr);
 
   return args;
 }
 
+#if REX_PLATFORM_IOS
 // Texture / mesh store budgets, chosen from the memory this process is
 // actually allowed rather than from a constant.
 //
@@ -495,11 +504,130 @@ std::vector<std::string> BuildIOSArguments() {
       "--audio_device_sample_frames=512",
   };
 
-  return ApplyIOSArgumentOverrides(std::move(args), documents / "user" / "ios_args.txt");
+  return ApplyArgumentFileOverrides(std::move(args), documents / "user" / "ios_args.txt",
+                                    "ios_args");
+}
+#endif  // REX_PLATFORM_IOS
+
+#if REX_PLATFORM_ANDROID
+// Where the app may write. SDL asks the activity for getExternalFilesDir(),
+// which is /storage/emulated/0/Android/data/<package>/files: visible to the
+// player through any file manager, needs no permission, and is where `adb
+// push` lands the game dump during development. HOME is unset in an app
+// process and the runtime's fallback user directory is unwritable, so both
+// roots MUST be named from here rather than left to the defaults. The Java
+// shell also exports SKATE3_EXTERNAL_FILES_DIR in case SDL's JNI lookup answers
+// nothing, and the app-private directory is the last resort.
+std::filesystem::path AndroidFilesRoot() {
+  if (const char* sdl_path = SDL_GetAndroidExternalStoragePath(); sdl_path && *sdl_path) {
+    return sdl_path;
+  }
+  if (const char* env_path = std::getenv("SKATE3_EXTERNAL_FILES_DIR"); env_path && *env_path) {
+    return env_path;
+  }
+  if (const char* internal = SDL_GetAndroidInternalStoragePath(); internal && *internal) {
+    return internal;
+  }
+  return ".";
 }
 
+// Texture / mesh store budgets from the device's RAM. 288/224 is the only pair
+// this renderer has been played against at length (every 4 GB iPhone shipped
+// with it, see PickStoreBudgets in the iOS branch), so an 8 GB phone starts
+// there too and raises it from user/android_args.txt once the eviction rate
+// has been measured rather than guessed. The 256 MB floor in
+// skate3_native_scene_gpu.cpp applies here as well.
+struct AndroidStoreBudgets {
+  uint32_t tex_mb;
+  uint32_t mesh_mb;
+  const char* tier;
+};
+
+AndroidStoreBudgets PickAndroidStoreBudgets() {
+  struct sysinfo info = {};
+  const uint64_t total_mb =
+      sysinfo(&info) == 0 ? (uint64_t(info.totalram) * uint64_t(info.mem_unit)) >> 20 : 0;
+  AndroidStoreBudgets b;
+  if (total_mb == 0) {
+    b = {288, 224, "unknown"};
+  } else if (total_mb >= 5000) {
+    b = {288, 224, "standard (6 GB+)"};
+  } else {
+    b = {224, 160, "small"};
+  }
+  std::fprintf(stderr, "store budgets: %s tier (%llu MB RAM) -> tex %u MB, mesh %u MB\n", b.tier,
+               (unsigned long long)total_mb, b.tex_mb, b.mesh_mb);
+  std::fflush(stderr);
+  return b;
+}
+
+// The shipped Android defaults. Every entry is a real cvar: CLI11 rejects an
+// unknown option and a failed parse silently discards the whole list, so
+// nothing speculative belongs here. Rationale for each value is in the iOS
+// list above; only the MoltenVK-specific knobs are missing, because there is
+// no MoltenVK. Anything here can be replaced without a rebuild from
+// <files>/user/android_args.txt, one argument per line.
+std::vector<std::string> BuildAndroidArguments() {
+  const std::filesystem::path root = AndroidFilesRoot();
+  const AndroidStoreBudgets store_budgets = PickAndroidStoreBudgets();
+  std::vector<std::string> args = {
+      "--game_data_root=" + (root / "game").string(),
+      "--user_data_root=" + (root / "user").string(),
+      "--log_file=" + (root / "skate3.log").string(),
+      "--log_flush_interval=1",
+      "--log_flush_level=warn",
+      "--log_level=warn",
+      // The native renderer replaces the emulated Xenos pipeline; it is the
+      // whole reason a phone can run this at all.
+      "--skate3_native_render_scene=true",
+      "--skate3_auto_install_dlc=true",
+      "--vulkan_log_debug_messages=false",
+      "--skate3_native_render_scene_perf_log=false",
+      "--presenter_present_cadence_log=false",
+      "--vulkan_present_timing_log=false",
+      // Mitigation for the WorldPresentation cross-thread use-after-free.
+      "--skate3_instance_free_defer_ms=250",
+      // FIFO on a 60 Hz mode (the activity picks it) paces a locked 60; the
+      // cap keeps the guest from running ahead of the panel.
+      "--skate3_guest_fps_cap=60",
+      "--skate3_guest_fps_cap_auto=false",
+      "--vsync=true",
+      "--skate3_native_render_scene_tex_store_mb=" + std::to_string(store_budgets.tex_mb),
+      "--skate3_native_render_scene_mesh_store_mb=" + std::to_string(store_budgets.mesh_mb),
+      // The Xenos texture cache fills to its HARD limit on every map load
+      // (menus and loading render through the emulated path) and then sits
+      // there. 8 GB of RAM buys more headroom than the phone that set 320.
+      "--texture_cache_memory_limit_soft=256",
+      "--texture_cache_memory_limit_hard=384",
+      "--texture_cache_memory_limit_soft_lifetime=30",
+      "--texture_cache_memory_limit_render_to_texture=24",
+      // Adreno is a tile GPU too: every emulated render-pass entry the native
+      // renderer leaves behind is a tile load/store. Mode 1 drops them.
+      "--native_render_suppress_mode=1",
+      "--resolution_scale=1",
+      "--draw_resolution_scale_x=1",
+      "--draw_resolution_scale_y=1",
+      "--skate3_native_render_scene_msaa=1",
+      "--skate3_native_render_scene_shadow_static_size=1024",
+      "--skate3_native_render_scene_shadow_pcss=false",
+      "--skate3_native_render_scene_ssao=false",
+      "--skate3_native_render_scene_bloom=false",
+      "--skate3_native_render_scene_shafts=false",
+      // The console's own draw radius; the 2.0 default is four times the
+      // world area streaming and is what makes fast travel hitch.
+      "--skate3_draw_distance_scale=1.0",
+      "--skate3_lod_distance_scale=1.0",
+      "--gpu_wait_reg_mem_timeout_ms=20",
+      "--audio_device_channels=2",
+      "--audio_device_sample_frames=512",
+  };
+  return ApplyArgumentFileOverrides(std::move(args), root / "user" / "android_args.txt",
+                                    "android_args");
+}
+#endif  // REX_PLATFORM_ANDROID
+
 }  // namespace
-#endif
+#endif  // REX_PLATFORM_MOBILE
 
 int main(int argc, char** argv) {
 #if REX_PLATFORM_ANDROID
@@ -600,7 +728,57 @@ int main(int argc, char** argv) {
   argv = ios_argv.data();
 #endif
 
-#if !REX_PLATFORM_IOS
+#if REX_PLATFORM_ANDROID
+  const std::filesystem::path android_root = AndroidFilesRoot();
+  {
+    // user/ is where android_args.txt and the settings live; make sure it
+    // exists before anything looks for it.
+    std::error_code ec;
+    std::filesystem::create_directories(android_root / "user", ec);
+    // stderr is discarded in an app process, and the crash reporter and the
+    // argument-override diagnostics write there. Give it a file next to the
+    // log, line-buffered so a crash loses at most one line.
+    const std::filesystem::path stderr_path = android_root / "stderr.log";
+    if (std::freopen(stderr_path.c_str(), "w", stderr)) {
+      setvbuf(stderr, nullptr, _IOLBF, 0);
+    }
+  }
+  // What the activity passed (SDLActivity.getArguments) is the operator's
+  // intent: record it as explicitly set, and let it replace the shipped
+  // default for the same key rather than sit beside it - CLI11 rejects a
+  // scalar option it sees twice, and that failure discards EVERYTHING.
+  std::vector<std::string> activity_keys;
+  for (int i = 1; i < argc; ++i) {
+    std::string_view arg(argv[i]);
+    if (arg.rfind("--", 0) != 0) {
+      continue;
+    }
+    arg.remove_prefix(2);
+    const std::string_view key = arg.substr(0, arg.find('='));
+    activity_keys.emplace_back(key);
+    rex::cvar::NoteExplicitlySet(key);
+  }
+  std::vector<std::string> android_args = BuildAndroidArguments();
+  std::erase_if(android_args, [&](const std::string& shipped) {
+    std::string_view key(shipped);
+    key.remove_prefix(2);
+    key = key.substr(0, key.find('='));
+    return std::find(activity_keys.begin(), activity_keys.end(), key) != activity_keys.end();
+  });
+  std::vector<char*> android_argv;
+  android_argv.reserve(size_t(argc) + android_args.size());
+  android_argv.push_back(argc > 0 ? argv[0] : const_cast<char*>("skate3"));
+  for (const std::string& arg : android_args) {
+    android_argv.push_back(const_cast<char*>(arg.c_str()));
+  }
+  for (int i = 1; i < argc; ++i) {
+    android_argv.push_back(argv[i]);
+  }
+  argc = int(android_argv.size());
+  argv = android_argv.data();
+#endif
+
+#if !REX_PLATFORM_MOBILE
   // Everywhere else the command line IS the operator, so record it before it is
   // parsed. Done here rather than inside cvar::Init because on iOS the same
   // argv also carries BuildIOSArguments' defaults, which must not count.
@@ -644,12 +822,25 @@ int main(int argc, char** argv) {
   SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_MENU_VISIBILITY, "1");
 #endif
 
+#if REX_PLATFORM_ANDROID
+  // Back is the settings-menu key, not "finish the activity".
+  SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+  // The activity keeps input focus while Android recreates the surface, but
+  // SDL's keyboard-focus window is null in that interval and, without this,
+  // controller button events arriving then are silently discarded.
+  SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+  // HIDAPI enumerates USB and Bluetooth HID itself; on Android it has been
+  // seen to consume a measurable slice of a core while finding nothing the
+  // platform's own controller APIs had not already reported.
+  SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
+#endif
+
   if (!SDL_Init(SDL_INIT_VIDEO)) {
     std::fprintf(stderr, "Failed to initialize SDL video: %s\n", SDL_GetError());
     return EXIT_FAILURE;
   }
 
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
   // A controller-driven game sends no touch events, so iOS sees an idle screen
   // and dims, locks, and backgrounds the app out from under a live run. SDL
   // routes this to UIApplication.idleTimerDisabled.
@@ -687,7 +878,10 @@ int main(int argc, char** argv) {
     }
 #endif
     result = initialized ? app_context.RunMainLoop() : EXIT_FAILURE;
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+    // Android: the same applies (SDLActivity.onDestroy waits one second for
+    // SDL_main to return and the process is torn down regardless).
+    //
     // Skip app/runtime teardown entirely: guest threads cannot be reliably
     // stopped on Darwin (pthread_cancel only lands at cancellation points,
     // never in CPU-bound recompiled code), so the destructor chain races

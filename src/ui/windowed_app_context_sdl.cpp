@@ -70,6 +70,13 @@ int SDLWindowedAppContext::RunMainLoop() {
             // iOS revokes GPU access here; the command processor must stop
             // treating the resulting submit failures as a dead device.
             rex::graphics::SetAppForeground(false);
+#if REX_PLATFORM_ANDROID
+            // Android is about to destroy the ANativeWindow this surface was
+            // created from. Unbind the presenter while the pointer is still
+            // valid; SDL delivers this event on its own thread before it
+            // blocks for the pause, and before Java reaches surfaceDestroyed.
+            SDLWindow::DetachAllSurfaces("entering the background");
+#endif
             [[fallthrough]];
           case SDL_EVENT_LOW_MEMORY:
             // Jetsam evicts suspended processes largest-first, and this one
@@ -93,6 +100,15 @@ int SDLWindowedAppContext::RunMainLoop() {
           case SDL_EVENT_DID_ENTER_FOREGROUND:
             SDLWindow::SetAllSurfacesPresentable(true, "returning to the foreground");
             rex::graphics::SetAppForeground(true);
+#if REX_PLATFORM_ANDROID
+            // Only on DID: SDL resumes its thread after the activity's
+            // surfaceChanged has stored the recreated ANativeWindow, so by the
+            // time this event is seen the new pointer is in the window
+            // property and a fresh VkSurfaceKHR can be built from it.
+            if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+              SDLWindow::ReattachAllSurfaces("returning to the foreground");
+            }
+#endif
             break;
           default:
             break;

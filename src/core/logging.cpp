@@ -25,6 +25,9 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#if REX_PLATFORM_ANDROID
+#include <spdlog/sinks/android_sink.h>
+#endif
 
 #if REX_PLATFORM_WIN32
 #include <spdlog/sinks/msvc_sink.h>
@@ -80,6 +83,11 @@ spdlog::sink_ptr g_console_sink;
 spdlog::sink_ptr g_file_sink;
 spdlog::sink_ptr g_early_sink;
 std::vector<spdlog::sink_ptr> g_extra_sinks;
+#if REX_PLATFORM_ANDROID
+// Kept separately so InitLogging, which replaces g_extra_sinks with the
+// caller's list, can put it back: logcat is the only live log on a phone.
+spdlog::sink_ptr g_android_logcat_sink;
+#endif
 bool g_early_initialized = false;
 bool g_initialized = false;
 std::mutex g_mutex;
@@ -190,6 +198,21 @@ void InitLoggingEarly() {
   sink->set_pattern("[%l] [%n] %v");
   g_early_sink = sink;
 
+#if REX_PLATFORM_ANDROID
+  // stdout goes nowhere in an app process. Mirror every category to logcat
+  // under one tag so `adb logcat -s skate3` is the live log; the file sink
+  // arrives later, once the arguments have named the file. Registered as an
+  // extra sink rather than through AddSink, which takes the mutex this
+  // function already holds.
+  {
+    auto logcat = std::make_shared<spdlog::sinks::android_sink_mt>("skate3");
+    logcat->set_level(spdlog::level::trace);
+    logcat->set_pattern("[%n] %v");
+    g_android_logcat_sink = logcat;
+    g_extra_sinks.push_back(logcat);
+  }
+#endif
+
   g_config.default_level = kDefaultLogLevel;
 
   // Create loggers for any categories already registered during static init
@@ -268,6 +291,11 @@ void InitLogging(const LogConfig& config) {
   }
 
   g_extra_sinks = config.extra_sinks;
+#if REX_PLATFORM_ANDROID
+  if (g_android_logcat_sink) {
+    g_extra_sinks.push_back(g_android_logcat_sink);
+  }
+#endif
 
   // Rebuild all loggers with new sinks
   for (auto& entry : g_registry) {

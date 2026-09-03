@@ -24,7 +24,7 @@
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
 #include <rex/input/touch_input_driver.h>
 #endif
 #include <rex/input/sdl/sdl_input_driver.h>
@@ -492,7 +492,7 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
       }
     }
 
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_MOBILE
     // Touch driver last of the real drivers: it declines while a physical
     // controller is attached, so it costs nothing when one is.
     {
