@@ -381,6 +381,17 @@ struct GraphicsPipelineDesc {
   Format rtv_format = Format::kUnknown;  // kUnknown = no color target
   Format dsv_format = Format::kUnknown;  // kUnknown = no depth target
   uint32_t sample_count = 1;
+  // Skip the TRIANGLE_STRIP twin. The Vulkan backend builds both topology
+  // variants EAGERLY at creation (it cannot build the strip one lazily -
+  // callers destroy their shader modules straight after creating the
+  // pipeline), so every pipeline costs two vkCreateGraphicsPipelines calls.
+  // On MoltenVK each one is a SPIR-V -> MSL -> Metal compile, so for the
+  // fullscreen-triangle passes - which are drawn exclusively as
+  // kTriangleList - half of that cost buys a variant nothing ever binds.
+  // Set this when the pipeline is never bound under kTriangleStrip; binding
+  // one that is under a strip topology is a logged error, not a silent
+  // no-draw. No effect on D3D12, where a PSO carries a topology TYPE.
+  bool triangle_list_only = false;
 };
 
 struct Viewport {

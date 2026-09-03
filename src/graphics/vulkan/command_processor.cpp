@@ -6731,6 +6731,44 @@ bool VulkanCommandProcessor::SoftenDeviceLoss(const char* stage) {
           "carrying on",
           stage, n + 1);
     }
+    // Remember it, because the refusals outlive the background state - see
+    // below.
+    background_device_loss_pending_.store(true, std::memory_order_relaxed);
+    return true;
+  }
+  // Foreground now, but were we a moment ago? Coming back from the background
+  // is not instantaneous down at the queue: the command buffers iOS refused
+  // while the app was away keep completing with
+  // kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted for a few
+  // milliseconds after IsAppForeground() has already flipped to true. Those
+  // are the SAME refusals as the branch above - the app just won the race to
+  // observe the transition first - and charging them to the foreground budget
+  // is what actually killed the app.
+  //
+  // Measured on an iPhone 13 mini, 2026-09-01 21:54:02: 65 background-attributed
+  // losses at 21:54:01, then eight more inside 20 MILLISECONDS that were
+  // attributed to the foreground, exhausting a budget of 8 meant to span 30
+  // SECONDS, and the ninth aborted the process with "Graphics device lost". The
+  // user sees the game quit to the home screen after resuming from the pause
+  // screen or the app switcher. The budget is sized for the occasional
+  // CAMetalDrawable timeout - a rate of one every few seconds - so any burst
+  // arriving faster than that is by construction not what it is there to catch.
+  //
+  // So: once a background loss has been seen, keep softening for free until a
+  // submission actually SUCCEEDS. That is the only signal that says the GPU is
+  // really ours again, it cannot be faked by more failures, and it leaves the
+  // budget intact for a genuine loss that happens later in the session.
+  if (background_device_loss_pending_.load(std::memory_order_relaxed)) {
+    static std::atomic<uint32_t> s_resume{0};
+    const uint32_t n = s_resume.fetch_add(1, std::memory_order_relaxed);
+    if (n < 4 || (n & (n - 1)) == 0) {
+      REXGPU_WARN(
+          "GPU: {} reported a lost device just after the app returned to the "
+          "foreground (occurrence {}); this is the backlog of work iOS refused "
+          "while it was in the background - dropping it without spending the "
+          "soft-retry budget, until a submission succeeds",
+          stage, n + 1);
+    }
     return true;
   }
   const int32_t budget = REXCVAR_GET(vulkan_device_lost_soft_retries);
@@ -7365,6 +7403,12 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+    }
+    if (submit_result == VK_SUCCESS) {
+      // The GPU is genuinely ours again - stop forgiving losses for free. See
+      // SoftenDeviceLoss for why a successful submit is the signal used here
+      // rather than a timer or the foreground flag.
+      background_device_loss_pending_.store(false, std::memory_order_relaxed);
     }
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");

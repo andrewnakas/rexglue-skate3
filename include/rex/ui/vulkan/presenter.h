@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -177,6 +178,14 @@ class VulkanPresenter final : public Presenter {
 
   uint32_t soft_device_loss_count_ = 0;
   std::chrono::steady_clock::time_point soft_device_loss_window_start_{};
+  // Set when a device loss arrives while the app is in the background, cleared
+  // by the next frame that actually presents. While it is set, losses are
+  // forgiven WITHOUT spending the budget above: the work iOS refused while the
+  // app was away keeps failing for a few milliseconds after the foreground flag
+  // has already flipped back, and charging that burst to a budget sized for
+  // occasional drawable timeouts is what killed the app on resume. See
+  // SoftenDeviceLoss.
+  std::atomic<bool> background_device_loss_pending_{false};
 
   // Usable for both the guest output image itself and for intermediate images.
   class GuestOutputImage {

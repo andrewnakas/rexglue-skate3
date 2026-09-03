@@ -22,6 +22,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/graphics_system.h>  // IsAppForeground, for SoftenDeviceLoss
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
@@ -1755,6 +1756,46 @@ void VulkanPresenter::DrainRetiredSwapchains(bool force) {
 }
 
 bool VulkanPresenter::SoftenDeviceLoss(const char* stage) {
+  // iOS refuses GPU work to a background app: every acquire and present comes
+  // back VK_ERROR_DEVICE_LOST with
+  // kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted, as fast as
+  // the loop can ask. That is not a lost device and it fixes itself on resume,
+  // so it must never be counted against a budget meant for the occasional
+  // CAMetalDrawable timeout - eight arrived inside 20 ms on an iPhone 13 mini
+  // and turned a routine app-switch into "Graphics device lost".
+  //
+  // The refusals also OUTLIVE the background state: work queued while away
+  // keeps failing for a few milliseconds after IsAppForeground() has flipped
+  // back. So once one is seen, keep forgiving for free until a frame actually
+  // presents - a success is the only signal that the GPU is really ours again,
+  // and it leaves the budget whole for a genuine loss later in the session.
+  // The command processor carries the same rule; see its SoftenDeviceLoss.
+  if (!rex::graphics::IsAppForeground()) {
+    background_device_loss_pending_.store(true, std::memory_order_relaxed);
+    static std::atomic<uint32_t> s_bg{0};
+    const uint32_t n = s_bg.fetch_add(1, std::memory_order_relaxed);
+    if (n < 4 || (n & (n - 1)) == 0) {
+      REXLOG_WARN(
+          "VulkanPresenter: {} reported a lost device while the app is in the "
+          "background (occurrence {}); iOS does not permit GPU work there - "
+          "dropping the frame and carrying on",
+          stage, n + 1);
+    }
+    return true;
+  }
+  if (background_device_loss_pending_.load(std::memory_order_relaxed)) {
+    static std::atomic<uint32_t> s_resume{0};
+    const uint32_t n = s_resume.fetch_add(1, std::memory_order_relaxed);
+    if (n < 4 || (n & (n - 1)) == 0) {
+      REXLOG_WARN(
+          "VulkanPresenter: {} reported a lost device just after the app "
+          "returned to the foreground (occurrence {}); this is the backlog of "
+          "work iOS refused while it was away - dropping the frame without "
+          "spending the soft-retry budget, until one presents",
+          stage, n + 1);
+    }
+    return true;
+  }
   const int32_t budget = REXCVAR_GET(vulkan_device_lost_soft_retries);
   if (budget <= 0) {
     return false;
@@ -2589,8 +2630,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   DrainRetiredSwapchains(false);
   switch (present_result) {
     case VK_SUCCESS:
+      // A frame reached the screen, so the GPU is genuinely ours - stop
+      // forgiving device losses for free. See SoftenDeviceLoss.
+      background_device_loss_pending_.store(false, std::memory_order_relaxed);
       return PaintResult::kPresented;
     case VK_SUBOPTIMAL_KHR:
+      // Suboptimal still means the frame was presented - same signal.
+      background_device_loss_pending_.store(false, std::memory_order_relaxed);
       return PaintResult::kPresentedSuboptimal;
     case VK_ERROR_DEVICE_LOST:
       // The image stays in the acquired state forever after this, which is

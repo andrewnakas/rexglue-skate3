@@ -15,6 +15,8 @@
 #include <SDL3/SDL.h>
 
 #if REX_PLATFORM_IOS
+#include <os/proc.h>  // os_proc_available_memory, for PickStoreBudgets
+
 REXCVAR_DEFINE_BOOL(vulkan_mvk_present_with_command_buffer, false, "GPU/Vulkan",
                     "Have MoltenVK present through a command buffer instead of calling "
                     "presentDrawable on the drawable itself. A different route to the same "
@@ -155,7 +157,72 @@ std::vector<std::string> ApplyIOSArgumentOverrides(std::vector<std::string> args
   return args;
 }
 
+// Texture / mesh store budgets, chosen from the memory this process is
+// actually allowed rather than from a constant.
+//
+// The large tier IS v2.5.0: 288 MB of textures, 224 MB of meshes, the values
+// every 4 GB phone shipped with and the only configuration this build has been
+// played against with the retired-object drain in its shipped (unbounded)
+// form. A 448/128 rebalance was tried on 2026-09-01 and measured fewer
+// eviction sweeps (6 vs 50 in comparable play), but every one of those runs
+// also carried a capped catch-up drain that left 11-17k retired objects
+// walked by erase_if on EVERY frame - the game was broadly slower and the
+// budget half of the change could not be separated from the drain half. Until
+// 448 is measured on its own, against the unbounded drain, the tested values
+// stay. Both budgets remain overridable from Documents/user/ios_args.txt with
+// no rebuild (skate3_native_render_scene_tex_store_mb / _mesh_store_mb), which
+// is how the next measurement should be taken.
+//
+// A FLOOR OF 256 MB APPLIES TO BOTH STORES and is not visible from here:
+// skate3_native_scene_gpu.cpp computes each cap as
+// `std::max(256, <the cvar>) << 20`, so any value below 256 is silently
+// raised. That is why every "mesh store LRU start" line ever logged says
+// cap_mb=256 - at 224 (v2.5.0), and at the 128 the 2.6.0 candidate briefly
+// set. The mesh half of that rebalance was a no-op, which is also why it
+// could not have been the gameplay regression it was blamed for. The mesh
+// numbers below are therefore documentation of intent, not of effect, and
+// the medium and small tiers cannot lower either store at all until that
+// floor is raised or removed. Leave them honest rather than reassuring.
+//
+// The lower tiers exist because 288/224 is only proven on a 4 GB phone.
+// Supported 6-core iPhones include 3 GB parts (XR, SE 2020) that were never
+// tested here, and on iOS the penalty for guessing high is not a slow frame,
+// it is jetsam killing the app. os_proc_available_memory() is the honest
+// input: it reports what is left before that happens, it is the same number
+// the periodic "ios mem ... headroom" line prints, and it is read here before
+// the guest allocates anything, so it is close to the whole allowance (2342 MB
+// on a 4 GB 13 mini, verified from stderr). The mesh store never exceeded
+// 97 MB in any log, so the smaller tiers cut textures first.
+struct StoreBudgets {
+  uint32_t tex_mb;
+  uint32_t mesh_mb;
+  const char* tier;
+};
+
+StoreBudgets PickStoreBudgets() {
+  const uint64_t avail_mb = uint64_t(os_proc_available_memory()) >> 20;
+  StoreBudgets b;
+  if (avail_mb == 0) {
+    // The API answered nothing (it returns 0 outside a memory-limited
+    // process). Take the shipped values rather than a number no device has run.
+    b = {288, 224, "unknown-availability"};
+  } else if (avail_mb >= 2000) {
+    // A 4 GB phone reports ~2342 MB at startup. The threshold sits well below
+    // that so a 4 GB device can never land in the medium tier by accident.
+    b = {288, 224, "large"};
+  } else if (avail_mb >= 1400) {
+    b = {256, 192, "medium"};
+  } else {
+    b = {224, 160, "small"};
+  }
+  std::fprintf(stderr, "store budgets: %s tier (%llu MB allowable) -> tex %u MB, mesh %u MB\n",
+               b.tier, (unsigned long long)avail_mb, b.tex_mb, b.mesh_mb);
+  std::fflush(stderr);
+  return b;
+}
+
 std::vector<std::string> BuildIOSArguments() {
+  const StoreBudgets store_budgets = PickStoreBudgets();
   const char* home = std::getenv("HOME");
   const std::filesystem::path documents =
       std::filesystem::path(home ? home : ".") / "Documents";
@@ -296,8 +363,10 @@ std::vector<std::string> BuildIOSArguments() {
       // the binding constraint. Textures cost more here than the numbers
       // suggest, too, since Metal exposes no BC formats and every DXT surface
       // is expanded to RGBA8 on upload (8x for DXT1).
-      "--skate3_native_render_scene_tex_store_mb=288",
-      "--skate3_native_render_scene_mesh_store_mb=224",
+      // Sized against what the KERNEL will actually let this process have - see
+      // PickStoreBudgets above. On a 4 GB phone these are v2.5.0's 288/224.
+      "--skate3_native_render_scene_tex_store_mb=" + std::to_string(store_budgets.tex_mb),
+      "--skate3_native_render_scene_mesh_store_mb=" + std::to_string(store_budgets.mesh_mb),
 
       // The Xenos texture cache is a SEPARATE budget from the two above, and
       // on device it is the largest single consumer of device-local memory:

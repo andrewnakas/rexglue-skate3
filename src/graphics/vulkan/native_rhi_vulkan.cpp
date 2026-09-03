@@ -76,6 +76,51 @@ REXCVAR_DEFINE_BOOL(vulkan_descriptor_set_recycle, true, "GPU/Vulkan",
                     "them, so the re-allocation storm after a texture eviction sweep costs a "
                     "pointer pop rather than a scan of every descriptor pool");
 
+REXCVAR_DEFINE_INT32(vulkan_drain_catchup_max_us, 50000, "GPU/Vulkan",
+                     "Wall-clock ceiling, in microseconds, on the per-frame retired-object "
+                     "drain once the backlog is deep enough to need catching up. While it "
+                     "applies, the per-frame OBJECT cap is lifted entirely - one bound, "
+                     "not two. 0 = no ceiling and the object cap stays on.\n"
+                     "\n"
+                     "50 ms by default because both of the alternatives were measured on "
+                     "device and both were worse:\n"
+                     "  - No ceiling (what v2.5.0 shipped) does NOT mean unbounded work: "
+                     "the clock came off but the call site's 256-object cap did not, so a "
+                     "backlog of 18000 on the mission-completion screens fell by a flat "
+                     "255 a frame for seventy frames at 5-36 ms each. One of those drains "
+                     "freed its 255 objects in 508 microseconds and stopped anyway. That "
+                     "is the completion-screen slowdown.\n"
+                     "  - A 16 ms ceiling WITH an object cap of 2048 never caught up at "
+                     "all: 16321 -> 11323 and still falling by a few hundred a frame, "
+                     "which is a permanent tax on every frame rather than an occasional "
+                     "hitch, and strictly harder to diagnose.\n"
+                     "\n"
+                     "With the object cap off, 50 ms clears a cheap backlog (descriptor "
+                     "sets, ~2 us each) in a single frame and still bounds an expensive "
+                     "one (large images, ~143 us each) to three dropped frames instead of "
+                     "the 4.25-SECOND freeze that a genuinely unbounded drain produced "
+                     "after a texture-store eviction sweep.\n"
+                     "\n"
+                     "The real fix is still upstream - retire fewer objects (see "
+                     "PickStoreBudgets and the store LRU). Tune this with the SLOW frame "
+                     "line in view: `stopped_on=objects` means the cap is throttling a "
+                     "drain that had time left, `stopped_on=time` means destruction is "
+                     "genuinely slow, and `retired_backlog` must return to near zero "
+                     "between eviction sweeps.")
+    .range(0, 1000000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_slow_pipeline_build_warn_ms, 100, "GPU/Vulkan",
+                     "Warn when a single pipeline build takes at least this many "
+                     "milliseconds. On MoltenVK the build is SPIR-V -> MSL -> Metal and "
+                     "runs on the render thread, so a family compiled lazily on first use "
+                     "stalls presentation for seconds; nothing used to say so, in any log, "
+                     "at any level. Warn-level on purpose: it has to survive the shipped "
+                     "default. A warm pipeline cache makes the same call a file read, so "
+                     "this stays silent after the first run. 0 logs every build.")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 namespace {
 
@@ -376,6 +421,10 @@ class NrPipelineVulkan : public nrhi::Pipeline {
   // that point - the scene keeps its shaders for the process lifetime,
   // mirroring how D3D12 baked the blobs into the PSO at creation.
   VkPipeline strip_pipeline = VK_NULL_HANDLE;
+  // strip_pipeline was deliberately not built (GraphicsPipelineDesc::
+  // triangle_list_only). Kept so a stray strip bind can say "declared
+  // list-only" rather than looking like a build that silently failed.
+  bool list_only = false;
 
   // Everything needed to build the strip twin.
   VkShaderModule vs_module = VK_NULL_HANDLE;
@@ -1292,11 +1341,19 @@ class NrDeviceVulkan : public nrhi::Device {
     // after pipeline creation (mirroring the D3D12 blob release), so a lazy
     // first-strip-draw build would reference freed VkShaderModules (this was
     // a driver crash on gameplay load).
-    pipeline->strip_pipeline = BuildPipeline(*pipeline, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
-    if (pipeline->strip_pipeline == VK_NULL_HANDLE) {
-      REXLOG_ERROR("nrhi-vulkan: strip pipeline creation failed");
-      DestroyDeferred(static_cast<nrhi::Pipeline*>(pipeline));
-      return nullptr;
+    //
+    // Which means every pipeline costs TWO builds, and on MoltenVK a build is
+    // a SPIR-V -> MSL -> Metal compile. For a pass that only ever draws a
+    // fullscreen triangle under kTriangleList, the second one is pure waste -
+    // so callers that know this can say so and halve their cold-cache cost.
+    pipeline->list_only = desc.triangle_list_only;
+    if (!pipeline->list_only) {
+      pipeline->strip_pipeline = BuildPipeline(*pipeline, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+      if (pipeline->strip_pipeline == VK_NULL_HANDLE) {
+        REXLOG_ERROR("nrhi-vulkan: strip pipeline creation failed");
+        DestroyDeferred(static_cast<nrhi::Pipeline*>(pipeline));
+        return nullptr;
+      }
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1578,7 +1635,8 @@ class NrDeviceVulkan : public nrhi::Device {
         REXLOG_INFO(
             "nrhi-vulkan: SLOW frame {}us: pass_open={}us/{} flush={}us/{} copies={}us/{} "
             "table_miss={}us/{} set0_miss={}us/{} view_destroy={}us/{} view_create={}us/{} "
-            "const={}us/{} pso={}us/{} drain={}us/{} retired_backlog={}",
+            "const={}us/{} pso={}us/{} drain={}us/{} retired_backlog={} "
+            "drain_freed={} recycled={} not_ready={} over_budget={} stopped_on={}",
             total_us, prof_.pass_open.us, prof_.pass_open.count, prof_.flush_barriers.us,
             prof_.flush_barriers.count, prof_.copies.us, prof_.copies.count, prof_.table_miss.us,
             prof_.table_miss.count, prof_.set0_miss.us, prof_.set0_miss.count,
@@ -1588,7 +1646,14 @@ class NrDeviceVulkan : public nrhi::Device {
             prof_.drain.count,
             // Backlog too: a drain that is falling behind decays the frame
             // rate over minutes and is invisible in the per-frame timings.
-            retired_backlog_);
+            retired_backlog_,
+            // ...and what the drain did with the budget it had. `not_ready` is
+            // work the GPU still owns, which no budget can touch; `over_budget`
+            // is work that was ready and was left for later. If `stopped_on` is
+            // "objects" while the drain is also cheap, the per-frame cap is the
+            // limiter and raising it costs nothing.
+            retired_destroyed_, retired_recycled_, retired_not_ready_, retired_over_budget_,
+            retired_hit_object_cap_ ? "objects" : (retired_over_budget_ ? "time" : "done"));
       }
     }
   }
@@ -1932,8 +1997,26 @@ class NrDeviceVulkan : public nrhi::Device {
   // its shader modules right after CreateGraphicsPipeline, so nothing may be
   // built lazily from them at draw time).
   VkPipeline GetPipelineVariant(NrPipelineVulkan* p, nrhi::PrimitiveTopology topology) {
-    return topology == nrhi::PrimitiveTopology::kTriangleList ? p->list_pipeline
-                                                              : p->strip_pipeline;
+    if (topology == nrhi::PrimitiveTopology::kTriangleList) {
+      return p->list_pipeline;
+    }
+    if (p->strip_pipeline == VK_NULL_HANDLE && p->list_only) {
+      // Binding a list-only pipeline under a strip topology. Returning null
+      // here would drop the draw silently, which is the failure mode that
+      // costs a day to find; say it once and fall back to the list variant so
+      // the geometry at least appears (wrong topology is visible, missing
+      // geometry is not).
+      static std::atomic<bool> s_warned{false};
+      if (!s_warned.exchange(true, std::memory_order_relaxed)) {
+        REXLOG_ERROR(
+            "nrhi-vulkan: a pipeline declared triangle_list_only (vs '{}' ps "
+            "'{}') was bound under a STRIP topology - falling back to the list "
+            "variant. Clear triangle_list_only on it.",
+            p->vs_entry, p->ps_entry);
+      }
+      return p->list_pipeline;
+    }
+    return p->strip_pipeline;
   }
 
   std::vector<NrTextureVulkan*>& pending_clear_textures() { return pending_clear_textures_; }
@@ -2214,15 +2297,57 @@ class NrDeviceVulkan : public nrhi::Device {
     // behind costs more than a stutter does.
     const size_t backlog = retired_.size();
     retired_backlog_ = backlog;
+    // Widen the budget as the backlog grows - but NEVER remove it. This used
+    // to set max_us = 0 (unbounded) past kDrainBacklogUnbounded, on the
+    // reasoning that catching up matters more than one frame's smoothness.
+    // Measured on an iPhone 13 mini, 2026-09-01, that produced a single frame
+    // of 4.25 SECONDS, of which 4.24 s was this function, clearing a backlog
+    // of 17843 after a texture-store eviction sweep. The clock was removed at
+    // exactly the moment it had the most work to bound, so the worst backlog
+    // bought the worst freeze.
+    //
+    // The opposite failure is real too and is why the unbounded branch was
+    // added: a flat 2 ms budget freed about two objects a frame while
+    // eviction retired thousands, the heap grew to 1361 MB and the frame rate
+    // decayed 53 -> 21 fps over two minutes. So scale BOTH bounds with the
+    // backlog instead of dropping either: at 8x the time and 8x the objects a
+    // 17k backlog clears in a handful of frames of visible-but-survivable
+    // hitching rather than one four-second stall.
     if (backlog > kDrainBacklogUnbounded) {
-      max_us = 0;  // catching up matters more than this frame's smoothness
+      const uint32_t ceiling = uint32_t(std::max(0, REXCVAR_GET(vulkan_drain_catchup_max_us)));
+      max_us = ceiling;
+      // Catching up means catching up: with a wall clock to stop it, the
+      // per-frame OBJECT cap must come off, because it is the bound that was
+      // actually binding.
+      //
+      // Measured on an iPhone 13 mini, 2026-09-02, on the mission-completion
+      // screens: a backlog near 18000 fell by a flat 255 a frame for seventy
+      // frames, and one of those drains freed its 255 in 508 MICROSECONDS
+      // before stopping. The clock had been removed (max_us = 0) exactly as
+      // intended, and then a 256-object cap left over from the call site ended
+      // a drain that had spent half a millisecond, with 18000 still waiting.
+      // Every frame of that catch-up cost 5-36 ms of destruction, which is what
+      // the player felt as the completion screen crawling.
+      //
+      // The earlier failed experiment - a 16 ms ceiling that never caught up,
+      // 16321 -> 11323 and falling by a few hundred a frame - kept an object
+      // cap of 2048 alongside the clock, so it was throttled the same way.
+      // That is the mistake being corrected here, not repeated: one bound, not
+      // two.
+      max_objects = ceiling != 0 ? SIZE_MAX : max_objects;
     } else if (backlog > kDrainBacklogHigh && max_us != 0) {
       max_us *= 4;
     }
     const auto drain_start = std::chrono::steady_clock::now();
     bool out_of_time = false;
+    size_t recycled = 0;
+    size_t not_ready = 0;
+    size_t over_budget = 0;
     std::erase_if(retired_, [&](const RetiredObject& r) {
-      if (r.submission >= completed) return false;
+      if (r.submission >= completed) {
+        ++not_ready;
+        return false;
+      }
       // Recycling a set is a pointer push, not allocator work, so it does not
       // spend the per-frame budget. That is the point: an eviction sweep
       // retires thousands of sets at once and the very next frame re-misses on
@@ -2234,10 +2359,14 @@ class NrDeviceVulkan : public nrhi::Device {
         if (free_list.size() < kMaxFreeSetsPerLayout) {
           free_list.push_back(
               SetEntry{r.descriptor_set, r.descriptor_pool, r.descriptor_set_layout});
+          ++recycled;
           return true;
         }
       }
-      if (destroyed >= max_objects || out_of_time) return false;
+      if (destroyed >= max_objects || out_of_time) {
+        ++over_budget;
+        return false;
+      }
       // Checked before EVERY destroy, not sampled every eighth: a single
       // vmaDestroyImage of a large texture can run into milliseconds on
       // MoltenVK, so eight of them blew a 2 ms budget out to 73 ms. A
@@ -2269,6 +2398,15 @@ class NrDeviceVulkan : public nrhi::Device {
       if (r.buffer != VK_NULL_HANDLE) vmaDestroyBuffer(allocator_, r.buffer, r.buffer_allocation);
       return true;
     });
+    retired_recycled_ = recycled;
+    retired_destroyed_ = destroyed;
+    retired_not_ready_ = not_ready;
+    retired_over_budget_ = over_budget;
+    // Which of the two bounds stopped it. The distinction is the whole point:
+    // out of TIME means destruction is genuinely slow this frame and spreading
+    // it is right, while out of OBJECTS with time to spare means the cap is
+    // throttling a catch-up that could have finished.
+    retired_hit_object_cap_ = !out_of_time && destroyed >= max_objects;
   }
 
   void DestroyGuestOutputWrapper(NrTextureVulkan* wrapper) {
@@ -2611,8 +2749,30 @@ class NrDeviceVulkan : public nrhi::Device {
     info.renderPass = render_pass;
     info.subpass = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    // Time it. On MoltenVK this call is SPIR-V -> MSL -> Metal (measured at
+    // 362-686 ms for one shader, see InitPipelineCache below), it runs on the
+    // render thread by the interface contract at the top of this file, and it
+    // used to log nothing at all on success. A family built lazily on the
+    // frame it is first needed therefore stalled the thread that presents for
+    // seconds with no trace in the log - which is exactly how the photo-editor
+    // chain shipped, and why a player's crash report could not be read.
+    //
+    // WARN, not INFO: this has to survive the shipped default (log_level=warn)
+    // or it cannot do the one job it exists for. The threshold keeps it silent
+    // on a warm cache, where the same call is a file read.
+    const auto build_start = std::chrono::steady_clock::now();
     VkResult result = dfn.vkCreateGraphicsPipelines(vulkan_device_->device(), pipeline_cache_, 1,
                                                     &info, nullptr, &pipeline);
+    const int64_t build_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - build_start)
+                                 .count();
+    if (build_ms >= REXCVAR_GET(vulkan_slow_pipeline_build_warn_ms)) {
+      REXLOG_WARN(
+          "nrhi-vulkan: pipeline build took {} ms (vs '{}' ps '{}') - a cold "
+          "shader cache compiling on the render thread. Several of these in one "
+          "frame is a multi-second stall.",
+          build_ms, p.vs_entry, p.ps_entry);
+    }
     // MoltenVK stores the generated MSL in the cache, so this is what turns a
     // second run's shader compilation into a file read.
     pipeline_cache_dirty_.store(true, std::memory_order_relaxed);
@@ -2695,6 +2855,19 @@ class NrDeviceVulkan : public nrhi::Device {
   bool drain_budget_logged_ = false;
   // Retired objects still awaiting destruction after the last drain.
   size_t retired_backlog_ = 0;
+  // What the last drain actually did, and why it stopped. The backlog alone
+  // says a drain is losing but not to what: on the mission-completion screens
+  // it sat near 18000 while the drain freed a flat ~255 a frame at 5-36 ms,
+  // which is the per-frame object cap being the binding constraint rather than
+  // the clock - invisible in every number logged before this. Composition
+  // matters too, because a retirement carrying only a descriptor set is
+  // recycled for the price of a pointer push while one carrying an image goes
+  // through the allocator.
+  size_t retired_recycled_ = 0;    // sets returned to a free list (cheap)
+  size_t retired_destroyed_ = 0;   // objects actually destroyed (the expensive half)
+  size_t retired_not_ready_ = 0;   // still owned by the GPU - cannot be touched yet
+  size_t retired_over_budget_ = 0; // ready, but the frame's budget ran out
+  bool retired_hit_object_cap_ = false;
   // Index of the pool that satisfied the last allocation; tried first.
   size_t last_alloc_pool_ = SIZE_MAX;
   // Retired sets waiting to be handed out again, per layout. Render-thread

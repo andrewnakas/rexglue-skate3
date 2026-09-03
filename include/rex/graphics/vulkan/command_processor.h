@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -547,6 +548,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool device_lost_ = false;
   std::chrono::steady_clock::time_point soft_device_loss_window_start_{};
   uint32_t soft_device_loss_count_ = 0;
+  // Set the moment a device loss is seen while the app is in the background,
+  // cleared by the next submission that actually succeeds. While it is set, a
+  // loss is softened WITHOUT spending the foreground budget: iOS refuses GPU
+  // work to a background app and the refusals already queued keep arriving for
+  // a few milliseconds after the app is foreground again, so charging them to
+  // the foreground budget exhausted all 8 of it in 20 ms and killed the app on
+  // resume. See SoftenDeviceLoss.
+  std::atomic<bool> background_device_loss_pending_{false};
   // Returns true when this loss should be treated as transient (drop the work
   // and carry on) rather than latching device_lost_.
   bool SoftenDeviceLoss(const char* stage);

@@ -301,6 +301,16 @@ u32 XamAlloc_entry(u32 unk, u32 size, mapped_u32 out_ptr) {
   uint32_t ptr = REX_KERNEL_MEMORY()->SystemHeapAlloc(size);
   *out_ptr = ptr;
 
+  // SystemHeapAlloc returns 0 when the system heap cannot satisfy the
+  // request. Reporting SUCCESS anyway hands the guest a null pointer wrapped
+  // in a success code, and the caller writes through address 0 - a crash
+  // whose faulting address says nothing about the cause, several frames after
+  // the memory actually ran out. Say what happened instead.
+  if (ptr == 0 && size != 0) {
+    REXKRNL_ERROR("XamAlloc: system heap exhausted, {} bytes refused", size);
+    return X_ERROR_NOT_ENOUGH_MEMORY;
+  }
+
   return X_ERROR_SUCCESS;
 }
 
