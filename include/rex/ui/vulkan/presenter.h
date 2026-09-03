@@ -185,7 +185,10 @@ class VulkanPresenter final : public Presenter {
   // has already flipped back, and charging that burst to a budget sized for
   // occasional drawable timeouts is what killed the app on resume. See
   // SoftenDeviceLoss.
-  std::atomic<bool> background_device_loss_pending_{false};
+  // See VulkanCommandProcessor's field of the same name: nanoseconds on the
+  // steady clock of the last background device loss, 0 when none is
+  // outstanding, and bounded so a genuinely dead device is still reported.
+  std::atomic<int64_t> background_device_loss_ns_{0};
 
   // Usable for both the guest output image itself and for intermediate images.
   class GuestOutputImage {

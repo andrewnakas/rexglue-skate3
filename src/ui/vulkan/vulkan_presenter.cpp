@@ -1761,6 +1761,12 @@ void VulkanPresenter::DrainRetiredSwapchains(bool force) {
   }
 }
 
+// Deliberately a second copy of the command processor's constant rather than a
+// shared one: rexui does not link rexgraphics, and a header dependency in that
+// direction for one integer is a worse trade than repeating it. Keep the two in
+// step - the reasoning for the value lives with the other one.
+constexpr int64_t kBackgroundDeviceLossGraceNs = 10'000'000'000;  // 10 s
+
 bool VulkanPresenter::SoftenDeviceLoss(const char* stage) {
   // iOS refuses GPU work to a background app: every acquire and present comes
   // back VK_ERROR_DEVICE_LOST with
@@ -1777,7 +1783,8 @@ bool VulkanPresenter::SoftenDeviceLoss(const char* stage) {
   // and it leaves the budget whole for a genuine loss later in the session.
   // The command processor carries the same rule; see its SoftenDeviceLoss.
   if (!rex::graphics::IsAppForeground()) {
-    background_device_loss_pending_.store(true, std::memory_order_relaxed);
+    background_device_loss_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                     std::memory_order_relaxed);
     static std::atomic<uint32_t> s_bg{0};
     const uint32_t n = s_bg.fetch_add(1, std::memory_order_relaxed);
     if (n < 4 || (n & (n - 1)) == 0) {
@@ -1789,7 +1796,13 @@ bool VulkanPresenter::SoftenDeviceLoss(const char* stage) {
     }
     return true;
   }
-  if (background_device_loss_pending_.load(std::memory_order_relaxed)) {
+  const int64_t background_loss_ns = background_device_loss_ns_.load(std::memory_order_relaxed);
+  const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+  // Bounded, not "until a present succeeds": see the command processor's copy.
+  // Forgiving indefinitely would hide a real device loss behind a frozen
+  // screen instead of reporting it.
+  if (background_loss_ns != 0 &&
+      now_ns - background_loss_ns < kBackgroundDeviceLossGraceNs) {
     static std::atomic<uint32_t> s_resume{0};
     const uint32_t n = s_resume.fetch_add(1, std::memory_order_relaxed);
     if (n < 4 || (n & (n - 1)) == 0) {
@@ -2638,11 +2651,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_SUCCESS:
       // A frame reached the screen, so the GPU is genuinely ours - stop
       // forgiving device losses for free. See SoftenDeviceLoss.
-      background_device_loss_pending_.store(false, std::memory_order_relaxed);
+      background_device_loss_ns_.store(0, std::memory_order_relaxed);
       return PaintResult::kPresented;
     case VK_SUBOPTIMAL_KHR:
       // Suboptimal still means the frame was presented - same signal.
-      background_device_loss_pending_.store(false, std::memory_order_relaxed);
+      background_device_loss_ns_.store(0, std::memory_order_relaxed);
       return PaintResult::kPresentedSuboptimal;
     case VK_ERROR_DEVICE_LOST:
       // The image stays in the acquired state forever after this, which is

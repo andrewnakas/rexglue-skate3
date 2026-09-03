@@ -555,7 +555,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   // a few milliseconds after the app is foreground again, so charging them to
   // the foreground budget exhausted all 8 of it in 20 ms and killed the app on
   // resume. See SoftenDeviceLoss.
-  std::atomic<bool> background_device_loss_pending_{false};
+  // Nanoseconds on the steady clock of the last device loss seen while the app
+  // was in the background, or 0. NOT a plain flag: forgiving for free until a
+  // submission succeeds would never end if the device is GENUINELY lost, and a
+  // permanently black screen is a worse failure than an honest abort - that was
+  // the bug the device_lost_ latch used to cause. A window instead, generous
+  // against the 20 ms the real race takes and short against a session.
+  std::atomic<int64_t> background_device_loss_ns_{0};
   // Returns true when this loss should be treated as transient (drop the work
   // and carry on) rather than latching device_lost_.
   bool SoftenDeviceLoss(const char* stage);

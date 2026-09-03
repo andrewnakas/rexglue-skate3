@@ -166,6 +166,16 @@ REXCVAR_DEFINE_INT32(vulkan_gpu_clock_log_interval_frames, 0, "GPU/Vulkan",
 
 namespace rex::graphics::vulkan {
 
+// How long after a background-caused device loss the losses that follow are
+// forgiven without spending the soft-retry budget. iOS keeps completing the
+// command buffers it refused for a few milliseconds after the app is foreground
+// again - measured at 20 ms on an iPhone 13 mini - so this is three orders of
+// magnitude of headroom over the race it exists for, while still expiring
+// inside a session so a genuinely lost device is reported rather than hidden
+// behind a frozen screen.
+constexpr int64_t kBackgroundDeviceLossGraceNs = 10'000'000'000;  // 10 s
+
+
 namespace {
 
 const char* ReadbackResolveModeName(ReadbackResolveMode mode) {
@@ -6731,9 +6741,11 @@ bool VulkanCommandProcessor::SoftenDeviceLoss(const char* stage) {
           "carrying on",
           stage, n + 1);
     }
-    // Remember it, because the refusals outlive the background state - see
+    // Remember when, because the refusals outlive the background state - see
     // below.
-    background_device_loss_pending_.store(true, std::memory_order_relaxed);
+    background_device_loss_ns_.store(
+        std::chrono::steady_clock::now().time_since_epoch().count(),
+        std::memory_order_relaxed);
     return true;
   }
   // Foreground now, but were we a moment ago? Coming back from the background
@@ -6755,10 +6767,14 @@ bool VulkanCommandProcessor::SoftenDeviceLoss(const char* stage) {
   // arriving faster than that is by construction not what it is there to catch.
   //
   // So: once a background loss has been seen, keep softening for free until a
-  // submission actually SUCCEEDS. That is the only signal that says the GPU is
-  // really ours again, it cannot be faked by more failures, and it leaves the
-  // budget intact for a genuine loss that happens later in the session.
-  if (background_device_loss_pending_.load(std::memory_order_relaxed)) {
+  // submission actually SUCCEEDS - or until the grace window below expires.
+  // A success is the signal that says the GPU is really ours again and it
+  // cannot be faked by more failures; the window is what stops "forgive until
+  // success" from meaning "forgive forever" when the device really is gone,
+  // which would trade an honest abort for a permanently black screen.
+  const int64_t background_loss_ns = background_device_loss_ns_.load(std::memory_order_relaxed);
+  const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+  if (background_loss_ns != 0 && now_ns - background_loss_ns < kBackgroundDeviceLossGraceNs) {
     static std::atomic<uint32_t> s_resume{0};
     const uint32_t n = s_resume.fetch_add(1, std::memory_order_relaxed);
     if (n < 4 || (n & (n - 1)) == 0) {
@@ -7408,7 +7424,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       // The GPU is genuinely ours again - stop forgiving losses for free. See
       // SoftenDeviceLoss for why a successful submit is the signal used here
       // rather than a timer or the foreground flag.
-      background_device_loss_pending_.store(false, std::memory_order_relaxed);
+      background_device_loss_ns_.store(0, std::memory_order_relaxed);
     }
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
