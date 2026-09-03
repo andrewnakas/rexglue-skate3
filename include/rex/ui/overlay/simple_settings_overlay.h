@@ -123,6 +123,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // factored out.
   void PushQualityPresetRow(std::vector<RowSpec>& rows);
   void PushRenderScaleRow(std::vector<RowSpec>& rows);
+  void PushTextureMemoryRow(std::vector<RowSpec>& rows);
   void PushFrameCapRow(std::vector<RowSpec>& rows);
   void PushMsaaRow(std::vector<RowSpec>& rows);
   void PushShadowQualityRow(std::vector<RowSpec>& rows);
@@ -164,6 +165,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // row back to Custom rather than lying about which preset is active.
   int graphics_preset_index_ = 0;
   int resolution_scale_index_ = 0;
+  int tex_store_index_ = 1;  // 288 MB, matching the shipped default
   int frame_cap_index_ = 0;
   int aspect_ratio_index_ = 0;
   int msaa_index_ = 2;

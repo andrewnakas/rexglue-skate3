@@ -112,6 +112,21 @@ constexpr const char* kApplyActionName = "Apply & Restart";
 #endif
 
 constexpr std::array<int32_t, 3> kResolutionScales = {1, 2, 3};
+// Texture memory. The store holds decoded guest textures; when it is full the
+// renderer evicts continuously and every eviction is paid twice, once
+// rebuilding the descriptor sets it invalidated and once destroying what it
+// retired. Measured on a 4 GB iPhone: at 288 MB, completing a challenge took a
+// steady 76-82 fps to 6 fps and left it at 53-64; at 448 MB the same play never
+// dropped below 74. Higher is not free - it is resident memory on a device that
+// kills the largest app when it runs short - but it is not the simple trade it
+// looks like either, because a store that thrashes holds its own garbage:
+// peak memory measured LOWER at 448 (1338 MB) than at 288 (1631 MB).
+// double rather than int, so NearestValueIndex takes it; written back as an
+// integer, because the cvar is int32 and "448.000000" is not one.
+constexpr std::array<double, 7> kTexStoreMb = {256, 288, 320, 384, 448, 576, 768};
+constexpr std::array<const char*, 7> kTexStoreLabels = {
+    "256 MB", "288 MB (default)", "320 MB", "384 MB", "448 MB", "576 MB", "768 MB"};
+
 constexpr std::array<const char*, 3> kResolutionLabels = {"720p (1x)", "1440p (2x)",
                                                           "2160p (3x)"};
 constexpr std::array<const char*, 2> kAspectRatioLabels = {"16:9", "21:9 (Experimental)"};
@@ -130,8 +145,9 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 36> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 37> kOptionalSimpleSettingsCvars = {
     "skate3_diagnostics",
+    "skate3_native_render_scene_tex_store_mb",
     "menu_scale",
     "touch_controls",
     "touch_stick_size",
@@ -1304,6 +1320,12 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   graphics_api_index_ = HasGraphicsApiChoice() ? GraphicsApiIndexFromCvar() : 0;
   device_index_ = DeviceIndexFromCvar(device_list_);
   resolution_scale_index_ = ResolutionIndexFromCvar();
+  tex_store_index_ =
+      HasCvar("skate3_native_render_scene_tex_store_mb")
+          ? NearestValueIndex(
+                kTexStoreMb,
+                double(rex::cvar::Query<int32_t>("skate3_native_render_scene_tex_store_mb")))
+          : 1;
   frame_cap_index_ = FrameCapIndexFromCvar();
   aspect_ratio_index_ =
       HasCvar("skate3_ultrawide") && rex::cvar::Query<bool>("skate3_ultrawide") ? 1 : 0;
@@ -1782,6 +1804,39 @@ void SimpleSettingsDialog::PushRenderScaleRow(std::vector<RowSpec>& rows) {
     };
     rows.push_back(std::move(row));
   }
+}
+
+void SimpleSettingsDialog::PushTextureMemoryRow(std::vector<RowSpec>& rows) {
+  if (!HasCvar("skate3_native_render_scene_tex_store_mb")) {
+    return;
+  }
+  RowSpec row;
+  row.kind = RowSpec::kEnum;
+  row.label = "Texture Memory";
+  row.desc =
+      "How much memory the renderer may hold decoded textures in. Too small and "
+      "it evicts constantly, which is felt as the game slowing down after a "
+      "challenge or a level reload rather than as a stutter. Too large and the "
+      "system may kill the game to reclaim memory. Applies immediately; lowering "
+      "it forces one large eviction.";
+  for (const char* label : kTexStoreLabels) {
+    row.options.push_back(label);
+  }
+  row.index = &tex_store_index_;
+  row.on_enum_change = [this](int value) {
+    value = std::clamp(value, 0, static_cast<int>(kTexStoreMb.size()) - 1);
+    rex::cvar::SetFlagByName("skate3_native_render_scene_tex_store_mb",
+                             std::to_string(int32_t(kTexStoreMb[value])));
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  row.reset = [this] {
+    tex_store_index_ = NearestValueIndex(
+        kTexStoreMb, CvarDefaultDouble("skate3_native_render_scene_tex_store_mb", 288.0));
+    rex::cvar::SetFlagByName("skate3_native_render_scene_tex_store_mb",
+                             std::to_string(int32_t(kTexStoreMb[tex_store_index_])));
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  rows.push_back(std::move(row));
 }
 
 void SimpleSettingsDialog::PushFrameCapRow(std::vector<RowSpec>& rows) {
@@ -2289,6 +2344,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         rows.push_back(std::move(row));
       }
       PushRenderScaleRow(rows);
+      PushTextureMemoryRow(rows);
       PushFrameCapRow(rows);
       if (HasCvar("skate3_ultrawide")) {
         RowSpec row;
@@ -2671,6 +2727,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       header("Quality");
       PushQualityPresetRow(rows);
       PushRenderScaleRow(rows);
+      PushTextureMemoryRow(rows);
       PushFrameCapRow(rows);
       PushMsaaRow(rows);
       PushShadowQualityRow(rows);

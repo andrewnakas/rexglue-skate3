@@ -58,6 +58,7 @@ REXCVAR_DEFINE_INT32(vulkan_mvk_log_level, 1, "GPU/Vulkan",
 #endif
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <cstdlib>
 
 namespace {
@@ -169,18 +170,39 @@ std::vector<std::string> ApplyArgumentFileOverrides(std::vector<std::string> arg
 // Texture / mesh store budgets, chosen from the memory this process is
 // actually allowed rather than from a constant.
 //
-// The large tier IS v2.5.0: 288 MB of textures, 224 MB of meshes, the values
-// every 4 GB phone shipped with and the only configuration this build has been
-// played against with the retired-object drain in its shipped (unbounded)
-// form. A 448/128 rebalance was tried on 2026-09-01 and measured fewer
-// eviction sweeps (6 vs 50 in comparable play), but every one of those runs
-// also carried a capped catch-up drain that left 11-17k retired objects
-// walked by erase_if on EVERY frame - the game was broadly slower and the
-// budget half of the change could not be separated from the drain half. Until
-// 448 is measured on its own, against the unbounded drain, the tested values
-// stay. Both budgets remain overridable from Documents/user/ios_args.txt with
-// no rebuild (skate3_native_render_scene_tex_store_mb / _mesh_store_mb), which
-// is how the next measurement should be taken.
+// 288 MB of textures on a 4 GB phone - the value v2.5.0 shipped, kept
+// deliberately after 448 was measured AND played, because the two disagreed.
+//
+// Where 448 wins, it wins enormously. Completing a challenge reloads the level
+// and leaves the app around 450 MB heavier for good, so at 288 the store sits
+// ON its cap afterwards and evicts continuously. Measured across three reloads,
+// one of them decoding 12064 meshes:
+//
+//              288 MB          448 MB
+//   min fps    6.3             74.0
+//   <55 fps    2 windows       none
+//   backlog    11563           159
+//   drain      50 ms           17 ms
+//   table_miss 46 ms           15 ms
+//   peak mem   1631 MB         1338 MB
+//
+// The last row is worth keeping in mind, because it is the opposite of the
+// obvious worry: the BIGGER store used LESS memory. A store that thrashes holds
+// its own garbage until the drain catches up.
+//
+// And yet 448 was reported as WORSE in ordinary free-roam movement - more
+// frequent small slowdowns while skating around, which is the majority of play
+// and is not what the session above measured. That session was dominated by
+// reloads. A plausible mechanism is that eviction cost scales with how much is
+// resident, so a larger store makes each sweep longer even though it needs
+// fewer of them, and streaming while moving triggers sweeps steadily rather
+// than in bursts. It has NOT been isolated, so it is not asserted here.
+//
+// Two measurements that disagree, one of which is a real player skating
+// normally: ship the conservative, long-shipped value and expose the choice.
+// "Texture Memory" in Settings > Video offers 256 through 768 MB and takes
+// effect immediately, and the settings file beats this default - which is why
+// these budgets are only appended below when the player has not chosen one.
 //
 // A FLOOR OF 256 MB APPLIES TO BOTH STORES and is not visible from here:
 // skate3_native_scene_gpu.cpp computes each cap as
@@ -372,10 +394,11 @@ std::vector<std::string> BuildIOSArguments() {
       // the binding constraint. Textures cost more here than the numbers
       // suggest, too, since Metal exposes no BC formats and every DXT surface
       // is expanded to RGBA8 on upload (8x for DXT1).
-      // Sized against what the KERNEL will actually let this process have - see
-      // PickStoreBudgets above. On a 4 GB phone these are v2.5.0's 288/224.
-      "--skate3_native_render_scene_tex_store_mb=" + std::to_string(store_budgets.tex_mb),
-      "--skate3_native_render_scene_mesh_store_mb=" + std::to_string(store_budgets.mesh_mb),
+      // The store budgets are NOT named here - they are appended below, and
+      // only when the player has not chosen a value in the settings menu. A
+      // command-line argument beats settings.toml, so naming them
+      // unconditionally is exactly what made the V-Sync row appear to work and
+      // then silently revert on the next launch.
 
       // The Xenos texture cache is a SEPARATE budget from the two above, and
       // on device it is the largest single consumer of device-local memory:
@@ -503,6 +526,41 @@ std::vector<std::string> BuildIOSArguments() {
       // values without a rebuild.
       "--audio_device_sample_frames=512",
   };
+
+  // Per-device store budgets, but only as a DEFAULT. cvar::LoadConfig applies
+  // settings.toml first and the command line second, so anything named in the
+  // list above can never be changed from the settings menu: the menu would
+  // write the file, this would overwrite it at the next launch, and the row
+  // would look broken in the specific way that wastes an evening. The V-Sync
+  // row was removed for exactly that. So if the player has already chosen a
+  // texture budget, say nothing and let their choice stand.
+  //
+  // A substring scan rather than a TOML parse: this runs before the cvar system
+  // exists, the keys are unique, and the worst case of being crude is that a
+  // commented-out line suppresses the default and the cvar's own compiled
+  // default applies instead - a working configuration either way.
+  {
+    std::string settings;
+    {
+      std::ifstream in(documents / "user" / "settings.toml");
+      if (in) {
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        settings = buf.str();
+      }
+    }
+    const auto chosen = [&settings](const char* key) {
+      return settings.find(key) != std::string::npos;
+    };
+    if (!chosen("skate3_native_render_scene_tex_store_mb")) {
+      args.push_back("--skate3_native_render_scene_tex_store_mb=" +
+                     std::to_string(store_budgets.tex_mb));
+    }
+    if (!chosen("skate3_native_render_scene_mesh_store_mb")) {
+      args.push_back("--skate3_native_render_scene_mesh_store_mb=" +
+                     std::to_string(store_budgets.mesh_mb));
+    }
+  }
 
   return ApplyArgumentFileOverrides(std::move(args), documents / "user" / "ios_args.txt",
                                     "ios_args");
