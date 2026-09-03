@@ -66,21 +66,40 @@ function(rexglue_apply_target_settings target_name)
                 # (verified from /proc/cpuinfo on a Galaxy S23 FE), and a
                 # stray SVE instruction in 7.7M lines of guest code is a SIGILL
                 # somewhere in the first minute of play.
+                # The DEFAULT has to run on any 64-bit Android phone, because
+                # this is what a shared APK is built from. Naming a core here
+                # instead is for a build that will only ever run on that one
+                # device.
+                #
+                # Learned the hard way: a release built with -mcpu=cortex-a710
+                # ran perfectly on an ARMv9 phone and died instantly on a
+                # Cortex-A78. Clang had emitted ARMv8.3 load-acquire (ldapr,
+                # ldaprb) throughout the guest code, and unlike the pointer-auth
+                # and BTI hints - which older cores quietly ignore - those are
+                # real instructions that fault. The app closed the moment guest
+                # code ran, with no error a player could act on.
                 set(REXGLUE_ANDROID_ARM_MCPU "" CACHE STRING
-                    "-mcpu for the Android arm64 guest code (empty = generic -march)")
-                set(REXGLUE_ANDROID_ARM_MARCH "armv8.2-a+crypto+fp16+dotprod" CACHE STRING
+                    "-mcpu for the Android arm64 guest code. Leave EMPTY for anything you will
+                     distribute; naming a core builds instructions older phones cannot execute.")
+                set(REXGLUE_ANDROID_ARM_MARCH "armv8-a" CACHE STRING
                     "-march for the Android arm64 guest code when REXGLUE_ANDROID_ARM_MCPU is empty")
                 if(REXGLUE_ANDROID_ARM_MCPU)
                     target_compile_options(${target_name} PRIVATE
                         $<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=${REXGLUE_ANDROID_ARM_MCPU}>)
+                    # A single-device build knows its atomics are there, so
+                    # emit them inline rather than through the dispatcher.
+                    target_compile_options(${target_name} PRIVATE
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-mno-outline-atomics>)
                 else()
                     target_compile_options(${target_name} PRIVATE
                         $<$<COMPILE_LANGUAGE:C,CXX>:-march=${REXGLUE_ANDROID_ARM_MARCH}>)
+                    # Outline atomics keep the LSE fast path on every phone that
+                    # has it and fall back at RUN time on those that do not, so
+                    # one binary suits both. This is clang's default; it is
+                    # named here so a later change cannot quietly drop it.
+                    target_compile_options(${target_name} PRIVATE
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-moutline-atomics>)
                 endif()
-                # LSE is in the baseline either way, so emit the atomics inline
-                # rather than through the runtime-dispatched outline helpers.
-                target_compile_options(${target_name} PRIVATE
-                    $<$<COMPILE_LANGUAGE:C,CXX>:-mno-outline-atomics>)
             else()
                 target_compile_options(${target_name} PRIVATE -march=armv8-a)
             endif()
