@@ -611,7 +611,10 @@ AndroidStoreBudgets PickAndroidStoreBudgets() {
   } else if (total_mb >= 5000) {
     b = {288, 224, "standard (6 GB+)"};
   } else {
-    b = {224, 160, "small"};
+    // 256 is the floor both stores are clamped to in
+    // skate3_native_scene_gpu.cpp, so asking for less only produces a warning
+    // and the same allocation. Say what will actually happen.
+    b = {256, 256, "small (clamped at the 256 MB floor)"};
   }
   std::fprintf(stderr, "store budgets: %s tier (%llu MB RAM) -> tex %u MB, mesh %u MB\n", b.tier,
                (unsigned long long)total_mb, b.tex_mb, b.mesh_mb);
