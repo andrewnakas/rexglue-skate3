@@ -755,6 +755,14 @@ class Presenter {
   // than 8 bits of precision per channel (though the image provided by the
   // refresher may still have a higher storage precision) - if not written, it
   // will be assumed to be false.
+  // UI thread only. Set when a reconnection was forced by a suspend rather
+  // than by anything reporting a failure, so the graphics backend knows to
+  // throw away the platform surface as well as the swapchain. Rebuilding only
+  // the swapchain is not enough after a suspend: the new swapchain is created
+  // from the SAME surface, and a surface the display system has quietly
+  // stopped showing goes on quietly not showing it.
+  bool force_full_surface_rebuild_ = false;
+
   virtual bool RefreshGuestOutputImpl(
       uint32_t mailbox_index, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
       std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) = 0;
@@ -908,6 +916,17 @@ class Presenter {
   // window / surface state changes, not the actual state from the platform.
   bool InSurfaceOnMonitorFromUIThread() const;
 
+  // Called from the guest output thread every frame. Asks the window to paint
+  // when frames are being produced but nothing is reaching the screen. See the
+  // comment at the call site in RefreshGuestOutput.
+  void MaybeRecoverFromPresentStall();
+
+  // Consecutive failed attempts to recover an outdated surface connection.
+  // Zeroed the moment one succeeds. Drives the immediate-then-throttled retry
+  // in PaintFromUIThread; see the comment there for why giving up after one
+  // attempt left a running emulator behind a frozen window.
+  uint32_t surface_recovery_attempts_ = 0;
+
   // Calls PaintAndPresentImpl and does post-paint checks that are safe to do on
   // both the UI thread and the guest output thread. See the information about
   // PaintAndPresentImpl for details.
@@ -1004,6 +1023,29 @@ class Presenter {
   // connection as the next successful reconnection should be followed by a
   // repaint request anyway.
   std::atomic<bool> ui_thread_paint_requested_{false};
+  // Present-stall recovery. After a suspend/resume the guest carries on
+  // producing frames at full rate while the UI thread sits idle in poll(),
+  // because neither side will speak first: RefreshGuestOutput does nothing at
+  // all when the paint mode is kNone, and the UI thread only paints when asked.
+  // The result is a game running perfectly behind a frozen picture. These track
+  // when anything last actually reached the screen so the guest can break the
+  // standoff. Steady-clock nanoseconds; 0 means "nothing presented yet".
+  std::atomic<uint64_t> last_present_steady_ns_{0};
+  std::atomic<uint64_t> last_stall_kick_steady_ns_{0};
+  std::atomic<uint32_t> stall_kick_count_{0};
+  // Suspend detection, done here because the guest output thread runs every
+  // frame and needs no help from anything else. CLOCK_BOOTTIME counts time
+  // spent suspended and CLOCK_MONOTONIC does not, so the difference between
+  // how much each advanced between two frames IS the length of the sleep.
+  uint64_t last_boot_ns_ = 0;
+  uint64_t last_mono_ns_ = 0;
+  // Set when a suspend is detected. The swapchain must be rebuilt after one
+  // even though nothing reports an error: vkQueuePresentKHR returns success
+  // once the image has been handed to the presentation engine, which is not a
+  // promise that it was ever put on screen. A swapchain that survived a
+  // suspend can swallow every frame silently, which looks exactly like a
+  // frozen game that is running perfectly.
+  std::atomic<bool> force_surface_reconnect_{false};
 
   std::mutex guest_output_paint_config_mutex_;
   // UI thread: writable, guest output thread: read-only.

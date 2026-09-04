@@ -14,6 +14,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <utility>
 
 #include <rex/assert.h>
@@ -51,6 +52,17 @@ REXCVAR_DEFINE_BOOL(presenter_present_cadence_log, false, "UI/Presenter",
                     "swap-to-swap interval, standard deviation, and frame-to-frame jitter "
                     "(mean absolute successive difference). Attributes perceived judder to "
                     "irregular present timing versus low frame rate.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    present_stall_recovery_ms, 1000, "UI/Presenter",
+    "How long the guest may produce frames that never reach the screen before the guest thread "
+    "asks the window to paint, in milliseconds (0 = off). This is the suspend/resume freeze: "
+    "after a resume the emulator runs on at full speed while the UI thread sits idle in poll(), "
+    "because the guest side does nothing at all when painting is marked unavailable and the UI "
+    "side only paints when asked. Neither speaks first and the picture never returns. Whichever "
+    "side is still alive has to break the tie.")
+    .range(0, 60000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
@@ -111,6 +123,13 @@ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
 
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
+
+// How many failed surface-recovery attempts are retried immediately before
+// backing off to the window's paint tick. Enough that a surface which returns
+// within a frame or two is picked up without a visible stall, small enough
+// that a surface which is gone for good cannot spin the UI thread.
+constexpr uint32_t kSurfaceRecoveryImmediateAttempts = 8;
+
 
 GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name) {
   std::string lowered = effect_name;
@@ -490,9 +509,72 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
     }
     // Try to recover from the connection becoming outdated in the previous
-    // paint.
-    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+    // paint - or from it having failed to connect at all.
+    //
+    // kUnconnectedRetryAtStateChange is the state a suspend/resume actually
+    // leaves behind, and its own definition is the trap: it waits for
+    // "anything to change in the state of the surface, such as its size". A
+    // resume changes nothing. Same window, same size, same monitor - so the
+    // one event that would retry never arrives, and the presenter waits for it
+    // forever while the emulator runs on behind a frozen picture.
+    //
+    // A paint that was explicitly asked for is itself a reason to try again,
+    // so treat it as one. Only reached when do_paint is set, so a routine
+    // idle UI paint does not turn into a reconnection attempt.
+    // A suspend was detected: force the connection to be treated as outdated
+    // even though it still claims to be perfectly paintable, so the code below
+    // rebuilds it. Nothing else will ever mark it, because as far as Vulkan is
+    // concerned nothing has gone wrong.
+    if (force_surface_reconnect_.exchange(false, std::memory_order_relaxed) &&
+        surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+      surface_paint_connection_state_ = SurfacePaintConnectionState::kConnectedOutdated;
+      // And rebuild the platform surface too, not just the swapchain. deck11
+      // rebuilt the swapchain twenty-four milliseconds after the resume, every
+      // present after that succeeded, and the screen still never changed -
+      // because the new swapchain was created from the same surface that had
+      // already stopped being displayed.
+      force_full_surface_rebuild_ = true;
+    }
+    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated ||
+        surface_paint_connection_state_ ==
+            SurfacePaintConnectionState::kUnconnectedRetryAtStateChange) {
       UpdateSurfacePaintConnectionFromUIThread(nullptr, false);
+      if (surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedPaintable) {
+        // Recovery failed. Ask to be called again, rather than going quiet.
+        //
+        // Without this the presenter gives up after ONE failed attempt: the
+        // paint below is skipped, so request_repaint_immediately is never set,
+        // the paint mode is dropped to kNone, and nothing ever asks the window
+        // for another go. The emulator carries on running behind a picture
+        // that never comes back - which is exactly the shape of "the screen
+        // froze but the music kept playing" after a suspend/resume, where the
+        // surface is reliably not ready yet on the first attempt.
+        //
+        // The first few retries are immediate, so a surface that returns
+        // quickly is picked up without a visible stall. After that they drop
+        // to the window's own paint tick: a surface that is never coming back
+        // must not spin the UI thread at 100%.
+        if (++surface_recovery_attempts_ <= kSurfaceRecoveryImmediateAttempts) {
+          request_repaint_immediately = true;
+        } else {
+          request_repaint_at_tick = true;
+        }
+        // Loud on the first failure, then rare - a recovery that is going to
+        // work usually works within a frame or two, and one that is not needs
+        // to leave a trail in the log without drowning it.
+        if (surface_recovery_attempts_ == 1 || (surface_recovery_attempts_ % 240) == 0) {
+          REXLOG_WARN(
+              "Presenter: the surface is not paintable yet (state {}), {} recovery attempt(s) so "
+              "far - still retrying",
+              int(surface_paint_connection_state_), surface_recovery_attempts_);
+        }
+      } else {
+        if (surface_recovery_attempts_) {
+          REXLOG_INFO("Presenter: surface recovered after {} failed attempt(s)",
+                      surface_recovery_attempts_);
+        }
+        surface_recovery_attempts_ = 0;
+      }
     }
     // If still paintable or recovered successfully, paint.
     if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
@@ -590,6 +672,7 @@ bool Presenter::RefreshGuestOutput(
       // If failed to refresh, don't send the currently writable image to the
       // mailbox as it may be in an undefined state. Don't disable the guest
       // output either though because the failure may be something transient.
+      //
       return false;
     }
     guest_output_active_last_refresh_ = true;
@@ -726,6 +809,25 @@ bool Presenter::RefreshGuestOutput(
         break;
     }
   }
+  // Break the standoff if the guest is producing frames that never reach the
+  // screen.
+  //
+  // This is the observed suspend/resume freeze, confirmed from thread dumps
+  // taken while it was happening: the GPU command processor was inside this
+  // very function at a steady sixty-odd frames a second, and the UI thread was
+  // idle in poll() inside the GTK main loop. Both healthy, and neither will
+  // speak first - the switch above does nothing whatsoever under kNone, and
+  // the UI thread only paints when it is asked to. Nothing is logged, nothing
+  // fails, and the picture never comes back.
+  //
+  // So the side that is demonstrably alive does the asking. Deliberately
+  // outside the paint-mode switch and outside the mutex: it does not touch the
+  // connection or the mode, only the window, which
+  // RequestPaintOrConnectionRecoveryViaWindow already documents as callable
+  // from any thread - and which this same function already calls from this
+  // same thread under kUIThreadOnRequest.
+  MaybeRecoverFromPresentStall();
+
   // Handle GPU loss when not in the middle of the function anymore, and
   // lifecycle management from the GPU loss callback is fine on the UI thread.
   if (host_gpu_loss_callback_) {
@@ -737,6 +839,100 @@ bool Presenter::RefreshGuestOutput(
   }
 
   return is_active;
+}
+
+void Presenter::MaybeRecoverFromPresentStall() {
+  const int32_t stall_ms = REXCVAR_GET(present_stall_recovery_ms);
+  if (stall_ms <= 0 || !window_ || !surface_) {
+    return;
+  }
+
+#if defined(__linux__)
+  // Notice a suspend, and rebuild the swapchain because of it rather than
+  // because anything reported a problem.
+  //
+  // Nothing does report one. vkQueuePresentKHR returns success once the image
+  // has been handed to the presentation engine, and that is not a promise it
+  // was ever put on screen - so a swapchain carried across a suspend can
+  // swallow every frame in silence. The result is a game that is running
+  // perfectly, presenting happily, and showing a still picture, with not one
+  // error anywhere to explain it. That is what every capture of this freeze
+  // has looked like.
+  //
+  // Detected from the guest output thread because it runs every frame and
+  // needs nothing else to cooperate: CLOCK_BOOTTIME counts time spent
+  // suspended and CLOCK_MONOTONIC does not, so the gap between how much each
+  // advanced between two frames is the length of the sleep.
+  {
+    struct timespec mono = {}, boot = {};
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    clock_gettime(CLOCK_BOOTTIME, &boot);
+    const uint64_t mono_ns = uint64_t(mono.tv_sec) * 1000000000ull + uint64_t(mono.tv_nsec);
+    const uint64_t boot_ns = uint64_t(boot.tv_sec) * 1000000000ull + uint64_t(boot.tv_nsec);
+    if (last_mono_ns_ != 0) {
+      const int64_t suspended_ns =
+          int64_t(boot_ns - last_boot_ns_) - int64_t(mono_ns - last_mono_ns_);
+      // 250 ms, not two seconds. A one-second suspend is enough to freeze the
+      // game on the Steam Deck, and the old threshold sailed straight past it.
+      // This difference is not an estimate of anything - it IS the time spent
+      // suspended, because CLOCK_BOOTTIME counts it and CLOCK_MONOTONIC does
+      // not, so an ordinary scheduling delay moves both equally and cancels.
+      if (suspended_ns > 250000000ll) {
+        REXLOG_WARN(
+            "Presenter: {} ms suspend detected - rebuilding the surface connection, because "
+            "a swapchain that outlived a suspend can accept frames and show none of them",
+            suspended_ns / 1000000ll);
+        force_surface_reconnect_.store(true, std::memory_order_relaxed);
+        // Do not wait for the stall timer. The picture is already wrong.
+        last_stall_kick_steady_ns_.store(0, std::memory_order_relaxed);
+        window_->RequestPaintBypassingFrameClock(Window::PaintBypassReason::kSuspendResume);
+      }
+    }
+    last_mono_ns_ = mono_ns;
+    last_boot_ns_ = boot_ns;
+  }
+#endif  // __linux__
+
+  const uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  const uint64_t last_present_ns = last_present_steady_ns_.load(std::memory_order_relaxed);
+  if (last_present_ns == 0) {
+    // Nothing has ever been presented - still starting up, and a frame that
+    // has not arrived yet is not a stall.
+    last_present_steady_ns_.store(now_ns, std::memory_order_relaxed);
+    return;
+  }
+  if (now_ns - last_present_ns < uint64_t(stall_ms) * 1000000ull) {
+    return;
+  }
+  // Rate-limit the kicks. The guest calls this every frame, and hammering the
+  // window sixty times a second would be its own bug.
+  const uint64_t last_kick_ns = last_stall_kick_steady_ns_.load(std::memory_order_relaxed);
+  if (last_kick_ns != 0 && now_ns - last_kick_ns < 250000000ull) {
+    return;
+  }
+  last_stall_kick_steady_ns_.store(now_ns, std::memory_order_relaxed);
+
+  const uint32_t kick = stall_kick_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (kick == 1 || (kick % 40) == 0) {
+    REXLOG_WARN(
+        "Presenter: the guest is producing frames but nothing has reached the screen for {} ms "
+        "- asking the window to paint (kick {})",
+        (now_ns - last_present_ns) / 1000000ull, kick);
+  }
+
+  // Force the tick AND clear the latch. RequestPaintOrConnectionRecoveryViaWindow
+  // returns early without touching the window when a paint request is already
+  // outstanding, which is correct in normal operation and exactly wrong here:
+  // the outstanding request is the one that was never answered.
+  ForceUIThreadPaintTick();
+  ui_thread_paint_requested_.store(true, std::memory_order_relaxed);
+  // Bypassing the frame clock, not an ordinary RequestPaint. An ordinary one
+  // only marks the widget dirty and leaves the toolkit to schedule the draw,
+  // and a toolkit that has stopped scheduling draws is precisely the situation
+  // this is trying to escape.
+  window_->RequestPaintBypassingFrameClock(Window::PaintBypassReason::kFrameClockStalled);
 }
 
 void Presenter::SetGuestFrameStatsEnabled(bool enabled) {
@@ -1700,6 +1896,20 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    // Something actually reached the screen. This is the only signal the
+    // stall detector in RefreshGuestOutput trusts - not "we tried to paint",
+    // which stays true right through the freeze it is looking for.
+    last_present_steady_ns_.store(
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count()),
+        std::memory_order_relaxed);
+    const uint32_t kicks = stall_kick_count_.exchange(0, std::memory_order_relaxed);
+    if (kicks) {
+      REXLOG_INFO("Presenter: presentation resumed after {} stall kick(s)", kicks);
+    }
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;

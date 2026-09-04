@@ -37,6 +37,8 @@ class InputSystem : public system::IInputSystem {
   void AddDriver(std::unique_ptr<InputDriver> driver);
   void AttachWindow(rex::ui::Window* window);
   void SetActiveCallback(std::function<bool()> callback);
+  // Forwarded to every driver. See InputDriver::OnSystemResume.
+  void OnSystemResume() override;
   void SetMenuChordCallback(std::function<void()> callback);
   // Fired on the rising edge of the picker chord (default: Guide button).
   void SetPickerChordCallback(std::function<void()> callback);

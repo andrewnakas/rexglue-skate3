@@ -20,6 +20,10 @@ class IInputSystem {
   virtual ~IInputSystem() = default;
   virtual X_STATUS Setup() = 0;
   virtual void Shutdown() = 0;
+  // The machine has woken from a suspend; re-establish any devices that went
+  // away while it was asleep. Default is to do nothing, for systems whose
+  // devices cannot.
+  virtual void OnSystemResume() {}
 };
 
 }  // namespace rex::system

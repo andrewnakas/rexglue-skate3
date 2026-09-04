@@ -59,6 +59,17 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
+REXCVAR_DEFINE_INT32(vulkan_acquire_timeout_ms, 2000, "UI/Vulkan",
+                     "How long to wait for a swapchain image before giving up on the swapchain "
+                     "and rebuilding it, in milliseconds. This is the escape from a frozen "
+                     "resume: across a suspend the compositor can take every swapchain image "
+                     "with it and never give one back, and an unbounded wait leaves the render "
+                     "thread stuck in the driver with the game apparently hung. Must stay well "
+                     "above a worst-case frame - a FIFO acquire legitimately blocks until "
+                     "vblank. 0 restores the unbounded wait.")
+    .range(0, 60000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_present_timing_log, false, "UI/Vulkan",
                     "Log averaged Vulkan host presentation timing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
@@ -840,6 +851,21 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.DestroySwapchainAndVulkanSurface();
   }
 #endif
+  // The same treatment, for the same reason, after a suspend. The platform has
+  // reconfigured things underneath and the existing VkSurface is not visibly
+  // recoverable - it accepts frames and shows none of them, reporting success
+  // throughout. Only the caller knows a suspend happened, because nothing in
+  // Vulkan ever says so.
+  if (force_full_surface_rebuild_) {
+    force_full_surface_rebuild_ = false;
+    if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+      REXLOG_INFO(
+          "VulkanPresenter: rebuilding the Vulkan surface itself, not just the swapchain - "
+          "recreating only the swapchain leaves it attached to a surface that has already "
+          "stopped being displayed");
+      paint_context_.DestroySwapchainAndVulkanSurface();
+    }
+  }
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
     bool surface_unusable;
@@ -1680,14 +1706,40 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
   const auto timing_acquire_start = std::chrono::steady_clock::now();
+  // Bounded, not UINT64_MAX. Acquire blocking forever is how a suspended
+  // machine comes back frozen: the compositor that owned every swapchain
+  // image went away across the suspend, nothing is ever returned, and the
+  // render thread sits in the driver where no amount of input can reach it.
+  // A timeout turns that dead hang into the outdated-swapchain path the
+  // presenter already knows how to recover from.
+  //
+  // It has to be generous. In FIFO the acquire legitimately blocks until a
+  // vblank frees an image, and a stalled frame or a hitching compositor can
+  // stretch that a long way; a timeout that fires during normal play would
+  // rebuild the swapchain over and over. Seconds, not milliseconds.
+  const int32_t acquire_timeout_ms = REXCVAR_GET(vulkan_acquire_timeout_ms);
+  const uint64_t acquire_timeout_ns =
+      acquire_timeout_ms > 0 ? uint64_t(acquire_timeout_ms) * 1000000ull : UINT64_MAX;
   VkResult acquire_result =
-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-                                VK_NULL_HANDLE, &swapchain_image_index);
+      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, acquire_timeout_ns,
+                                acquire_semaphore, VK_NULL_HANDLE, &swapchain_image_index);
   const auto timing_acquire_end = std::chrono::steady_clock::now();
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
       break;
+    case VK_TIMEOUT:
+    case VK_NOT_READY:
+      // No image, and the semaphore was left untouched - so nothing may be
+      // submitted, and returning here is safe for exactly the reason the
+      // comment above the acquire gives. Treat it as an outdated connection
+      // so the swapchain is rebuilt rather than waited on again.
+      REXLOG_WARN(
+          "VulkanPresenter: Swapchain image acquisition timed out after {} ms - "
+          "rebuilding the swapchain. If this follows a suspend/resume, that is "
+          "the recovery working.",
+          acquire_timeout_ms);
+      return PaintResult::kNotPresentedConnectionOutdated;
     case VK_ERROR_DEVICE_LOST:
       REXLOG_ERROR(
           "VulkanPresenter: Failed to acquire the swapchain image as the "

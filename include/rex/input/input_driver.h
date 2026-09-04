@@ -49,6 +49,16 @@ class InputDriver {
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
 
+  // The machine has just woken from a suspend. Drivers whose devices can go
+  // away underneath them across a sleep re-establish them here.
+  //
+  // On the Steam Deck the pad is a USB device and re-enumerates across a
+  // suspend. If the driver misses that, the game goes on polling a handle that
+  // answers with the last state it ever saw, forever - which looks exactly like
+  // a frozen game, because the skater rolls to a halt and nothing ever asks the
+  // camera to move again.
+  virtual void OnSystemResume() {}
+
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;
   }

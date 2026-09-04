@@ -45,10 +45,20 @@ REXCVAR_DEFINE_STRING(input_backend, kDefaultInputBackend, "Input", "Input backe
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
-// Back+Start is deliberately not the default: Steam Input uses View+Menu
-// (Back+Start) as its Guide-button chord on pads without a Guide button, so
-// opening our settings would also pop the Steam overlay.
-REXCVAR_DEFINE_STRING(menu_chord, "rb+start", "Input",
+// Back+Start, i.e. View+Menu, i.e. Select+Start.
+//
+// This was rb+start, on the reasoning that Steam Input claims View+Menu as its
+// Guide-button chord on pads that have no Guide button of their own. That is
+// still true, but it is the wrong trade for this game: RB is held constantly
+// while skating and Start is pause, so the old default opened the settings
+// screen every time a player paused out of a grind. A chord that fires during
+// normal play is a worse bug than a chord that overlaps Steam's on the subset
+// of pads lacking a Guide button - and the Steam Deck, the machine this most
+// affects, has a Steam button, so Steam Input does not need the chord there.
+//
+// Pads with no Guide button may still see the Steam overlay open alongside the
+// settings screen. Those players can pick another chord in Settings -> Input.
+REXCVAR_DEFINE_STRING(menu_chord, "back+start", "Input",
                       "Controller chord that toggles the settings menu. Buttons joined by '+': "
                       "a, b, x, y, lb, rb, l3, r3, back, start, dpad_up, dpad_down, dpad_left, "
                       "dpad_right. Empty disables the chord.");
@@ -129,6 +139,14 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
   window_ = window;
   for (auto& driver : drivers_) {
     driver->OnWindowAvailable(window);
+  }
+}
+
+void InputSystem::OnSystemResume() {
+  REXLOG_INFO("Input: waking from suspend - asking {} driver(s) to re-establish their devices",
+              drivers_.size());
+  for (auto& driver : drivers_) {
+    driver->OnSystemResume();
   }
 }
 
