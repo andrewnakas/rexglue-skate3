@@ -638,6 +638,19 @@ std::vector<std::string> BuildAndroidArguments() {
       // The native renderer replaces the emulated Xenos pipeline; it is the
       // whole reason a phone can run this at all.
       "--skate3_native_render_scene=true",
+      // ...and because it does, the emulated pipeline's requirements are not
+      // this build's requirements. Only the Xenos emulation wants geometry
+      // shaders and non-solid fill; demanding them turns away GPUs that can
+      // run the game perfectly well.
+      //
+      // Adreno happens to have both, which is why leaving these out looked
+      // fine on the one phone they were written on. A PowerVR GE8320 has
+      // neither: it enumerated, failed the geometry-shader check, and the app
+      // exited during graphics setup before drawing anything. Mali parts are
+      // commonly in the same position. iOS carries these two lines for the
+      // same reason, Metal having no geometry shaders at all.
+      "--vulkan_require_geometry_shader=false",
+      "--vulkan_require_fill_mode_non_solid=false",
       "--skate3_auto_install_dlc=true",
       "--vulkan_log_debug_messages=false",
       "--skate3_native_render_scene_perf_log=false",
