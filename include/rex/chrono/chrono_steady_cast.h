@@ -66,7 +66,28 @@ struct clock_time_conversion<std::chrono::steady_clock, ::rex::chrono::WinSystem
     std::atomic_thread_fence(std::memory_order_acq_rel);
 
     auto delta = t - nt_now;
-    return steady_now + delta;
+    // Clamp before widening. steady_clock counts NANOseconds while
+    // WinSystemClock counts hundreds of them, so converting this delta
+    // multiplies it by a hundred - and a delta that sits comfortably inside
+    // int64 in 100 ns units can overflow it in nanoseconds. That is not
+    // hypothetical: a guest timer set to an absolute time near the 1601 epoch
+    // produces a delta of about minus four hundred and twenty-five years, which
+    // wraps to a deadline roughly a hundred and sixty years in the FUTURE. The
+    // timer is then queued and never fires, and every thread behind it waits
+    // forever. Signed overflow is undefined behaviour, so the wrap is not even
+    // guaranteed to be the same twice.
+    //
+    // A century either side is far outside anything a real timer asks for and
+    // far inside the range where the multiply is safe.
+    using SteadyDuration = steady_clock_::duration;
+    constexpr auto kLimit = std::chrono::duration_cast<decltype(delta)>(
+        std::chrono::duration<int64_t>(int64_t(100) * 365 * 24 * 60 * 60));
+    if (delta > kLimit) {
+      delta = kLimit;
+    } else if (delta < -kLimit) {
+      delta = -kLimit;
+    }
+    return steady_now + std::chrono::duration_cast<SteadyDuration>(delta);
   }
 };
 
