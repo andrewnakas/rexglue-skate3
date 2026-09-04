@@ -54,7 +54,7 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 25> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 32> kOptionalSimpleSettingsCvars = {
     "skate3_performance_profile",
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
@@ -79,7 +79,14 @@ constexpr std::array<std::string_view, 25> kOptionalSimpleSettingsCvars = {
     "input_backend",
     "audio_mute",
     "audio_device_sample_frames",
-    "user_language"};
+    "user_language",
+    "hid_sdl_touchpad_right_stick",
+    "hid_sdl_touchpad_left_dpad",
+    "hid_sdl_touchpad_invert_y",
+    "hid_sdl_touchpad_smoothing_ms",
+    "hid_sdl_touchpad_full_deflection",
+    "hid_sdl_touchpad_flick_hold_ms",
+    "hid_sdl_touchpad_press_threshold"};
 
 // One-click video presets. The row starts at Custom and keeps whichever preset
 // was last applied, so stepping through them works; the cvar behind it is put
@@ -132,10 +139,10 @@ constexpr std::array<const char*, 12> kLanguageLabels = {
 
 // Settings-menu controller chord presets (menu_chord cvar spec strings).
 // First entry matches the cvar default (the chord reset target).
-constexpr std::array<const char*, 4> kMenuChordSpecs = {"rb+start", "lb+rb+start", "back+start",
-                                                        "l3+r3"};
-constexpr std::array<const char*, 4> kMenuChordLabels = {"RB + Start", "LB + RB + Start",
-                                                         "Back + Start", "L3 + R3"};
+constexpr std::array<const char*, 4> kMenuChordSpecs = {"back+start", "lb+rb+start", "l3+r3",
+                                                        "rb+start"};
+constexpr std::array<const char*, 4> kMenuChordLabels = {"Back + Start", "LB + RB + Start",
+                                                         "L3 + R3", "RB + Start"};
 
 constexpr std::array<const char*, 5> kMonitorLabels = {"Auto", "Monitor 1", "Monitor 2",
                                                        "Monitor 3", "Monitor 4"};
@@ -224,7 +231,7 @@ bool HasCvar(std::string_view name) {
 
 std::vector<std::string_view> GetSimpleSettingsCvars() {
   std::vector<std::string_view> cvars;
-  cvars.reserve(32);
+  cvars.reserve(48);
   cvars.insert(cvars.end(), kCoreSimpleSettingsCvars.begin(), kCoreSimpleSettingsCvars.end());
   for (std::string_view name : kOptionalSimpleSettingsCvars) {
     if (HasCvar(name)) {
@@ -647,8 +654,22 @@ void SetTearingCvars(bool value) {
   if (HasCvar("vulkan_allow_present_mode_immediate")) {
     SetBoolCvar("vulkan_allow_present_mode_immediate", value);
   }
+  // Mailbox is NOT a tearing mode and must not be switched off with the others.
+  //
+  // It is triple buffering: the presentation engine replaces the queued image
+  // instead of queueing another, so a frame is always shown whole, at vblank,
+  // and never torn. Turning it off with the tearing modes left plain FIFO as
+  // the only option - and FIFO quantizes the frame rate hard, because a frame
+  // that misses vblank waits for the whole of the next one. On the Steam Deck's
+  // 90 Hz panel that is 90 -> 45 -> 30 with nothing in between, so a game that
+  // is a fraction under budget reads as a drop to 45 rather than the 80-odd it
+  // is actually capable of.
+  //
+  // Someone turning tearing off is asking not to see torn frames, which mailbox
+  // already guarantees. There is no configuration in which taking it away is
+  // what they wanted.
   if (HasCvar("vulkan_allow_present_mode_mailbox")) {
-    SetBoolCvar("vulkan_allow_present_mode_mailbox", value);
+    SetBoolCvar("vulkan_allow_present_mode_mailbox", true);
   }
   if (HasCvar("vulkan_allow_present_mode_fifo_relaxed")) {
     SetBoolCvar("vulkan_allow_present_mode_fifo_relaxed", value);
@@ -1068,6 +1089,29 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   chord_custom_.clear();
   chord_index_ = HasCvar("menu_chord") ? MenuChordIndexFromCvar(&chord_custom_) : 0;
   input_backend_index_ = HasInputBackendChoice() ? InputBackendIndexFromCvar() : 0;
+  touchpad_stick_ = HasCvar("hid_sdl_touchpad_right_stick") &&
+                    rex::cvar::Query<bool>("hid_sdl_touchpad_right_stick");
+  touchpad_dpad_ = HasCvar("hid_sdl_touchpad_left_dpad") &&
+                   rex::cvar::Query<bool>("hid_sdl_touchpad_left_dpad");
+  touchpad_invert_y_ = HasCvar("hid_sdl_touchpad_invert_y") &&
+                       rex::cvar::Query<bool>("hid_sdl_touchpad_invert_y");
+  touchpad_smoothing_ =
+      HasCvar("hid_sdl_touchpad_smoothing_ms")
+          ? float(std::clamp(rex::cvar::Query<double>("hid_sdl_touchpad_smoothing_ms"), 0.0, 150.0))
+          : 30.0f;
+  touchpad_full_deflection_ =
+      HasCvar("hid_sdl_touchpad_full_deflection")
+          ? float(std::clamp(rex::cvar::Query<double>("hid_sdl_touchpad_full_deflection"), 0.25,
+                             1.0))
+          : 0.7f;
+  touchpad_flick_hold_ =
+      HasCvar("hid_sdl_touchpad_flick_hold_ms")
+          ? float(std::clamp(rex::cvar::Query<double>("hid_sdl_touchpad_flick_hold_ms"), 0.0, 150.0))
+          : 32.0f;
+  touchpad_press_ =
+      HasCvar("hid_sdl_touchpad_press_threshold")
+          ? float(std::clamp(rex::cvar::Query<double>("hid_sdl_touchpad_press_threshold"), 0.0, 1.0))
+          : 0.5f;
 }
 
 bool SimpleSettingsDialog::HasSettingsChanges() const {
@@ -1488,7 +1532,9 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.label = "VRR / Tearing";
         row.desc =
             "Allows uncapped presentation with variable-refresh-rate displays "
-            "(G-Sync / FreeSync). Recommended on.";
+            "(G-Sync / FreeSync). Recommended on. Turning it off keeps triple "
+            "buffering, which never tears - it does not drop you to plain "
+            "vsync.";
         row.options = {"Off", "On"};
         row.flag = &tearing_;
         row.reset = [this] { tearing_ = TearingDefault(); };
@@ -1964,6 +2010,96 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
+      // The touchpads are the whole control scheme on a handheld: the right
+      // pad is the flick-it stick and the left one is the d-pad. They have to
+      // be tunable here, with the game running behind the menu, because the
+      // only way to know whether the smoothing is right is to try a kickflip.
+      if (HasCvar("hid_sdl_touchpad_right_stick") || HasCvar("hid_sdl_touchpad_left_dpad")) {
+        header("Touchpads");
+      }
+      auto touchpad_toggle = [this, &rows](const char* cvar, const char* label, const char* desc,
+                                           bool* member, bool fallback) {
+        if (!HasCvar(cvar)) {
+          return;
+        }
+        RowSpec row;
+        row.kind = RowSpec::kEnum;
+        row.label = label;
+        row.desc = desc;
+        row.options = {"Off", "On"};
+        row.flag = member;
+        row.on_enum_change = [this, cvar, member](int value) {
+          SetBoolCvar(cvar, value != 0);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        row.reset = [this, cvar, member, fallback] {
+          *member = CvarDefaultBool(cvar, fallback);
+          SetBoolCvar(cvar, *member);
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      };
+      auto touchpad_slider = [this, &rows](const char* cvar, const char* label, const char* desc,
+                                           float* member, float lo, float hi, float step,
+                                           const char* fmt, double fallback) {
+        if (!HasCvar(cvar)) {
+          return;
+        }
+        RowSpec row;
+        row.kind = RowSpec::kSlider;
+        row.label = label;
+        row.desc = desc;
+        row.value = member;
+        row.min = lo;
+        row.max = hi;
+        row.step = step;
+        row.fmt = fmt;
+        row.on_value_change = [cvar, member, lo, hi] {
+          *member = std::clamp(*member, lo, hi);
+          rex::cvar::SetFlagByName(cvar, std::to_string(*member));
+        };
+        row.reset = [this, cvar, member, lo, hi, fallback] {
+          *member = float(std::clamp(CvarDefaultDouble(cvar, fallback), double(lo), double(hi)));
+          rex::cvar::SetFlagByName(cvar, std::to_string(*member));
+          SaveSimpleSettingsConfig(config_path_);
+        };
+        rows.push_back(std::move(row));
+      };
+      touchpad_toggle("hid_sdl_touchpad_right_stick", "Right Pad as Right Stick",
+                      "Your thumb's position on the right pad IS the stick's position, so the "
+                      "pad works like an on-screen stick rather than a mouse. Applies "
+                      "immediately.",
+                      &touchpad_stick_, true);
+      touchpad_slider("hid_sdl_touchpad_full_deflection", "Right Pad Stick Size",
+                      "How much of the pad the stick's circle takes up. Smaller means the outer "
+                      "ring of the pad is all full deflection, so a thumb on the bottom edge is "
+                      "definitely a hard stick-down and the ollie is a big one. Larger gives "
+                      "finer control of part-deflections and smaller ollies.",
+                      &touchpad_full_deflection_, 0.25f, 1.0f, 0.05f, "%.2f", 0.7);
+      touchpad_slider("hid_sdl_touchpad_smoothing_ms", "Right Pad Smoothing",
+                      "Milliseconds the stick takes to catch your thumb. The stick starts at "
+                      "centre on every new touch and travels out, which is what makes a flick "
+                      "read as a flick. Lower is sharper and twitchier; higher is smoother but "
+                      "blurs fast rotations like shuvits.",
+                      &touchpad_smoothing_, 0.0f, 120.0f, 5.0f, "%.0f ms", 30.0);
+      touchpad_slider("hid_sdl_touchpad_flick_hold_ms", "Right Pad Flick Hold",
+                      "Milliseconds the stick stays where your thumb left it before snapping "
+                      "back. Long enough that a fast flick cannot slip between two input polls; "
+                      "raise it if tricks get eaten, lower it if letting go drops you into a "
+                      "manual.",
+                      &touchpad_flick_hold_, 0.0f, 120.0f, 4.0f, "%.0f ms", 32.0);
+      touchpad_toggle("hid_sdl_touchpad_left_dpad", "Left Pad as D-Pad",
+                      "Press-activated, not touch-activated: a thumb resting on the pad does "
+                      "nothing, pressing it down sends the direction under your thumb.",
+                      &touchpad_dpad_, true);
+      touchpad_slider("hid_sdl_touchpad_press_threshold", "Left Pad Press Force",
+                      "How hard the left pad has to be pressed to count. Lower it if pressing "
+                      "does nothing; 0 makes the pad touch-activated instead.",
+                      &touchpad_press_, 0.0f, 1.0f, 0.05f, "%.2f", 0.5);
+      touchpad_toggle("hid_sdl_touchpad_invert_y", "Invert Touchpad Up/Down",
+                      "Flips up and down on BOTH pads. Turn it on if ollie and nollie come out "
+                      "swapped, or the d-pad goes up when you press down.",
+                      &touchpad_invert_y_, false);
       break;
     }
     case 2: {  // Audio

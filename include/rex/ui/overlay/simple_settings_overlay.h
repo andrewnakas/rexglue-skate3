@@ -134,6 +134,16 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   int chord_index_ = 0;
   int input_backend_index_ = 0;
   std::string chord_custom_;
+  // Steam Deck touchpads. These are on the Controls page because they are the
+  // only stick a handheld player has for flick tricks, and they need tuning by
+  // feel with the game running rather than by editing a file.
+  bool touchpad_stick_ = true;
+  bool touchpad_dpad_ = true;
+  bool touchpad_invert_y_ = false;
+  float touchpad_smoothing_ = 30.0f;
+  float touchpad_full_deflection_ = 0.7f;
+  float touchpad_flick_hold_ = 32.0f;
+  float touchpad_press_ = 0.5f;
 
   // Navigation state.
   FocusZone zone_ = FocusZone::kRail;

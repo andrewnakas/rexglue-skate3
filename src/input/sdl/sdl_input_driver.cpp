@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <filesystem>
 
 #include <rex/assert.h>
@@ -26,6 +27,79 @@ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 REXCVAR_DEFINE_UINT32(hid_sdl_rumble_duration_ms, 100, "Input",
                       "SDL rumble pulse duration for nonzero XInput vibration");
+REXCVAR_DEFINE_BOOL(hid_sdl_touchpad_right_stick, true, "Input",
+                    "Drive the right thumbstick from the controller's right touchpad, as an "
+                    "absolute position: where your finger is on the pad is where the stick is. "
+                    "Lifting off returns the stick to the physical stick's own position. Needs a "
+                    "pad that reports touchpads to SDL - on a Steam Deck that means Steam Input "
+                    "must not be consuming them for the game's own layout.");
+REXCVAR_DEFINE_INT32(hid_sdl_touchpad_right_index, 1, "Input",
+                     "Which SDL touchpad drives the right stick. On a Steam Deck 0 is the left "
+                     "pad and 1 the right. -1 turns it off.");
+REXCVAR_DEFINE_DOUBLE(hid_sdl_touchpad_smoothing_ms, 30.0, "Input",
+                      "How long the right-stick touchpad takes to catch up with your finger, as "
+                      "a time constant in milliseconds. The stick starts at CENTRE on each new "
+                      "touch and travels out, so the game sees a continuous flick instead of the "
+                      "stick teleporting to full deflection - which is what a flip trick needs. "
+                      "Lower is snappier and twitchier, higher is smoother and laggier. 0 "
+                      "restores the old instant jump.")
+    .range(0.0, 500.0);
+REXCVAR_DEFINE_DOUBLE(hid_sdl_touchpad_full_deflection, 0.7, "Input",
+                      "How far out from the centre of the pad, 0..1, counts as the stick being "
+                      "all the way over. Everything past it is full deflection in that "
+                      "direction. It is deliberately well inside the pad: a thumb on the bottom "
+                      "edge has to read as a HARD stick-down for a big ollie, and it cannot do "
+                      "that if the edge of the pad is only just barely full. The trade is a "
+                      "smaller region in which partial deflection is expressible.")
+    .range(0.25, 1.0);
+REXCVAR_DEFINE_DOUBLE(
+    hid_sdl_touchpad_reacquire_ms, 120.0, "Input",
+    "How long, in milliseconds, a lift from a STATIONARY thumb is doubted before it is "
+    "believed. The Steam Deck's pad reports lifts that never happened - a finger held still "
+    "produces an UP and then a DOWN in the same place, sometimes in the same millisecond - and "
+    "each one collapses a held preload. Within this window a re-touch near where the thumb "
+    "supposedly left is treated as the same contact continuing, and the stick keeps its "
+    "position instead of being yanked to centre. A lift from a MOVING thumb is a real flick and "
+    "is acted on immediately whatever this is set to, so raising it does not make tricks less "
+    "responsive - it only delays the pop at the end of a deliberate, motionless preload. 0 "
+    "restores the old behaviour of believing every lift at once.")
+    .range(0.0, 400.0);
+REXCVAR_DEFINE_BOOL(hid_sdl_touchpad_trace, false, "Input",
+                    "Log every right-touchpad event and the resulting stick value, for working "
+                    "out why a gesture does not read the way it feels. Noisy by design.");
+REXCVAR_DEFINE_DOUBLE(hid_sdl_touchpad_flick_hold_ms, 32.0, "Input",
+                      "How long the stick stays pinned where your thumb left it, in "
+                      "milliseconds, before it snaps back to centre. It exists so a fast flick "
+                      "cannot land entirely between two input polls and be missed. It must stay "
+                      "SHORT: hold it much longer and the game reads a held stick, which is a "
+                      "manual, not a flick.")
+    .range(0.0, 250.0);
+REXCVAR_DEFINE_BOOL(hid_sdl_touchpad_invert_y, false, "Input",
+                    "Flip up and down on both touchpads. SDL reports the Steam Deck's pads with "
+                    "Y increasing upward, which already matches a thumbstick, so this is off. "
+                    "Turn it on if up and down come out backwards - ollie where you wanted "
+                    "nollie, d-pad up where you pressed down - on some other controller.");
+REXCVAR_DEFINE_BOOL(hid_sdl_touchpad_invert_x, false, "Input",
+                    "Flip left and right on both touchpads. The counterpart to "
+                    "hid_sdl_touchpad_invert_y, and off for the same reason.");
+REXCVAR_DEFINE_BOOL(hid_sdl_touchpad_left_dpad, true, "Input",
+                    "Drive the d-pad from the left touchpad. PRESS-activated: resting a thumb "
+                    "does nothing, pressing the pad down sends the direction under your thumb. "
+                    "That is deliberate - a touch-activated d-pad fires constantly while your "
+                    "hand rests there.");
+REXCVAR_DEFINE_INT32(hid_sdl_touchpad_left_index, 0, "Input",
+                     "Which SDL touchpad drives the d-pad. On a Steam Deck 0 is the left pad. "
+                     "-1 turns it off.");
+REXCVAR_DEFINE_DOUBLE(hid_sdl_touchpad_press_threshold, 0.5, "Input",
+                      "How hard the left pad must be pressed to count as a press, 0..1 of the "
+                      "pressure SDL reports. Lower it if pressing does nothing; set it to 0 to "
+                      "make the pad touch-activated instead.")
+    .range(0.0, 1.0);
+REXCVAR_DEFINE_DOUBLE(hid_sdl_touchpad_dpad_deadzone, 0.35, "Input",
+                      "How far from the centre of the left pad a press has to be before it "
+                      "counts as a direction, 0..1. Presses inside this do nothing, so the "
+                      "middle of the pad is not a coin-flip between two directions.")
+    .range(0.0, 0.95);
 
 namespace rex::input::sdl {
 
@@ -192,6 +266,11 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   }
 
   auto guard = DrainAndLock();
+
+  // The touchpad stick is steered here rather than from the events: SDL only
+  // sends touchpad motion when the finger MOVES, and a finger held still at
+  // the edge of the pad still has to be carried there smoothly.
+  AdvanceTouchpadSmoothingLocked();
 
   auto controller = GetControllerState(user_index);
   if (!controller) {
@@ -462,6 +541,11 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
       OnControllerDeviceButtonChangedLocked(event);
       break;
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+      OnControllerTouchpadLocked(event);
+      break;
     default:
       break;
   }
@@ -470,6 +554,58 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
 void SDLInputDriver::StopRumbleLocked(ControllerState& state) {
   if (state.sdl) {
     SDL_RumbleGamepad(state.sdl, 0, 0, 0);
+  }
+}
+
+void SDLInputDriver::OnSystemResume() {
+  // Close every gamepad and open whatever is actually there now.
+  //
+  // SDL does not reliably re-announce a device that went away and came back
+  // while the machine was asleep - and on the Deck the pad is USB, so it does
+  // exactly that. Without this the driver keeps a handle that no longer refers
+  // to anything, every poll returns the last state it ever saw, and the game
+  // sits there being told the sticks are centred and no buttons are down. The
+  // picture stops moving, which is indistinguishable from the engine having
+  // frozen unless you go looking - and sixteen builds went looking in the
+  // wrong place.
+  auto lock = DrainAndLock();
+
+  size_t closed = 0;
+  for (size_t i = 0; i < controllers_.size(); ++i) {
+    auto& state = controllers_.at(i);
+    if (!state.sdl) {
+      continue;
+    }
+    StopRumbleLocked(state);
+    SDL_CloseGamepad(state.sdl);
+    state = {};
+    keystroke_states_.at(i) = {};
+    ++closed;
+  }
+
+  // SDL's own view of the devices can be stale too: make it re-enumerate
+  // before asking it what exists.
+  SDL_UpdateGamepads();
+  int count = 0;
+  SDL_JoystickID* ids = SDL_GetGamepads(&count);
+  size_t opened = 0;
+  if (ids) {
+    for (int i = 0; i < count; ++i) {
+      // Reuse the add path so slot assignment, capabilities and the initial
+      // packet number are all established exactly as they are at startup.
+      SDL_Event added = {};
+      added.type = SDL_EVENT_GAMEPAD_ADDED;
+      added.cdevice.which = ids[i];
+      OnControllerDeviceAddedLocked(added);
+      ++opened;
+    }
+    SDL_free(ids);
+  }
+  REXLOG_INFO("SDL: woke from suspend - closed {} stale gamepad(s), re-opened {}", closed, opened);
+  if (!opened) {
+    REXLOG_ERROR(
+        "SDL: woke from suspend and there is NO gamepad. Nothing will respond to the sticks or "
+        "buttons until one appears.");
   }
 }
 
@@ -551,11 +687,20 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
     case SDL_GAMEPAD_AXIS_LEFTY:
       pad.thumb_ly = ~event.gaxis.value;
       break;
+    // The touchpad, when a finger is on it, owns the right stick. Record what
+    // the physical stick is doing either way so releasing the pad can hand it
+    // straight back without waiting for the next stick movement.
     case SDL_GAMEPAD_AXIS_RIGHTX:
-      pad.thumb_rx = event.gaxis.value;
+      controllers_.at(*idx).stick_rx = event.gaxis.value;
+      if (!controllers_.at(*idx).touchpad_active) {
+        pad.thumb_rx = event.gaxis.value;
+      }
       break;
     case SDL_GAMEPAD_AXIS_RIGHTY:
-      pad.thumb_ry = ~event.gaxis.value;
+      controllers_.at(*idx).stick_ry = static_cast<int16_t>(~event.gaxis.value);
+      if (!controllers_.at(*idx).touchpad_active) {
+        pad.thumb_ry = controllers_.at(*idx).stick_ry;
+      }
       break;
     case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:
       pad.left_trigger = static_cast<uint8_t>(event.gaxis.value >> 7);
@@ -568,6 +713,364 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
       break;
   }
   controllers_.at(*idx).state_changed = true;
+}
+
+namespace {
+
+// -1..1 onto the XInput thumb range. Scaled by the POSITIVE maximum: the range
+// is asymmetric (-32768..32767), so scaling by 32768 would send a full-left
+// reading to -32768 and a full-right one past 32767 into a wrap.
+int16_t FloatToThumb(float value) {
+  const float scaled = std::clamp(value, -1.0f, 1.0f) * 32767.0f;
+  return static_cast<int16_t>(std::lround(scaled));
+}
+
+// SDL reports a touchpad as 0..1 across each axis. Centre that onto -1..1 and
+// apply the per-axis inversion cvars. Both pads go through here so that a
+// controller reporting its pad the other way up is one setting to fix, not
+// two, and so the d-pad and the stick can never disagree about which way is
+// up.
+float PadAxisX(float raw) {
+  const float x = raw * 2.0f - 1.0f;
+  return REXCVAR_GET(hid_sdl_touchpad_invert_x) ? -x : x;
+}
+
+float PadAxisY(float raw) {
+  const float y = raw * 2.0f - 1.0f;
+  return REXCVAR_GET(hid_sdl_touchpad_invert_y) ? -y : y;
+}
+
+}  // namespace
+
+// Absolute touchpad -> right stick: the finger's position on the pad IS the
+// stick's position, rather than the pad nudging a stick that stays where it
+// was left.
+void SDLInputDriver::OnControllerTouchpadLocked(const SDL_Event& event) {
+  auto idx = GetControllerIndexFromInstanceID(event.gtouchpad.which);
+  if (!idx) {
+    return;
+  }
+  auto& controller = controllers_.at(*idx);
+
+  const int32_t right = REXCVAR_GET(hid_sdl_touchpad_right_index);
+  if (REXCVAR_GET(hid_sdl_touchpad_right_stick) && right >= 0 &&
+      event.gtouchpad.touchpad == right) {
+    OnRightTouchpadLocked(event, controller);
+  }
+  const int32_t left = REXCVAR_GET(hid_sdl_touchpad_left_index);
+  if (REXCVAR_GET(hid_sdl_touchpad_left_dpad) && left >= 0 && event.gtouchpad.touchpad == left) {
+    OnLeftTouchpadLocked(event, controller);
+  }
+}
+
+void SDLInputDriver::OnRightTouchpadLocked(const SDL_Event& event, ControllerState& controller) {
+  auto& pad = controller.state.gamepad;
+
+  if (REXCVAR_GET(hid_sdl_touchpad_trace)) {
+    const char* kind = event.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN   ? "DOWN"
+                       : event.type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP   ? "UP  "
+                                                                       : "MOVE";
+    REXLOG_INFO(
+        "rpad {}: finger={} raw=({:.3f},{:.3f}) pressure={:.3f} | active={} releasing={} "
+        "owner={}",
+        kind, event.gtouchpad.finger, event.gtouchpad.x, event.gtouchpad.y,
+        event.gtouchpad.pressure, controller.touchpad_active ? 1 : 0,
+        controller.touchpad_releasing ? 1 : 0, controller.touchpad_finger);
+  }
+
+  if (event.type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP) {
+    // Only the finger holding the stick can let go of it.
+    if (!controller.touchpad_active || event.gtouchpad.finger != controller.touchpad_finger) {
+      return;
+    }
+    // Snap the stick out to where the thumb actually was at the instant it
+    // left the pad, rather than wherever the smoothing had got to. A flick is
+    // over in a handful of milliseconds and the smoothed value is always
+    // behind, so without this the game never sees the end of the gesture and
+    // the trick that comes out is the one you were halfway through, not the
+    // one you did. Then hold it there for flick_hold_ms and drop it dead.
+    controller.pad_current_x = controller.pad_target_x;
+    controller.pad_current_y = controller.pad_target_y;
+    controller.touchpad_releasing = true;
+    const uint64_t up_ns = rex::chrono::Clock::QueryHostSystemTime();
+    controller.touchpad_release_ns = up_ns;
+    controller.touchpad_lift_x = controller.pad_target_x;
+    controller.touchpad_lift_y = controller.pad_target_y;
+    // Was the thumb actually moving when the pad says it left?
+    //
+    // A flick is a fast gesture and is still travelling at the instant of the
+    // lift. A preload is a thumb planted still at full deflection. The Deck's
+    // pad emits phantom lifts under a STILL thumb, so that is the case worth
+    // being sceptical about - and it is also the case where waiting a few more
+    // milliseconds costs nothing, because nothing is moving.
+    double since_move_ms = 1e9;
+    if (controller.touchpad_last_move_ns != 0 && up_ns > controller.touchpad_last_move_ns) {
+      since_move_ms = double(up_ns - controller.touchpad_last_move_ns) / 10000.0;
+    }
+    controller.touchpad_lift_was_stationary = since_move_ms >= 60.0;
+    return;
+  }
+
+  if (event.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN) {
+    // A re-touch that arrives almost immediately, in almost the same place, is
+    // the pad having dropped and regained a finger that never left. Continue
+    // the gesture instead of starting a new one: keep the stick exactly where
+    // it is, rather than yanking it to centre and travelling back out. That
+    // yank is what collapses a held preload under a motionless thumb.
+    if (controller.touchpad_releasing &&
+        event.gtouchpad.finger == controller.touchpad_finger) {
+      const uint64_t now_ns = rex::chrono::Clock::QueryHostSystemTime();
+      double gap_ms = 1e9;
+      if (controller.touchpad_release_ns != 0 && now_ns > controller.touchpad_release_ns) {
+        gap_ms = double(now_ns - controller.touchpad_release_ns) / 10000.0;
+      }
+      const float rx = PadAxisX(event.gtouchpad.x);
+      const float ry = PadAxisY(event.gtouchpad.y);
+      const float full_now = std::max(
+          static_cast<float>(REXCVAR_GET(hid_sdl_touchpad_full_deflection)), 0.05f);
+      const float dx = rx / full_now - controller.touchpad_lift_x;
+      const float dy = ry / full_now - controller.touchpad_lift_y;
+      if (gap_ms <= REXCVAR_GET(hid_sdl_touchpad_reacquire_ms) &&
+          std::sqrt(dx * dx + dy * dy) <= 0.35f) {
+        controller.touchpad_releasing = false;
+        controller.touchpad_release_ns = 0;
+        controller.touchpad_last_ns = now_ns;
+        if (REXCVAR_GET(hid_sdl_touchpad_trace)) {
+          REXLOG_INFO("rpad: phantom lift ignored ({:.0f}ms, moved {:.2f}) - contact continues",
+                      gap_ms, std::sqrt(dx * dx + dy * dy));
+        }
+        // Fall through to update the target; the stick keeps its position.
+        float cx = rx / full_now;
+        float cy = ry / full_now;
+        const float rad = std::sqrt(cx * cx + cy * cy);
+        if (rad > 1.0f) {
+          cx /= rad;
+          cy /= rad;
+        }
+        controller.pad_target_x = cx;
+        controller.pad_target_y = cy;
+        controller.touchpad_last_move_ns = now_ns;
+        return;
+      }
+    }
+    if (!controller.touchpad_active || controller.touchpad_releasing) {
+      controller.touchpad_active = true;
+      controller.touchpad_releasing = false;
+      controller.touchpad_finger = event.gtouchpad.finger;
+      // Every new touch starts the stick at CENTRE, wherever the finger
+      // landed. Skate reads the travel, not the endpoint: a stick that
+      // appears at full deflection has not flicked, it has teleported, and
+      // the trick does not come out. From centre the same gesture becomes a
+      // real sweep - down and out for a flip, and back through centre when
+      // the thumb lifts.
+      controller.pad_current_x = 0.0f;
+      controller.pad_current_y = 0.0f;
+      controller.touchpad_release_ns = 0;
+      controller.touchpad_last_ns = rex::chrono::Clock::QueryHostSystemTime();
+    } else if (event.gtouchpad.finger != controller.touchpad_finger) {
+      return;  // a second finger, while the first still has the stick
+    }
+  } else if (!controller.touchpad_active ||
+             event.gtouchpad.finger != controller.touchpad_finger) {
+    return;  // motion from a finger that does not own the stick
+  }
+
+  float x = PadAxisX(event.gtouchpad.x);
+  float y = PadAxisY(event.gtouchpad.y);
+
+  // The pad is square and the stick is round. A circle inside the pad is the
+  // stick's full travel: everything on or outside it is full deflection in
+  // whatever direction it points, so a touch in a corner snaps to the nearest
+  // point ON the circle rather than reaching 1.41x what a cardinal can. That
+  // per-axis clamp is exactly the artefact that makes a square pad feel wrong
+  // as a round stick, and it is also what breaks rim gestures - a shuvit is a
+  // slide around the edge, and it only reads as one if the edge is a circle.
+  //
+  // The circle is deliberately smaller than the pad. At 0.7 the outer third of
+  // the pad is all full deflection, so a thumb anywhere along the bottom edge
+  // is unambiguously stick-hard-down and the ollie is a big one.
+  const float full = std::max(static_cast<float>(REXCVAR_GET(hid_sdl_touchpad_full_deflection)),
+                              0.05f);
+  x /= full;
+  y /= full;
+  const float radius = std::sqrt(x * x + y * y);
+  if (radius > 1.0f) {
+    x /= radius;
+    y /= radius;
+  }
+
+  // Remember when the finger genuinely moved, so a lift can be judged against
+  // it. Small jitter under a planted thumb must not count as movement.
+  if (std::abs(x - controller.pad_target_x) + std::abs(y - controller.pad_target_y) > 0.02f) {
+    controller.touchpad_last_move_ns = rex::chrono::Clock::QueryHostSystemTime();
+  }
+
+  controller.pad_target_x = x;
+  controller.pad_target_y = y;
+}
+
+// The d-pad off the left touchpad, activated by PRESSING rather than touching.
+// A thumb resting on the pad is the normal way to hold a Deck, so a
+// touch-activated d-pad would fire a direction the whole time.
+void SDLInputDriver::OnLeftTouchpadLocked(const SDL_Event& event, ControllerState& controller) {
+  auto& pad = controller.state.gamepad;
+  constexpr uint16_t kDpadMask = X_INPUT_GAMEPAD_DPAD_UP | X_INPUT_GAMEPAD_DPAD_DOWN |
+                                 X_INPUT_GAMEPAD_DPAD_LEFT | X_INPUT_GAMEPAD_DPAD_RIGHT;
+
+  // buttons is a byte-swapping wrapper, so every change is a read, a modify
+  // and a write back rather than a compound assignment.
+  auto clear = [&]() {
+    if (controller.left_pad_buttons) {
+      pad.buttons = static_cast<uint16_t>(pad.buttons & ~controller.left_pad_buttons);
+      controller.left_pad_buttons = 0;
+      controller.state_changed = true;
+    }
+  };
+
+  if (event.type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP) {
+    if (controller.left_pad_active && event.gtouchpad.finger == controller.left_pad_finger) {
+      controller.left_pad_active = false;
+      clear();
+    }
+    return;
+  }
+  if (!controller.left_pad_active) {
+    controller.left_pad_active = true;
+    controller.left_pad_finger = event.gtouchpad.finger;
+  } else if (event.gtouchpad.finger != controller.left_pad_finger) {
+    return;
+  }
+
+  // A threshold of 0 means "treat any touch as a press", which is the escape
+  // hatch for a pad whose pressure never crosses a threshold.
+  const float threshold = static_cast<float>(REXCVAR_GET(hid_sdl_touchpad_press_threshold));
+  const bool pressed = threshold <= 0.0f || event.gtouchpad.pressure >= threshold;
+  if (!pressed) {
+    clear();
+    return;
+  }
+
+  const float x = PadAxisX(event.gtouchpad.x);
+  const float y = PadAxisY(event.gtouchpad.y);
+  const float deadzone = static_cast<float>(REXCVAR_GET(hid_sdl_touchpad_dpad_deadzone));
+  if (std::sqrt(x * x + y * y) < deadzone) {
+    clear();  // pressed in the dead middle - no direction is the honest answer
+    return;
+  }
+
+  // 8-way, by which axis dominates. Both bits set on a diagonal, exactly as a
+  // real d-pad reports it.
+  uint16_t buttons = 0;
+  if (std::abs(x) > deadzone * 0.5f) {
+    buttons |= x > 0.0f ? X_INPUT_GAMEPAD_DPAD_RIGHT : X_INPUT_GAMEPAD_DPAD_LEFT;
+  }
+  if (std::abs(y) > deadzone * 0.5f) {
+    buttons |= y > 0.0f ? X_INPUT_GAMEPAD_DPAD_UP : X_INPUT_GAMEPAD_DPAD_DOWN;
+  }
+  if (buttons != controller.left_pad_buttons) {
+    const uint16_t without_ours =
+        static_cast<uint16_t>(pad.buttons & ~(controller.left_pad_buttons & kDpadMask));
+    pad.buttons = static_cast<uint16_t>(without_ours | buttons);
+    controller.left_pad_buttons = buttons;
+    controller.state_changed = true;
+  }
+}
+
+// Steer each touchpad-driven stick toward where the finger is. Exponential
+// smoothing on a real elapsed time, so the feel does not change with frame
+// rate - at 30fps and at 90fps the stick takes the same wall-clock time to
+// cross the pad.
+void SDLInputDriver::AdvanceTouchpadSmoothingLocked() {
+  const uint64_t now = rex::chrono::Clock::QueryHostSystemTime();
+  const double tau_ms = REXCVAR_GET(hid_sdl_touchpad_smoothing_ms);
+  for (auto& controller : controllers_) {
+    if (!controller.sdl || !controller.touchpad_active) {
+      continue;
+    }
+    // QueryHostSystemTime is in 100ns units.
+    double dt_ms = 0.0;
+    if (controller.touchpad_last_ns != 0 && now > controller.touchpad_last_ns) {
+      dt_ms = static_cast<double>(now - controller.touchpad_last_ns) / 10000.0;
+    }
+    controller.touchpad_last_ns = now;
+
+    auto& pad = controller.state.gamepad;
+
+    // Ten times a second while a finger owns the stick. This is the half that
+    // matters: a finger held still sends NO events at all, so the event trace
+    // goes quiet exactly when the interesting thing happens. If the stick
+    // walks back to centre while the thumb is planted, it can only show up
+    // here.
+    if (REXCVAR_GET(hid_sdl_touchpad_trace)) {
+      static uint64_t s_last_trace_ns = 0;
+      if (s_last_trace_ns == 0 || now < s_last_trace_ns ||
+          (now - s_last_trace_ns) / 10000 >= 100) {
+        s_last_trace_ns = now;
+        REXLOG_INFO(
+            "rpad tick: releasing={} target=({:+.2f},{:+.2f}) current=({:+.2f},{:+.2f}) "
+            "thumb_r=({},{}) dt={:.1f}ms",
+            controller.touchpad_releasing ? 1 : 0, controller.pad_target_x,
+            controller.pad_target_y, controller.pad_current_x, controller.pad_current_y,
+            int16_t(pad.thumb_rx), int16_t(pad.thumb_ry), dt_ms);
+      }
+    }
+
+    if (controller.touchpad_releasing) {
+      // The thumb is off the pad. Hold the lift position long enough that at
+      // least one poll is guaranteed to see it, then let go completely - a
+      // real stick springs back, it does not ease back, and easing back is
+      // what the game reads as a held stick and turns into a manual.
+      double held_ms = 0.0;
+      if (controller.touchpad_release_ns != 0 && now > controller.touchpad_release_ns) {
+        held_ms = static_cast<double>(now - controller.touchpad_release_ns) / 10000.0;
+      }
+      // A flick is believed at once; a lift from a planted thumb is held on to
+      // for longer, because that is the one the pad lies about and the one
+      // where waiting costs nothing - nothing is moving.
+      double hold_ms = REXCVAR_GET(hid_sdl_touchpad_flick_hold_ms);
+      if (controller.touchpad_lift_was_stationary) {
+        hold_ms = std::max(hold_ms, REXCVAR_GET(hid_sdl_touchpad_reacquire_ms));
+      }
+      if (held_ms < hold_ms) {
+        const int16_t hx = FloatToThumb(controller.pad_current_x);
+        const int16_t hy = FloatToThumb(controller.pad_current_y);
+        if (hx != pad.thumb_rx || hy != pad.thumb_ry) {
+          pad.thumb_rx = hx;
+          pad.thumb_ry = hy;
+          controller.state_changed = true;
+        }
+        continue;
+      }
+      if (REXCVAR_GET(hid_sdl_touchpad_trace)) {
+        REXLOG_INFO("rpad: RELEASING DONE after {:.1f}ms - stick dropped to centre", held_ms);
+      }
+      controller.touchpad_active = false;
+      controller.touchpad_releasing = false;
+      controller.pad_current_x = 0.0f;
+      controller.pad_current_y = 0.0f;
+      controller.pad_target_x = 0.0f;
+      controller.pad_target_y = 0.0f;
+      pad.thumb_rx = controller.stick_rx;
+      pad.thumb_ry = controller.stick_ry;
+      controller.state_changed = true;
+      continue;
+    }
+
+    float alpha = 1.0f;
+    if (tau_ms > 0.0 && dt_ms > 0.0) {
+      alpha = static_cast<float>(1.0 - std::exp(-dt_ms / tau_ms));
+    }
+    controller.pad_current_x += (controller.pad_target_x - controller.pad_current_x) * alpha;
+    controller.pad_current_y += (controller.pad_target_y - controller.pad_current_y) * alpha;
+
+    const int16_t rx = FloatToThumb(controller.pad_current_x);
+    const int16_t ry = FloatToThumb(controller.pad_current_y);
+    if (rx != pad.thumb_rx || ry != pad.thumb_ry) {
+      pad.thumb_rx = rx;
+      pad.thumb_ry = ry;
+      controller.state_changed = true;
+    }
+  }
 }
 
 void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& event) {
@@ -714,10 +1217,19 @@ void SDLInputDriver::QueueControllerUpdate() {
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
   if (!is_queued) {
-    attached_window_->app_context().CallInUIThread([this]() {
-      SDL_PumpEvents();
+    if (!attached_window_->app_context().CallInUIThread([this]() {
+          SDL_PumpEvents();
+          sdl_pumpevents_queued_ = false;
+        })) {
+      // The call was refused, so the callback that clears the latch will never
+      // run - and the latch is what lets the NEXT pump be queued. Leaving it
+      // set means SDL is never pumped again for the life of the process:
+      // controller state freezes at whatever it last saw, silently and
+      // permanently. Clear it here so a refusal costs one missed pump instead
+      // of all of them.
       sdl_pumpevents_queued_ = false;
-    });
+      REXLOG_WARN("SDL: the event pump could not be queued on the UI thread");
+    }
   }
 }
 

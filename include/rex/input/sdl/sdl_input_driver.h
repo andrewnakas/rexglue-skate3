@@ -44,6 +44,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
   void OnWindowAvailable(rex::ui::Window* window) override;
+  void OnSystemResume() override;
 
  private:
   struct ControllerState {
@@ -52,6 +53,55 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     X_INPUT_STATE state;
     bool state_changed;
     bool is_active;
+    // The right stick as the PHYSICAL stick last reported it. While a finger
+    // is on the right touchpad the pad owns thumb_r*, so the stick's own value
+    // is parked here and put back on release - otherwise letting go of the pad
+    // would leave the stick reading centre until it was next moved.
+    int16_t stick_rx;
+    int16_t stick_ry;
+    bool touchpad_active;
+    // Which finger owns the stick. A second finger landing must not steal it,
+    // and that finger lifting must not recentre it.
+    int32_t touchpad_finger;
+    // Where the finger is (target) and where the stick has actually got to
+    // (current), both -1..1. The gap between them is the smoothing: the stick
+    // travels to the finger instead of teleporting, which is what gives the
+    // game a flick to read rather than a jump.
+    float pad_target_x;
+    float pad_target_y;
+    float pad_current_x;
+    float pad_current_y;
+    // Set when the finger lifts. The stick does not coast home from there: it
+    // is pinned at the lift position for a beat so the game cannot miss the
+    // end of the flick between two polls, and then snapped straight back to
+    // the physical stick. Coasting was what put the board into a manual -
+    // a stick easing back over a hundred milliseconds is a stick being HELD,
+    // and held-down is exactly the manual input.
+    bool touchpad_releasing;
+    uint64_t touchpad_last_ns;
+    uint64_t touchpad_release_ns;
+    // Where the finger was when it lifted, and when it last actually MOVED.
+    //
+    // The Steam Deck's pad reports lifts that never happened: a finger held
+    // still on it produces an UP immediately followed by a DOWN in the same
+    // place, sometimes in the same millisecond. Measured on hardware, 29 of 74
+    // lifts in one session were phantoms like this. Left alone each one either
+    // completes a release or re-acquires and resets the stick to centre, so a
+    // held preload keeps collapsing under a thumb that never moved.
+    //
+    // These let a re-touch be recognised as the same contact continuing, and
+    // let a lift from a STATIONARY finger wait a little longer before being
+    // believed - while a lift from a moving one, which is a real flick, is
+    // still acted on at once.
+    float touchpad_lift_x;
+    float touchpad_lift_y;
+    uint64_t touchpad_last_move_ns;
+    bool touchpad_lift_was_stationary;
+    // Left pad acting as a d-pad. Press-activated, so this holds the direction
+    // bits currently asserted and the finger that is pressing.
+    uint16_t left_pad_buttons;
+    bool left_pad_active;
+    int32_t left_pad_finger;
   };
 
   enum class RepeatState {
@@ -80,6 +130,12 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnControllerDeviceAddedLocked(const SDL_Event& event);
   void OnControllerDeviceRemovedLocked(const SDL_Event& event);
   void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
+  void OnControllerTouchpadLocked(const SDL_Event& event);
+  void OnRightTouchpadLocked(const SDL_Event& event, ControllerState& controller);
+  void OnLeftTouchpadLocked(const SDL_Event& event, ControllerState& controller);
+  // Advance every touchpad-driven stick toward its target. Called from the
+  // state poll, because that is the only thing that ticks per frame.
+  void AdvanceTouchpadSmoothingLocked();
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
