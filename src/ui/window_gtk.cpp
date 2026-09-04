@@ -32,6 +32,7 @@ REXCVAR_DEFINE_DOUBLE(gtk_ui_scale, 1.25, "UI/GTK",
     .range(0.75, 2.0)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+
 namespace {
 
 constexpr uint32_t kDefaultDpi = 96;
@@ -662,7 +663,15 @@ void GTKWindow::FocusImpl() {
 
 std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
   GdkDisplay* display = gtk_widget_get_display(window_);
-  GdkWindow* drawing_area_window = gtk_widget_get_window(drawing_area_);
+  GdkWindow* drawing_area_window = drawing_area_ ? gtk_widget_get_window(drawing_area_) : nullptr;
+  if (!drawing_area_window) {
+    // No GdkWindow yet, so there is no X window to hand to the graphics
+    // backend. Reachable from the recovery ladder, which deliberately
+    // unrealizes the drawing area to get it a new one; asking GDK for the id of
+    // a window that does not exist would take the process down with it.
+    REXLOG_WARN("GTKWindow: cannot create a surface - the drawing area has no window yet");
+    return nullptr;
+  }
   bool type_known = false;
   bool type_supported_by_display = false;
   if (allowed_types & Surface::kTypeFlag_XcbWindow) {
@@ -681,6 +690,35 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(Surface::TypeFlags allowed
         "Xenia");
   }
   return nullptr;
+}
+
+float GTKWindow::QueryDisplayRefreshHzImpl() const {
+  // Never implemented for GTK until now, so it returned 0 and the automatic
+  // frame cap silently did nothing on Linux for its whole life: the cap is
+  // derived from this, a zero means "no reading", and the code then falls back
+  // to the explicit cap - which is 0 by default, i.e. uncapped. The setting
+  // read as on and had no effect.
+  if (!window_) {
+    return 0.0f;
+  }
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  if (!display) {
+    return 0.0f;
+  }
+  GdkMonitor* monitor = nullptr;
+  if (GdkWindow* gdk_window = gtk_widget_get_window(window_)) {
+    monitor = gdk_display_get_monitor_at_window(display, gdk_window);
+  }
+  if (!monitor) {
+    monitor = gdk_display_get_primary_monitor(display);
+  }
+  if (!monitor) {
+    return 0.0f;
+  }
+  // GDK reports milli-hertz: 60 Hz is 60000. Zero means it does not know,
+  // which is common on virtual and remote displays.
+  const int milli_hz = gdk_monitor_get_refresh_rate(monitor);
+  return milli_hz > 0 ? float(milli_hz) / 1000.0f : 0.0f;
 }
 
 void GTKWindow::RequestPaintImpl() {
@@ -705,6 +743,15 @@ void GTKWindow::RequestPaintImpl() {
   // the callback runs on the UI thread. Coalesced through a flag because the
   // guest can present faster than the main loop drains idle sources, and one
   // pending repaint is as good as ten.
+  //
+  // Once the frame clock has been caught not delivering, every request goes
+  // the direct way instead. Nothing is lost by that: the frame rate here is
+  // paced by the Vulkan present, which waits for vertical blank itself, not by
+  // GTK's clock.
+  if (frame_clock_unreliable_.load(std::memory_order_relaxed)) {
+    PostDirectPaint();
+    return;
+  }
   if (paint_request_pending_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
@@ -719,6 +766,67 @@ void GTKWindow::RequestPaintImpl() {
         return G_SOURCE_REMOVE;
       },
       this);
+}
+
+void GTKWindow::PostDirectPaint() {
+  // Coalesced: the guest can ask faster than the main loop drains idle
+  // sources, and one pending paint is as good as ten.
+  if (direct_paint_pending_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  g_idle_add(
+      [](gpointer user_data) -> gboolean {
+        auto* gtk_window = reinterpret_cast<GTKWindow*>(user_data);
+        gtk_window->direct_paint_pending_.store(false, std::memory_order_release);
+        if (gtk_window->drawing_area_) {
+          gtk_window->OnPaint(true);
+        }
+        return G_SOURCE_REMOVE;
+      },
+      this);
+}
+
+void GTKWindow::RequestPaintBypassingFrameClockImpl(PaintBypassReason reason) {
+  // Paint from an idle source instead of asking GTK to redraw the widget.
+  //
+  // gtk_widget_queue_draw only marks the widget dirty; the actual "draw"
+  // signal is emitted by GTK's frame clock, which on X11 paces itself against
+  // frame-completion messages from the compositor. Across a suspend those can
+  // stop arriving, and then the frame clock never ticks again - the widget
+  // stays dirty forever and no draw is ever emitted, however many times it is
+  // queued.
+  //
+  // Painting straight from the idle source sidesteps that entirely. It is
+  // exactly what the draw handler does anyway: it ignores the cairo context
+  // completely and calls OnPaint, because the presenter draws to its own
+  // Vulkan surface rather than through GTK. Idle sources are dispatched by the
+  // main loop itself and depend on nothing outside this process.
+  //
+  // Reaching here at all is proof the frame clock has stopped delivering, so
+  // latch that and stop relying on it. Without the latch the recovery is
+  // useless in practice: the paint mode on this backend is "the UI thread
+  // paints when asked", so EVERY guest frame goes through RequestPaintImpl and
+  // into the dead frame clock, and only the once-a-second stall kick gets
+  // through - which is a game running at one frame per second, not a game that
+  // has recovered.
+  if (!frame_clock_unreliable_.exchange(true, std::memory_order_relaxed)) {
+    // Say which of the two this is. The earlier version of this line claimed
+    // the frame clock had stopped no matter why it was called, including on
+    // the suspend path that calls it unconditionally - so every capture of the
+    // freeze contained the claim, it was read back out as evidence, and two
+    // builds went looking at GTK's clock because of it.
+    if (reason == PaintBypassReason::kFrameClockStalled) {
+      REXLOG_WARN(
+          "GTKWindow: the frame clock has stopped delivering draws - frames were produced and "
+          "none were drawn - painting from idle callbacks instead for the rest of this session");
+    } else {
+      REXLOG_INFO(
+          "GTKWindow: woke from suspend - painting from idle callbacks from now on as a "
+          "precaution. This is NOT a report that the frame clock stopped; nothing here has "
+          "checked whether it did.");
+    }
+  }
+  PostDirectPaint();
 }
 
 void GTKWindow::HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver) {

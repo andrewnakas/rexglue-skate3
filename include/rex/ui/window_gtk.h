@@ -52,6 +52,10 @@ class GTKWindow : public Window {
 
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
   void RequestPaintImpl() override;
+  void RequestPaintBypassingFrameClockImpl(PaintBypassReason reason) override;
+  float QueryDisplayRefreshHzImpl() const override;
+  // Posts a paint straight to the main loop, skipping GTK's frame clock.
+  void PostDirectPaint();
 
  private:
   void UpdateDpi(WindowDestructionReceiver* destruction_receiver = nullptr);
@@ -86,6 +90,14 @@ class GTKWindow : public Window {
   // so a guest thread producing frames faster than the main loop drains them
   // does not pile up idle sources. See RequestPaintImpl.
   std::atomic<bool> paint_request_pending_{false};
+  // The same, for the frame-clock-bypassing path. Deliberately a separate
+  // flag - see RequestPaintBypassingFrameClockImpl.
+  std::atomic<bool> direct_paint_pending_{false};
+  // Set once the frame clock has been caught not delivering draws. From then
+  // on every repaint goes directly to the main loop instead. One-way for the
+  // life of the window: a clock that has stopped once has no way to announce
+  // that it is trustworthy again.
+  std::atomic<bool> frame_clock_unreliable_{false};
   GdkCursor* blank_cursor_ = nullptr;
   guint cursor_auto_hide_timer_ = 0;
   bool cursor_currently_auto_hidden_ = false;

@@ -358,6 +358,32 @@ class Window {
       RequestPaintImpl();
     }
   }
+  // A paint that does not go through the windowing system's own "this window
+  // needs redrawing" machinery. Ordinary RequestPaint marks the widget dirty
+  // and leaves it to the toolkit's frame clock to schedule a draw - which on
+  // GTK/X11 is throttled by frame-completion messages from the compositor, and
+  // after a suspend/resume those can simply stop arriving. The widget is then
+  // dirty forever and no draw is ever emitted.
+  //
+  // This is only for breaking that standoff, never for normal painting: the
+  // frame clock is what paces repaints, and bypassing it routinely would mean
+  // painting as fast as the caller asks.
+  // Why the frame clock is being bypassed. Only kFrameClockStalled is evidence
+  // that the toolkit's clock actually stopped - frames were produced and
+  // nothing was drawn. kSuspendResume is precautionary: a resume may or may not
+  // have killed the clock. Keeping them apart matters because an earlier
+  // version logged "the frame clock has stopped delivering draws"
+  // unconditionally on every suspend, and that line was then read back out of
+  // the captures as proof, sending two builds after the wrong layer.
+  enum class PaintBypassReason {
+    kSuspendResume,
+    kFrameClockStalled,
+  };
+  void RequestPaintBypassingFrameClock(PaintBypassReason reason) {
+    if (presenter_surface_) {
+      RequestPaintBypassingFrameClockImpl(reason);
+    }
+  }
   void RequestPresenterUIPaintFromUIThread() {
     if (presenter_) {
       presenter_->RequestUIPaintFromUIThread();
@@ -566,6 +592,11 @@ class Window {
   virtual std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) = 0;
   // Called only if the Surface exists.
   virtual void RequestPaintImpl() = 0;
+  // Called only if the Surface exists. Defaults to an ordinary paint request;
+  // backends whose toolkit can stop scheduling draws override it.
+  virtual void RequestPaintBypassingFrameClockImpl(PaintBypassReason /*reason*/) {
+    RequestPaintImpl();
+  }
 
   // Will also disconnect the surface if needed.
   void OnBeforeClose(WindowDestructionReceiver& destruction_receiver);

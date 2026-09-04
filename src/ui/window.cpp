@@ -75,7 +75,19 @@ float Window::CachedDisplayRefreshHz() {
 void Window::UpdateCachedDisplayRefresh() {
   const float hz = QueryDisplayRefreshHzImpl();
   if (hz > 0.0f) {
-    g_display_refresh_hz.store(hz, std::memory_order_relaxed);
+    const float previous = g_display_refresh_hz.exchange(hz, std::memory_order_relaxed);
+    // Say what the panel is running at, because it silently sets the ceiling on
+    // everything above it and there is otherwise no way to see it from a log.
+    // A Steam Deck OLED is a 90 Hz panel, but SteamOS's Desktop Mode commonly
+    // drives it at 60 - and then vsync caps the game at 60 however high the
+    // frame cap is set, which looks exactly like the game refusing to go
+    // faster. Logged only when it changes, so it costs nothing.
+    if (previous != hz) {
+      REXLOG_INFO(
+          "Display refresh: {:.3g} Hz (automatic frame cap would be {:.3g} FPS; this is the "
+          "ceiling for vsync regardless of any higher cap)",
+          hz, AutoFrameCapHz(hz));
+    }
   }
 }
 
