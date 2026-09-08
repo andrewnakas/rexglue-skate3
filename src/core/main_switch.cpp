@@ -41,9 +41,6 @@ u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
 
 }  // extern "C"
 
-// Placed by libnx's linker script at the start of the loaded image.
-extern "C" char __start__;
-
 namespace rex {
 
 namespace {
@@ -111,13 +108,60 @@ bool InitializeSwitchApp() {
   // this when it is ready to exit.
   appletLockExit();
 
-  // The address the image was loaded at. hbloader does not register the NRO as
-  // a module, so a system crash report gives raw addresses with nothing to
-  // subtract - and this is the number that turns them back into offsets that
-  // addr2line can resolve against skate3.debug.elf. Printed first, because a
-  // crash before anything else still needs it.
-  std::fprintf(stderr, "[boot] image base: %p (subtract this from a crash PC)\n",
-               (void*)&__start__);
+  // Where the image actually landed. hbloader does not register the NRO as a
+  // module, so a system crash report gives raw addresses with nothing to
+  // subtract, and this is what turns them back into something addr2line can
+  // resolve against skate3.debug.elf.
+  //
+  // The address of a real function rather than the linker's __start__: that
+  // symbol resolved to zero here, which for a position-independent image is a
+  // plausible thing for it to mean and useless for this purpose. A function's
+  // address is unambiguous - subtract its address in the ELF, given by nm, and
+  // the difference is the relocation applied to everything.
+  std::fprintf(stderr, "[boot] &InitializeSwitchApp = %p (see scripts/symbolize_crash.sh)\n",
+               (void*)&InitializeSwitchApp);
+
+  // Walk this process's own mapping across the image and report what the
+  // kernel actually gave us.
+  //
+  // Every crash so far is a call into a function sitting in the last few
+  // kilobytes of a 76 MB .text, landing instead at the image base. The same
+  // calls work perfectly in a small test binary, which points at the loading of
+  // something this large rather than at the code. hbloader's own source carries
+  // a "todo: Detect whether NRO fits into heap or not", so it is worth asking
+  // the kernel directly whether the whole image is mapped and executable.
+  {
+    const u64 anchor = (u64)&InitializeSwitchApp;
+    std::fprintf(stderr, "[map] walking the image from the anchor\n");
+    u64 addr = anchor & ~0xFFFFFull;  // back off to a round address below it
+    // Far enough to cross a 76 MB text section and its neighbours.
+    const u64 limit = addr + 0x8000000ull;
+    int regions = 0;
+    while (addr < limit && regions < 24) {
+      MemoryInfo info = {};
+      u32 pageinfo = 0;
+      if (R_FAILED(svcQueryMemory(&info, &pageinfo, addr))) {
+        std::fprintf(stderr, "[map] query failed at %#llx\n", (unsigned long long)addr);
+        break;
+      }
+      if (info.type == MemType_Unmapped && info.size == 0) {
+        break;
+      }
+      const char* kind = info.perm == Perm_Rx   ? "r-x"
+                         : info.perm == Perm_R  ? "r--"
+                         : info.perm == Perm_Rw ? "rw-"
+                         : info.perm == Perm_None ? "---" : "?";
+      std::fprintf(stderr, "[map] %#012llx +%#010llx %s type=%u%s\n",
+                   (unsigned long long)info.addr, (unsigned long long)info.size, kind,
+                   (unsigned)info.type,
+                   (anchor >= info.addr && anchor < info.addr + info.size) ? "  <- code is here"
+                                                                          : "");
+      ++regions;
+      const u64 next = info.addr + info.size;
+      if (next <= addr) break;
+      addr = next;
+    }
+  }
 
   std::fprintf(stderr, "[boot] Horizon %u.%u.%u, %s, pool %llu MiB (%llu MiB used)\n",
                (unsigned)HOSVER_MAJOR(hosversionGet()), (unsigned)HOSVER_MINOR(hosversionGet()),
