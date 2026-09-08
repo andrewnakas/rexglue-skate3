@@ -511,7 +511,11 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     }
 #endif
 
-#if REX_PLATFORM_MOBILE
+// The touch driver reads SDL finger events, so it needs SDL as well as a touch
+// screen. The Switch has the screen but not SDL; until the driver takes a
+// platform-neutral event it cannot be built there, and the console always has
+// physical buttons anyway.
+#if REX_PLATFORM_MOBILE && REXGLUE_HAS_SDL
     // Touch driver last of the real drivers: it declines while a physical
     // controller is attached, so it costs nothing when one is.
     {

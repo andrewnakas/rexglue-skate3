@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <regex.h>
 
+#include <reent.h>
 #include <switch.h>
 
 /* Back rust's getrandom with CSRNG so the values are actually random. */
@@ -129,4 +130,24 @@ int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
    if (result)
       *result = NULL;
    return ENOTSUP;
+}
+
+/*
+ * newlib ships getentropy(), but it is a thin wrapper that calls _getentropy_r
+ * and expects the platform to supply that. devkitA64 does not, so anything
+ * reaching for entropy - libstdc++'s std::random_device, among others - fails
+ * at link time rather than at runtime.
+ *
+ * The console has a hardware random number generator behind randomGet, which is
+ * what getrandom above already uses.
+ */
+int _getentropy_r(struct _reent *reent, void *buf, size_t buflen)
+{
+   (void)reent;
+   if (buflen > 256) {  /* the documented maximum for getentropy */
+      errno = EIO;
+      return -1;
+   }
+   randomGet(buf, buflen);
+   return 0;
 }

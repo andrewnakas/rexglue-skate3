@@ -38,12 +38,7 @@ REXCVAR_DEFINE_BOOL(audio_realtime_credit_pacing, true, "Audio",
                     "times too fast.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(audio_stats, false, "Audio",
-                    "Log a 5-second audio pipeline stats line: device callback rate/gaps, "
-                    "frames consumed vs real time, silence insertions (underruns), queue "
-                    "depth and pacing state. Turn on when diagnosing robotic/slowed/"
-                    "crackling audio reports.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(bool, audio_stats);  // defined in audio_system.cpp
 
 REXCVAR_DEFINE_INT32(audio_device_channels, 0, "Audio",
                      "Channel count to open the audio device with (0 = ask the device, "

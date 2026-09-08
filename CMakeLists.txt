@@ -232,6 +232,10 @@ elseif(REX_SWITCH)
     # glibc and BSD extension that newlib's struct tm does not carry. The
     # library's own switch drops the offset rather than the timestamp.
     add_compile_definitions(SPDLOG_NO_TZ_OFFSET)
+    # imgui's default "open in shell" forks a process to hand a URL to a
+    # browser. There is no shell and no fork here, and nothing in this build
+    # opens a link; without this it pulls execvp and waitpid into the link.
+    add_compile_definitions(IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
