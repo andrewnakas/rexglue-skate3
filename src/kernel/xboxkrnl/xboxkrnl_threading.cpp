@@ -543,6 +543,11 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
 }
 
 u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+  // Which handle, and from which thread. A stalled title is a thread waiting on
+  // an event nobody sets, and the wait side is already reported by the thread
+  // dump - this is the other half of that pairing, and neither event calls nor
+  // waits were logged at all before.
+  REXKRNL_DEBUG("NtSetEvent(handle={:08X})", handle);
   return xeNtSetEvent(handle, previous_state_ptr);
 }
 
@@ -851,6 +856,20 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
+  // Only the ones that block for a long time: this is the hottest call in the
+  // title and logging every one buries the file. A handle that shows up here
+  // repeatedly is an event whose signal never arrives.
+  {
+    static thread_local uint64_t last_reported = 0;
+    static std::atomic<uint64_t> seq{0};
+    const uint64_t n = seq.fetch_add(1, std::memory_order_relaxed);
+    if ((n - last_reported) > 20000) {
+      last_reported = n;
+      REXKRNL_DEBUG("NtWaitForSingleObjectEx(handle={:08X}, alertable={}) still waiting",
+                    object_handle, alertable);
+    }
+  }
+
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
