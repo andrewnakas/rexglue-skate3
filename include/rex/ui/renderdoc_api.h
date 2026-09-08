@@ -12,6 +12,7 @@
 
 #include <memory>
 
+#include <rex/platform.h>
 #include <rex/platform/dynlib.h>
 
 #include <renderdoc_app.h>

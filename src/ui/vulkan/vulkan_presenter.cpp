@@ -47,6 +47,9 @@
 #if REX_PLATFORM_WIN32
 #include <rex/ui/surface_win.h>
 #endif
+#if REX_PLATFORM_SWITCH
+#include <rex/ui/surface_switch.h>
+#endif
 
 REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 2, "UI/Vulkan",
                      "How many paint submissions may be outstanding at once. Must stay "
@@ -542,6 +545,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
     type_flags |= Surface::kTypeFlag_AndroidNativeWindow;
   }
 #endif
+#if REX_PLATFORM_SWITCH
+  if (instance_extensions.ext_NN_vi_surface) {
+    type_flags |= Surface::kTypeFlag_NintendoViWindow;
+  }
+#endif
 #if REX_PLATFORM_GNU_LINUX
   if (instance_extensions.ext_KHR_xcb_surface) {
     type_flags |= Surface::kTypeFlag_XcbWindow;
@@ -920,6 +928,19 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     }
     VkResult vulkan_surface_create_result = VK_ERROR_UNKNOWN;
     switch (surface_type) {
+#if REX_PLATFORM_SWITCH
+      case Surface::kTypeIndex_NintendoViWindow: {
+        auto& vi_window_surface = static_cast<const ViWindowSurface&>(new_surface);
+        VkViSurfaceCreateInfoNN surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        // The NWindow itself, which is what libnx hands the compositor.
+        surface_create_info.window = vi_window_surface.window();
+        vulkan_surface_create_result = ifn.vkCreateViSurfaceNN(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+#endif
 #if REX_PLATFORM_ANDROID
       case Surface::kTypeIndex_AndroidNativeWindow: {
         auto& android_native_window_surface =

@@ -137,6 +137,15 @@ float SwitchWindow::QueryDisplayRefreshHzImpl() const {
   return 60.0f;
 }
 
+bool SwitchWindow::PaintIfRequested() {
+  if (!paint_requested_.exchange(false, std::memory_order_acq_rel)) {
+    return false;
+  }
+  // Blocks on the display when vsync is on, which is what paces the loop.
+  OnPaint();
+  return true;
+}
+
 void SwitchWindow::OnFocusStateChanged(bool has_focus) {
   WindowDestructionReceiver destruction_receiver(this);
   OnFocusUpdate(has_focus, destruction_receiver);

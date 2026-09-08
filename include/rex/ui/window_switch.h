@@ -34,8 +34,10 @@ class SwitchWindow final : public Window {
                uint32_t desired_logical_width, uint32_t desired_logical_height);
   ~SwitchWindow() override;
 
-  // Called by the applet loop.
-  bool TakePaintRequest() { return paint_requested_.exchange(false, std::memory_order_acq_rel); }
+  // Called by the applet loop once per iteration. Consumes a pending paint
+  // request and paints, returning whether it did. The painting itself stays
+  // inside the window, which is where the base class keeps it.
+  bool PaintIfRequested();
   void OnFocusStateChanged(bool has_focus);
   void OnOperationModeChanged();
 

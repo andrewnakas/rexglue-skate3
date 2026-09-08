@@ -116,9 +116,7 @@ int SwitchWindowedAppContext::RunMainLoop() {
       input_pump_();
     }
 
-    if (window_ && window_->TakePaintRequest()) {
-      // Blocks on the display when vsync is on, which is what paces the loop.
-      window_->OnPaint();
+    if (window_ && window_->PaintIfRequested()) {
       continue;
     }
 

@@ -30,7 +30,13 @@
 
 #if defined(WIN32) || defined(_WIN32)
 	#define RENDERDOC_CC __cdecl
-#elif defined(__linux__) || defined(__APPLE__)
+#elif defined(__linux__) || defined(__APPLE__) || defined(__SWITCH__)
+	// __SWITCH__ added downstream: Horizon is an AArch64 ELF target using the
+	// standard procedure call standard, the same as the Linux case here, so the
+	// empty calling convention is correct. RenderDoc itself cannot attach to a
+	// console; this only lets the header parse, and the API is never obtained
+	// because it is reached by loading a library at runtime, which that
+	// platform does not do.
 	#define RENDERDOC_CC
 #else
 	#error "Unknown platform"

@@ -222,6 +222,12 @@ elseif(REX_SWITCH)
     # volk must see the Horizon window-system extension when it builds its
     # static dispatch table.
     set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_VI_NN)
+    # Vulkan-Hpp's DynamicLoader exists to dlopen a Vulkan loader at runtime,
+    # and it refuses to compile for a platform it cannot do that on. There is
+    # no loader here and nothing to open: the driver is linked into the NRO and
+    # entered through its one exported symbol. Removing the class is exactly
+    # right rather than a workaround.
+    add_compile_definitions(VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0)
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
