@@ -115,7 +115,12 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
 
 }  // namespace rex::arch
 
-extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
+// Visibility, explicitly. libnx declares this weak and the kernel calls
+// whatever the link resolved it to; the SDK compiles with -fvisibility=hidden,
+// which made this local and left libnx's default in place - so every fault
+// terminated the process silently instead of reporting itself.
+extern "C" __attribute__((visibility("default"))) void __libnx_exception_handler(
+    ThreadExceptionDump* ctx) {
   using namespace rex::arch;
 
   // Re-entering means a handler faulted. There is no recovering from that and

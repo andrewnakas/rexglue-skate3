@@ -242,6 +242,27 @@ bool CreateChunk(uint64_t file_offset, size_t length) {
 
   w.mapping_count += mapped;
   w.committed_bytes += length;
+
+  // The first commit is the one that matters: it is the first proof on real
+  // hardware that heap can be published as code memory and then mapped at
+  // several guest addresses at once, which is what the whole design rests on.
+  // After that, a line every 256 MB is enough to follow the shape of a boot
+  // without burying the log.
+  static bool first_commit_reported = false;
+  static size_t last_reported_mb = 0;
+  const size_t committed_mb = w.committed_bytes >> 20;
+  if (!first_commit_reported) {
+    first_commit_reported = true;
+    std::fprintf(stderr,
+                 "[mem] first guest commit ok: %zu KB at file offset 0x%llx, "
+                 "mapped into %zu view(s)\n",
+                 length >> 10, (unsigned long long)file_offset, mapped);
+  } else if (committed_mb >= last_reported_mb + 256) {
+    last_reported_mb = committed_mb;
+    std::fprintf(stderr, "[mem] committed %zu MB across %zu chunks, %zu mappings\n",
+                 committed_mb, w.chunks.size() + 1, w.mapping_count);
+  }
+
   w.chunks.emplace(file_offset, std::move(chunk));
   return true;
 }
