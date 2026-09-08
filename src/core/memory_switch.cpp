@@ -111,6 +111,12 @@ Window& window() {
   return w;
 }
 
+// Where this process's own code lives, filled in by SwitchInitialize. Guest
+// memory is published into the same region of the address space, so every
+// mapping is checked against it.
+u64 g_image_start = 0;
+u64 g_image_end = 0;
+
 constexpr size_t AlignDown(size_t v, size_t a) { return v & ~(a - 1); }
 constexpr size_t AlignUp(size_t v, size_t a) { return AlignDown(v + a - 1, a); }
 
@@ -200,6 +206,26 @@ bool CreateChunk(uint64_t file_offset, size_t length) {
     return false;
   }
 
+  // Guest memory is published into the code region, which is where the loader
+  // also placed this image. libnx's allocator is supposed to skip what is
+  // already mapped, but the consequence of it not doing so is that the game
+  // overwrites its own code and then dies somewhere unrelated - so check,
+  // rather than trust and debug it later.
+  const u64 alias_start = reinterpret_cast<u64>(chunk.alias);
+  const u64 alias_end = alias_start + length;
+  if (g_image_end && alias_start < g_image_end && alias_end > g_image_start) {
+    std::fprintf(stderr,
+                 "[mem] REFUSING an alias at %#llx..%#llx: it overlaps this image "
+                 "(%#llx..%#llx). Mapping there would overwrite the running code.\n",
+                 (unsigned long long)alias_start, (unsigned long long)alias_end,
+                 (unsigned long long)g_image_start, (unsigned long long)g_image_end);
+    virtmemLock();
+    virtmemRemoveReservation(chunk.alias_reservation);
+    virtmemUnlock();
+    std::free(chunk.backing);
+    return false;
+  }
+
   Result rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(),
                                       reinterpret_cast<u64>(chunk.alias),
                                       reinterpret_cast<u64>(chunk.backing), length);
@@ -255,8 +281,9 @@ bool CreateChunk(uint64_t file_offset, size_t length) {
     first_commit_reported = true;
     std::fprintf(stderr,
                  "[mem] first guest commit ok: %zu KB at file offset 0x%llx, "
-                 "mapped into %zu view(s)\n",
-                 length >> 10, (unsigned long long)file_offset, mapped);
+                 "alias %#llx, mapped into %zu view(s)\n",
+                 length >> 10, (unsigned long long)file_offset,
+                 (unsigned long long)alias_start, mapped);
   } else if (committed_mb >= last_reported_mb + 256) {
     last_reported_mb = committed_mb;
     std::fprintf(stderr, "[mem] committed %zu MB across %zu chunks, %zu mappings\n",
@@ -360,7 +387,21 @@ size_t page_size() { return kPageSize; }
 
 size_t allocation_granularity() { return kPageSize; }
 
-void SwitchInitialize() {}
+void SwitchInitialize() {
+  // Ask the kernel where this image is. Guest memory is published as code
+  // memory, which comes from the same region of the address space the loader
+  // put the game in - so "did I just map over myself" is a question with a
+  // definite answer, and it is worth being able to ask it.
+  MemoryInfo info = {};
+  u32 pageinfo = 0;
+  const u64 probe = reinterpret_cast<u64>(&SwitchInitialize);
+  if (R_SUCCEEDED(svcQueryMemory(&info, &pageinfo, probe))) {
+    g_image_start = info.addr;
+    g_image_end = info.addr + info.size;
+    std::fprintf(stderr, "[mem] own code occupies %#llx..%#llx\n",
+                 (unsigned long long)g_image_start, (unsigned long long)g_image_end);
+  }
+}
 
 void SwitchShutdown() {}
 
