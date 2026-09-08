@@ -686,14 +686,25 @@ add_library(libavcodec STATIC
     ${FFMPEG_DIR}/libavcodec/rdft.c
     ${FFMPEG_DIR}/libavcodec/aactab.c
     ${FFMPEG_DIR}/libavcodec/null_bsf.c
-    ${FFMPEG_DIR}/libavcodec/pthread.c
-    ${FFMPEG_DIR}/libavcodec/pthread_slice.c
-    ${FFMPEG_DIR}/libavcodec/pthread_frame.c
     ${FFMPEG_DIR}/libavcodec/avfft.c
     ${FFMPEG_DIR}/libavcodec/fft_float.c
     ${FFMPEG_DIR}/libavcodec/fft_fixed_32.c
     ${FFMPEG_DIR}/libavcodec/fft_init_table.c
 )
+
+# Frame and slice threading, which needs pthreads. Horizon has none, and the
+# threading would go unused anyway: the guest hands over one XMA frame at a
+# time and the engine decodes it on a thread it already owns. HAVE_THREADS is 0
+# in that platform's config header, which makes these files compile to nothing
+# useful even where they do build - so they are simply left out.
+if(NOT REX_SWITCH)
+    target_sources(libavcodec PRIVATE
+        ${FFMPEG_DIR}/libavcodec/pthread.c
+        ${FFMPEG_DIR}/libavcodec/pthread_slice.c
+        ${FFMPEG_DIR}/libavcodec/pthread_frame.c
+    )
+endif()
+
 
 # Windows-specific source
 if(WIN32)
