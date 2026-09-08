@@ -445,12 +445,13 @@ void SwitchVerifyOwnCode(const char* when) {
                  (unsigned long long)probe);
     return;
   }
-  u64 total = 0, used = 0;
-  svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-  svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-  std::fprintf(stderr, "[mem] %s: pool %llu MiB used of %llu MiB (%lld MiB free)\n", when,
-               (unsigned long long)(used >> 20), (unsigned long long)(total >> 20),
-               (long long)((long long)total - (long long)used) >> 20);
+  // The pool figure is not the interesting one: __nx_heap_size = 0 hands the
+  // whole pool to the heap at startup, so the kernel calls almost all of it
+  // "used" before a single allocation happens. What matters is how much the
+  // allocator still has to give out.
+  const struct mallinfo mi = mallinfo();
+  std::fprintf(stderr, "[mem] %s: heap %zu MB in use, %zu MB free, arena %zu MB\n", when,
+               (size_t)mi.uordblks >> 20, (size_t)mi.fordblks >> 20, (size_t)mi.arena >> 20);
 
   const bool executable = info.perm == Perm_Rx;
   const bool covers = probe >= info.addr && probe < info.addr + info.size;

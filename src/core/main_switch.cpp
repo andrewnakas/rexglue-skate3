@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <cstdlib>
 
+#include <rex/exception_handler.h>
 #include <rex/memory/utils.h>
 #include <rex/thread.h>
 
@@ -51,6 +52,32 @@ u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
 namespace rex {
 
 namespace {
+
+// Committing the log costs an SD round trip, so it happens on a timer rather
+// than on every line. SwitchFlushLog takes the stream lock, so this cannot
+// overlap a write in progress - an earlier version of this called fsync
+// directly and raced the writers.
+Thread log_sync_thread_;
+bool log_sync_running_ = false;
+
+void LogSyncThreadMain(void*) {
+  while (log_sync_running_) {
+    svcSleepThread(250ull * 1000 * 1000);  // 250 ms
+    SwitchFlushLog();
+  }
+}
+
+void StartLogSyncThread() {
+  log_sync_running_ = true;
+  // Priority 0x3B is the preemptive level on the cores homebrew can use, so
+  // this cannot starve anything. A failure is not worth reporting: it costs
+  // only the periodic commit, and the crash handler still syncs directly.
+  if (R_FAILED(threadCreate(&log_sync_thread_, &LogSyncThreadMain, nullptr, nullptr, 0x10000,
+                            0x3B, -2)) ||
+      R_FAILED(threadStart(&log_sync_thread_))) {
+    log_sync_running_ = false;
+  }
+}
 
 bool socket_ready_ = false;
 bool nxlink_stdio_ = false;
@@ -97,8 +124,14 @@ bool InitializeSwitchApp() {
     if (std::freopen("sdmc:/switch/skate3/stderr.log", "w", stderr)) {
       setvbuf(stderr, nullptr, _IOLBF, 0);
       stderr_fd_ = fileno(stderr);
+      StartLogSyncThread();
     }
   }
+
+  // As early as possible, and in particular before the guest address space and
+  // the caches are built: those allocate hundreds of megabytes, and a failure
+  // there throws rather than faulting.
+  rex::arch::InstallSwitchTerminateHandler();
 
   if (!application_mode_) {
     // Not a warning: in applet mode this process gets a few hundred megabytes

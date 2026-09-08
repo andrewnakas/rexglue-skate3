@@ -30,6 +30,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <new>
+#include <stdexcept>
+#include <typeinfo>
+#include <unistd.h>
+
+#include <rex/execinfo_android.h>
 
 #include <rex/assert.h>
 #include <rex/logging.h>
@@ -89,6 +96,52 @@ const char* DescribeExceptionClass(uint32_t ec) {
 }
 
 }  // namespace
+
+
+namespace {
+
+// Without this an uncaught C++ exception is completely silent. std::terminate
+// calls abort, which calls svcBreak, and the process ends without going through
+// the exception handler above - no registers, no backtrace, and a log that
+// simply stops. std::bad_alloc from a failed allocation looks exactly like a
+// hardware fault from the outside, which is a bad way to spend an afternoon.
+[[noreturn]] void SwitchTerminateHandler() {
+  std::fprintf(stderr, "\n[fatal] std::terminate\n");
+
+  if (std::exception_ptr active = std::current_exception()) {
+    try {
+      std::rethrow_exception(active);
+    } catch (const std::bad_alloc& e) {
+      std::fprintf(stderr, "[fatal] out of memory: %s\n", e.what());
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "[fatal] uncaught %s: %s\n", typeid(e).name(), e.what());
+    } catch (...) {
+      std::fprintf(stderr, "[fatal] uncaught exception, not derived from std::exception\n");
+    }
+  } else {
+    std::fprintf(stderr,
+                 "[fatal] terminate with no active exception - an abort, a failed assert, or a "
+                 "throw out of a noexcept function\n");
+  }
+
+  void* frames[32];
+  const int count = backtrace(frames, static_cast<int>(rex::countof(frames)));
+  if (count > 0) {
+    std::fprintf(stderr, "[fatal] backtrace (%d frames, offsets from the image base):\n", count);
+    std::fflush(stderr);
+    backtrace_symbols_fd(frames, count, fileno(stderr));
+  }
+
+  rex::FlushLogging();
+  std::fflush(nullptr);
+  rex::SwitchFlushLog();
+  svcBreak(BreakReason_Panic, 0, 0);
+  __builtin_unreachable();
+}
+
+}  // namespace
+
+void InstallSwitchTerminateHandler() { std::set_terminate(&SwitchTerminateHandler); }
 
 void ExceptionHandler::Install(Handler fn, void* data) {
   for (size_t i = 0; i < rex::countof(handlers_); ++i) {
