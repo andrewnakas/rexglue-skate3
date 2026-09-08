@@ -228,6 +228,10 @@ elseif(REX_SWITCH)
     # entered through its one exported symbol. Removing the class is exactly
     # right rather than a workaround.
     add_compile_definitions(VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0)
+    # spdlog reports a log timestamp's UTC offset from tm_gmtoff, which is a
+    # glibc and BSD extension that newlib's struct tm does not carry. The
+    # library's own switch drops the offset rather than the timestamp.
+    add_compile_definitions(SPDLOG_NO_TZ_OFFSET)
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")

@@ -219,16 +219,29 @@ if(REXGLUE_USE_VULKAN)
     set(VMA_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
     add_subdirectory(vulkan-memory-allocator)
 
-    # volk
-    if(APPLE)
-        set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_METAL_EXT CACHE STRING "" FORCE)
+    # volk. Its whole purpose is to find a Vulkan loader with dlopen and build a
+    # dispatch table from it. Horizon has no dlopen and no loader - the driver
+    # is linked into the NRO and entered through its one exported symbol - and
+    # nothing here includes volk.h, so it is simply not built there.
+    if(NOT REX_SWITCH)
+        if(APPLE)
+            set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_METAL_EXT CACHE STRING "" FORCE)
+        endif()
+        set(VOLK_INSTALL ON CACHE BOOL "" FORCE)
+        set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
+        add_subdirectory(volk)
+        target_link_libraries(volk PUBLIC Vulkan::Headers)
+        target_link_libraries(volk_headers INTERFACE Vulkan::Headers)
+        target_compile_options(volk PRIVATE -w)
+    else()
+        # Three libraries name volk::volk in their link lists, and all they want
+        # from it in practice is the Vulkan headers. Standing in for it here
+        # keeps those lists honest and platform-agnostic, and puts the fact that
+        # volk is absent in exactly one place instead of three.
+        add_library(volk_stub INTERFACE)
+        add_library(volk::volk ALIAS volk_stub)
+        target_link_libraries(volk_stub INTERFACE Vulkan::Headers)
     endif()
-    set(VOLK_INSTALL ON CACHE BOOL "" FORCE)
-    set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
-    add_subdirectory(volk)
-    target_link_libraries(volk PUBLIC Vulkan::Headers)
-    target_link_libraries(volk_headers INTERFACE Vulkan::Headers)
-    target_compile_options(volk PRIVATE -w)
 endif()
 
 #=============================================================================
