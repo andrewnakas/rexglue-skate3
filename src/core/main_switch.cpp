@@ -14,6 +14,7 @@
 #include <switch.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 
 #include <rex/memory/utils.h>
@@ -39,6 +40,9 @@ alignas(16) u8 __nx_exception_stack[0x4000];
 u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
 
 }  // extern "C"
+
+// Placed by libnx's linker script at the start of the loaded image.
+extern "C" char __start__;
 
 namespace rex {
 
@@ -72,6 +76,19 @@ bool InitializeSwitchApp() {
     nxlink_stdio_ = nxlink_socket_ >= 0;
   }
 
+  // Point stderr at a file before anything is written to it. This used to
+  // happen in main() after this function returned, so everything below - the
+  // applet-mode refusal and the image base among it - went to a stderr nobody
+  // was reading and never reached the log. Line-buffered, so a crash loses at
+  // most the line in progress.
+  if (!nxlink_stdio_) {
+    std::error_code ec;
+    std::filesystem::create_directories("sdmc:/switch/skate3", ec);
+    if (std::freopen("sdmc:/switch/skate3/stderr.log", "w", stderr)) {
+      setvbuf(stderr, nullptr, _IOLBF, 0);
+    }
+  }
+
   if (!application_mode_) {
     // Not a warning: in applet mode this process gets a few hundred megabytes
     // and none of the process-memory syscalls the guest address space is built
@@ -93,6 +110,14 @@ bool InitializeSwitchApp() {
   // guest is mid-frame with the GPU holding buffers; the applet loop releases
   // this when it is ready to exit.
   appletLockExit();
+
+  // The address the image was loaded at. hbloader does not register the NRO as
+  // a module, so a system crash report gives raw addresses with nothing to
+  // subtract - and this is the number that turns them back into offsets that
+  // addr2line can resolve against skate3.debug.elf. Printed first, because a
+  // crash before anything else still needs it.
+  std::fprintf(stderr, "[boot] image base: %p (subtract this from a crash PC)\n",
+               (void*)&__start__);
 
   std::fprintf(stderr, "[boot] Horizon %u.%u.%u, %s, pool %llu MiB (%llu MiB used)\n",
                (unsigned)HOSVER_MAJOR(hosversionGet()), (unsigned)HOSVER_MINOR(hosversionGet()),

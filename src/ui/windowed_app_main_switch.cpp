@@ -214,16 +214,8 @@ int main(int argc, char** argv) {
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(kAppRoot) / "user", ec);
     std::filesystem::create_directories(std::filesystem::path(kAppRoot) / "cache", ec);
-    // With nxlink attached stdout and stderr are the development machine's
-    // terminal, which is where they belong. Without it they go nowhere, so
-    // give stderr a file - the crash reporter and the argument diagnostics
-    // both write there. Line-buffered, so a crash loses at most one line.
-    if (!rex::SwitchHasNxlinkStdio()) {
-      const std::filesystem::path stderr_path = std::filesystem::path(kAppRoot) / "stderr.log";
-      if (std::freopen(stderr_path.c_str(), "w", stderr)) {
-        setvbuf(stderr, nullptr, _IOLBF, 0);
-      }
-    }
+    // stderr was pointed at its file by InitializeSwitchApp, before it wrote
+    // anything. Redirecting again here would truncate that away.
   }
 
   // What the launcher passed is the operator's intent: record it as explicitly
