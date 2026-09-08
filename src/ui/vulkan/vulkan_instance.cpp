@@ -150,14 +150,33 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 
   // Load global functions.
 
-  functions_loaded &= (ifn.vkCreateInstance = PFN_vkCreateInstance(
-                           ifn.vkGetInstanceProcAddr(nullptr, "vkCreateInstance"))) != nullptr;
-  functions_loaded &= (ifn.vkEnumerateInstanceExtensionProperties =
-                           PFN_vkEnumerateInstanceExtensionProperties(ifn.vkGetInstanceProcAddr(
-                               nullptr, "vkEnumerateInstanceExtensionProperties"))) != nullptr;
-  functions_loaded &=
-      (ifn.vkEnumerateInstanceLayerProperties = PFN_vkEnumerateInstanceLayerProperties(
-           ifn.vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceLayerProperties"))) != nullptr;
+  // Named individually rather than folded into one boolean: when this fails it
+  // is the first thing that runs on a new platform, and "one of three was null"
+  // costs a whole debugging round trip to narrow down.
+  ifn.vkCreateInstance =
+      PFN_vkCreateInstance(ifn.vkGetInstanceProcAddr(nullptr, "vkCreateInstance"));
+  if (!ifn.vkCreateInstance) {
+    REXLOG_ERROR("Vulkan: vkCreateInstance not available from vkGetInstanceProcAddr");
+    functions_loaded = false;
+  }
+  ifn.vkEnumerateInstanceExtensionProperties = PFN_vkEnumerateInstanceExtensionProperties(
+      ifn.vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceExtensionProperties"));
+  if (!ifn.vkEnumerateInstanceExtensionProperties) {
+    REXLOG_ERROR("Vulkan: vkEnumerateInstanceExtensionProperties not available");
+    functions_loaded = false;
+  }
+
+  // Layers are a loader concept, not a driver one: they are libraries the
+  // loader inserts between the application and the driver, so a build that
+  // talks to a driver directly has nowhere to put them and no list to read.
+  // The Vulkan ICD interface does not require a driver to answer this at all,
+  // and NVK does not. Treated as optional, with the call site checking for it.
+  ifn.vkEnumerateInstanceLayerProperties = PFN_vkEnumerateInstanceLayerProperties(
+      ifn.vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceLayerProperties"));
+  if (!ifn.vkEnumerateInstanceLayerProperties) {
+    REXLOG_INFO("Vulkan: no layer enumeration (expected when talking to a driver directly)");
+  }
+
   if (!functions_loaded) {
     REXLOG_ERROR(
         "Failed to get Vulkan global function pointers via "
@@ -282,7 +301,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 
   std::vector<const char*> enabled_layers;
 
-  if (!requested_layers.empty()) {
+  if (!requested_layers.empty() && !ifn.vkEnumerateInstanceLayerProperties) {
+    // Nothing can be enabled that cannot be enumerated. Only validation asks
+    // for a layer, and asking for it on a driver-only build is a mistake worth
+    // saying out loud rather than failing quietly later.
+    REXLOG_WARN("Vulkan: layers were requested but this build has no layer support; ignoring");
+  } else if (!requested_layers.empty()) {
     std::vector<VkLayerProperties> available_layers;
     // "The list of available layers may change at any time due to actions
     // outside of the Vulkan implementation"
