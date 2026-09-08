@@ -19,6 +19,7 @@
 #include <malloc.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include <rex/audio/conversion.h>
@@ -90,6 +91,11 @@ bool AudoutAudioDriver::Initialize() {
   // driver that reports a queue. Start it with every buffer free so the guest
   // may run ahead by the whole ring before it is made to wait.
   SetAutoDeviceSampleFrames(int32_t(kChannelSamples));
+  // Warn level so it survives the shipped log_level: silence from this driver
+  // is indistinguishable from a driver that never started, and "no sound" is
+  // the report that arrives when either happens.
+  REXAPU_WARN("audout ready: {} Hz, {} channels, {} buffers of {} frames", kFrameFrequency,
+              kOutputChannels, kBufferCount, kChannelSamples);
   return true;
 }
 
@@ -116,6 +122,17 @@ void AudoutAudioDriver::Shutdown() {
 void AudoutAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   if (!initialized_) {
     return;
+  }
+
+  // Says whether the guest is feeding this driver at all. A frame count that
+  // stays at zero means the mixer never reached us, which is a different
+  // problem from one where the frames arrive and do not make a sound.
+  {
+    static std::atomic<uint64_t> submitted{0};
+    const uint64_t n = submitted.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || (n % 2000) == 0) {
+      REXAPU_WARN("audout: {} guest frame(s) submitted", n);
+    }
   }
 
   int index = -1;
