@@ -14,6 +14,9 @@
 #include <switch.h>
 
 #include <cstdio>
+#include <unistd.h>
+#include <thread>
+#include <atomic>
 #include <filesystem>
 #include <cstdlib>
 
@@ -36,6 +39,10 @@ size_t __nx_heap_size = 0;
 // is often the thing that is broken. 16 KB is enough for the register dump and
 // the backtrace walk in exception_handler_switch.cpp, both of which are
 // written not to allocate.
+// Set once stderr points at the SD card; -1 while it still points at nxlink or
+// nowhere. Read by the sync thread and by SwitchFlushLog.
+std::atomic<int> stderr_fd_{-1};
+
 alignas(16) u8 __nx_exception_stack[0x4000];
 u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
 
@@ -76,13 +83,31 @@ bool InitializeSwitchApp() {
   // Point stderr at a file before anything is written to it. This used to
   // happen in main() after this function returned, so everything below - the
   // applet-mode refusal and the image base among it - went to a stderr nobody
-  // was reading and never reached the log. Line-buffered, so a crash loses at
-  // most the line in progress.
+  // was reading and never reached the log.
+  //
+  // Unbuffered, and separately synced: line buffering is not enough here. A
+  // flush only hands the bytes to the SD filesystem, which does not commit the
+  // file's new size until the handle is synced or closed. A process that dies
+  // without closing loses everything written since the last commit, so the log
+  // stops at a filesystem boundary rather than at the fault - which is exactly
+  // as misleading as it sounds when the log is all you have.
   if (!nxlink_stdio_) {
     std::error_code ec;
     std::filesystem::create_directories("sdmc:/switch/skate3", ec);
     if (std::freopen("sdmc:/switch/skate3/stderr.log", "w", stderr)) {
-      setvbuf(stderr, nullptr, _IOLBF, 0);
+      setvbuf(stderr, nullptr, _IONBF, 0);
+      stderr_fd_ = fileno(stderr);
+      // Committing on every write would make logging cost an SD round trip, so
+      // a small thread does it on a timer instead. The window of loss is the
+      // sync interval, not the whole run.
+      std::thread([]() {
+        for (;;) {
+          svcSleepThread(100ull * 1000 * 1000);  // 100 ms
+          if (stderr_fd_ >= 0) {
+            fsync(stderr_fd_);
+          }
+        }
+      }).detach();
     }
   }
 
@@ -203,3 +228,18 @@ bool SwitchHasNxlinkStdio() { return nxlink_stdio_; }
 }  // namespace rex
 
 #endif  // REX_PLATFORM_SWITCH
+
+namespace rex {
+
+void SwitchFlushLog() {
+  std::fflush(stderr);
+  std::fflush(stdout);
+  const int fd = stderr_fd_.load();
+  if (fd >= 0) {
+    // Commits the file size, not just the bytes. Without this a crash leaves
+    // the log looking as though execution stopped where the last sync landed.
+    fsync(fd);
+  }
+}
+
+}  // namespace rex

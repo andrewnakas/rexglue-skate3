@@ -25,6 +25,7 @@
 #if REX_PLATFORM_SWITCH
 
 #include <switch.h>
+#include <rex/main_switch.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -174,7 +175,32 @@ extern "C" __attribute__((visibility("default"))) void __libnx_exception_handler
   }
   std::fprintf(stderr, "[fault] sp %016llx  pstate %08x\n", (unsigned long long)thread_context.sp,
                (unsigned)thread_context.pstate);
+
+  // Horizon puts no guard page below a thread stack, so running off the end of
+  // one does not fault where it happens - it quietly overwrites what is mapped
+  // below and the thread dies later at a nonsense address. Reporting how much
+  // room was left turns that into something readable: a few hundred bytes of
+  // headroom here means the stack was the cause, whatever the fault says.
+  {
+    MemoryInfo si = {};
+    u32 spi = 0;
+    if (R_SUCCEEDED(svcQueryMemory(&si, &spi, thread_context.sp)) && si.size) {
+      const u64 sp = thread_context.sp;
+      if (sp >= si.addr && sp < si.addr + si.size) {
+        const u64 remaining = sp - si.addr;
+        std::fprintf(stderr,
+                     "[fault] stack %#llx..%#llx (%llu KB), sp is %llu KB above the bottom%s\n",
+                     (unsigned long long)si.addr, (unsigned long long)(si.addr + si.size),
+                     (unsigned long long)(si.size >> 10), (unsigned long long)(remaining >> 10),
+                     remaining < 0x4000 ? "  <-- almost certainly a STACK OVERFLOW" : "");
+      } else {
+        std::fprintf(stderr, "[fault] sp %#llx is outside any mapped region\n",
+                     (unsigned long long)sp);
+      }
+    }
+  }
   std::fflush(stderr);
+  rex::SwitchFlushLog();
 
   Exception ex;
   if (is_abort) {
@@ -199,11 +225,13 @@ extern "C" __attribute__((visibility("default"))) void __libnx_exception_handler
                    "fatal.\n",
                    i);
       std::fflush(stderr);
+      rex::SwitchFlushLog();
     }
   }
 
   rex::FlushLogging();
   std::fflush(nullptr);
+  rex::SwitchFlushLog();
 
   // BreakReason_Panic stops in an attached debugger and otherwise ends the
   // process with a report the system records.

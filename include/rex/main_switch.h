@@ -41,6 +41,11 @@ uint64_t SwitchUsedMemory();
 // True when stdout is going to a listening nxlink host rather than a file.
 bool SwitchHasNxlinkStdio();
 
+// Commits everything written to the log so far to the SD card. Safe to call
+// from an exception handler; without it a crash truncates the log at whatever
+// the filesystem last committed.
+void SwitchFlushLog();
+
 }  // namespace rex
 
 #endif  // REX_PLATFORM_SWITCH

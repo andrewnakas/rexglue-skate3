@@ -71,6 +71,12 @@ uint8_t* SwitchGuestWindowBase();
 // runs into a kernel limit if the slab strategy ever regresses.
 size_t SwitchGuestCommittedBytes();
 size_t SwitchGuestMappingCount();
+
+// Re-checks that this process's own code is still mapped executable, and says
+// so. Guest memory is published into the same region of the address space, so
+// this is how a mapping that damages the running image gets caught at the
+// moment it happens rather than at the next call into it.
+void SwitchVerifyOwnCode(const char* when);
 #endif
 
 // Returns the native page size of the system, in bytes.

@@ -71,6 +71,7 @@ elseif(REX_SWITCH)
         socket_switch.cpp
         system_switch.cpp
         threading_switch.cpp
+        pthread_stack_switch.cpp
         # The guest's fibers are hand-written AArch64: no OS involvement, so the
         # same two files the phones use assemble unchanged here.
         fiber_aarch64.cpp

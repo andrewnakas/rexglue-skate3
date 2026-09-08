@@ -252,6 +252,23 @@ bool CreateChunk(uint64_t file_offset, size_t length) {
     return false;
   }
 
+  // svcMapProcessCodeMemory borrows the source pages: the kernel drops the
+  // original mapping's permissions while the alias exists. The source here is
+  // 512 MB of the C heap, so report what state it is left in - anything that
+  // later allocates inside a range the kernel has made inaccessible would fault
+  // far away from here.
+  {
+    MemoryInfo bi = {};
+    u32 bpi = 0;
+    if (R_SUCCEEDED(svcQueryMemory(&bi, &bpi, reinterpret_cast<u64>(chunk.backing)))) {
+      std::fprintf(stderr,
+                   "[mem] backing %#llx +%#llx now type=%u perm=%u attr=%u%s\n",
+                   (unsigned long long)bi.addr, (unsigned long long)bi.size,
+                   (unsigned)bi.type, (unsigned)bi.perm, (unsigned)bi.attr,
+                   bi.perm == Perm_None ? "  <-- source is now INACCESSIBLE" : "");
+    }
+  }
+
   chunk.committed.assign((length / kPageSize + 63) / 64, 0);
 
   const size_t mapped = MapChunkIntoViews(chunk);
@@ -284,10 +301,12 @@ bool CreateChunk(uint64_t file_offset, size_t length) {
                  "alias %#llx, mapped into %zu view(s)\n",
                  length >> 10, (unsigned long long)file_offset,
                  (unsigned long long)alias_start, mapped);
+    SwitchVerifyOwnCode("after first commit");
   } else if (committed_mb >= last_reported_mb + 256) {
     last_reported_mb = committed_mb;
     std::fprintf(stderr, "[mem] committed %zu MB across %zu chunks, %zu mappings\n",
                  committed_mb, w.chunks.size() + 1, w.mapping_count);
+    SwitchVerifyOwnCode("after 256 MB");
   }
 
   w.chunks.emplace(file_offset, std::move(chunk));
@@ -410,6 +429,36 @@ uint8_t* SwitchGuestWindowBase() { return window().base; }
 size_t SwitchGuestCommittedBytes() { return window().committed_bytes; }
 
 size_t SwitchGuestMappingCount() { return window().mapping_count; }
+
+void SwitchVerifyOwnCode(const char* when) {
+  if (!g_image_start) {
+    return;
+  }
+  MemoryInfo info = {};
+  u32 pageinfo = 0;
+  // The far end of the image is what the crashes call into, so check there
+  // rather than at the start: a mapping that has been broken part-way through
+  // still looks intact from the front.
+  const u64 probe = g_image_end - 0x2000;
+  if (R_FAILED(svcQueryMemory(&info, &pageinfo, probe))) {
+    std::fprintf(stderr, "[mem] %s: cannot query our own code at %#llx\n", when,
+                 (unsigned long long)probe);
+    return;
+  }
+  u64 total = 0, used = 0;
+  svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+  svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+  std::fprintf(stderr, "[mem] %s: pool %llu MiB used of %llu MiB (%lld MiB free)\n", when,
+               (unsigned long long)(used >> 20), (unsigned long long)(total >> 20),
+               (long long)((long long)total - (long long)used) >> 20);
+
+  const bool executable = info.perm == Perm_Rx;
+  const bool covers = probe >= info.addr && probe < info.addr + info.size;
+  std::fprintf(stderr, "[mem] %s: own code %#llx +%#llx perm=%u%s\n", when,
+               (unsigned long long)info.addr, (unsigned long long)info.size,
+               (unsigned)info.perm,
+               (executable && covers) ? " (still executable)" : "  <-- NO LONGER EXECUTABLE");
+}
 
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& /*path*/, size_t length,
                                           PageAccess /*access*/, bool /*commit*/) {
