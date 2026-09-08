@@ -83,6 +83,21 @@ function(rexglue_apply_target_settings target_name)
                      distribute; naming a core builds instructions older phones cannot execute.")
                 set(REXGLUE_ANDROID_ARM_MARCH "armv8-a" CACHE STRING
                     "-march for the Android arm64 guest code when REXGLUE_ANDROID_ARM_MCPU is empty")
+                # Scheduling WITHOUT touching the instruction set or the
+                # atomics strategy. Naming a core with -mcpu does three things
+                # at once - baseline, scheduling, and (below) inline atomics -
+                # and only the middle one is wanted for a build that has to run
+                # on every low-end phone. -mtune=cortex-a53 emits byte-identical
+                # code to -mcpu=cortex-a53 for the shapes the guest code is made
+                # of, while -march stays generic and outline atomics keep the
+                # LSE fast path on the chips that have it. A53 and A55 are both
+                # in-order and between them are the little cores of essentially
+                # every budget SoC, so one tuning covers the field.
+                set(REXGLUE_ANDROID_ARM_MTUNE "" CACHE STRING
+                    "-mtune for the Android arm64 guest code. Scheduling only; safe to ship.")
+                set(REXGLUE_ANDROID_ARM_NO_OUTLINE_ATOMICS OFF CACHE BOOL
+                    "Emit inline LL/SC atomics instead of the runtime LSE dispatcher. Correct
+                     everywhere, faster on in-order cores, slower on chips that have LSE.")
                 if(REXGLUE_ANDROID_ARM_MCPU)
                     target_compile_options(${target_name} PRIVATE
                         $<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=${REXGLUE_ANDROID_ARM_MCPU}>)
@@ -93,12 +108,31 @@ function(rexglue_apply_target_settings target_name)
                 else()
                     target_compile_options(${target_name} PRIVATE
                         $<$<COMPILE_LANGUAGE:C,CXX>:-march=${REXGLUE_ANDROID_ARM_MARCH}>)
+                    if(REXGLUE_ANDROID_ARM_MTUNE)
+                        target_compile_options(${target_name} PRIVATE
+                            $<$<COMPILE_LANGUAGE:C,CXX>:-mtune=${REXGLUE_ANDROID_ARM_MTUNE}>)
+                    endif()
                     # Outline atomics keep the LSE fast path on every phone that
                     # has it and fall back at RUN time on those that do not, so
                     # one binary suits both. This is clang's default; it is
                     # named here so a later change cannot quietly drop it.
-                    target_compile_options(${target_name} PRIVATE
-                        $<$<COMPILE_LANGUAGE:C,CXX>:-moutline-atomics>)
+                    #
+                    # A build aimed only at in-order cores can turn it off. The
+                    # dispatch is a call, a load of the feature flag and a
+                    # branch on EVERY atomic - 13,101 call sites in the low-end
+                    # library - and the call also acts as a scheduling barrier,
+                    # which an in-order core pays for far more heavily than an
+                    # out-of-order one that can execute around it. Inline
+                    # LL/SC is correct on every ARMv8 chip; it is merely slower
+                    # than LSE on the chips that have LSE, which is a trade a
+                    # dedicated low-end binary can make.
+                    if(REXGLUE_ANDROID_ARM_NO_OUTLINE_ATOMICS)
+                        target_compile_options(${target_name} PRIVATE
+                            $<$<COMPILE_LANGUAGE:C,CXX>:-mno-outline-atomics>)
+                    else()
+                        target_compile_options(${target_name} PRIVATE
+                            $<$<COMPILE_LANGUAGE:C,CXX>:-moutline-atomics>)
+                    endif()
                 endif()
             else()
                 target_compile_options(${target_name} PRIVATE -march=armv8-a)

@@ -149,6 +149,9 @@ if(REXGLUE_USE_VULKAN)
         volk::volk
         GPUOpen::VulkanMemoryAllocator
         SPIRV-Tools-static
+        # For vulkan_spirv_optimize: some Adreno drivers segfault in their own
+        # shader compiler on unoptimized SPIR-V.
+        SPIRV-Tools-opt
     )
 endif()
 

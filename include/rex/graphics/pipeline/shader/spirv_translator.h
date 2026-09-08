@@ -223,6 +223,22 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_reset;
     // Number of guest vertices processed by the memexport compute dispatch.
     uint32_t compute_memexport_vertex_count;
+    // Pad so user_clip_planes starts at 32 rather than 28.
+    //
+    // The seven scalars above occupy 0..27, which put an array of vec4 at
+    // offset 28. std140's extended alignment requires 16 for an array member,
+    // so the block was only legal with the uniformBufferStandardLayout
+    // feature - core in Vulkan 1.2, and simply absent on a device that reports
+    // 1.1. Three reporters crashed inside the Adreno driver's own shader
+    // compiler within seconds of starting: two Snapdragon 865 handhelds
+    // (Adreno 650) and a Motorola Edge 30 (Adreno 642L). Adreno 730 and 740,
+    // which report Vulkan 1.3 and therefore get the feature, never did.
+    //
+    // Four bytes here make the layout legal with no feature at all, on every
+    // device. The SPIR-V member offsets come from offsetof() below, so the
+    // shader side follows automatically, and the padding is not a table entry
+    // so no member index moves.
+    uint32_t padding_user_clip_planes_alignment;
     float user_clip_planes[6][4];
 
     float ndc_scale[3];
@@ -238,6 +254,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // One bit per texture fetch constant indicating that it references a
     // draw-resolution-scaled texture.
     uint32_t textures_resolution_scaled;
+    // Pad so every remaining array member lands on 16.
+    //
+    // Four of them were off: texture_swizzled_signs at 180, texture_swizzles
+    // at 212, edram_rt_keep_mask at 404 and edram_rt_clamp at 436. They are
+    // all after this point, so twelve bytes here moves the lot to 192, 224,
+    // 416 and 448 - one pad rather than four. See the note on
+    // padding_user_clip_planes_alignment above for why any of this matters.
+    uint32_t padding_array_alignment[3];
 
     // Each byte contains post-swizzle TextureSign values for each of the needed
     // components of each of the 32 used texture fetch constants.

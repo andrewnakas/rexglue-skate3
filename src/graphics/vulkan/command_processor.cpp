@@ -1258,10 +1258,20 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
   if (!device_properties.vertexPipelineStoresAndAtomics) {
-    REXGPU_ERROR(
-        "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation and "
-        "D3D12 parity, but unsupported by the selected device");
-    return false;
+    // Not fatal on its own. The stage bits below already add COMPUTE when this
+    // is missing, which is the path for vertex memexport, and the only draw
+    // that cannot be served is one that actually exports from a vertex shader
+    // - caught where it happens rather than by refusing the device outright.
+    // Refusing meant a Mali-G77 could not start the app at all.
+    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics)) {
+      REXGPU_ERROR(
+          "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation and "
+          "D3D12 parity, but unsupported by the selected device");
+      return false;
+    }
+    REXGPU_WARN(
+        "Vulkan vertexPipelineStoresAndAtomics is unsupported; vertex memexport will "
+        "go through compute shaders and a draw that needs it will fail");
   }
   if (!device_properties.geometryShader) {
     if (REXCVAR_GET(vulkan_require_geometry_shader)) {

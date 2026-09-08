@@ -32,8 +32,10 @@ REXCVAR_DEFINE_BOOL(vulkan_robust_buffer_access, true, "UI/Vulkan",
                     "then return undefined data and may crash the GPU - experimental")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
-                    "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
-                    "required for Vulkan GPU emulation")
+                    "Refuse a device without vertexPipelineStoresAndAtomics. Turning this off "
+                    "lets a GPU that lacks it run: the command processor already routes vertex "
+                    "memexport through compute shaders when it is absent, and only a draw that "
+                    "actually exports from a vertex shader then fails")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader,
 #if REX_PLATFORM_MAC
@@ -125,10 +127,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
           properties.deviceName);
       return nullptr;
     }
-    if (!supported_features.vertexPipelineStoresAndAtomics) {
+    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics) &&
+        !supported_features.vertexPipelineStoresAndAtomics) {
       REXLOG_WARN(
-          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, which "
-          "is required for Vulkan GPU emulation parity",
+          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, but "
+          "vulkan_require_vertex_pipeline_stores_and_atomics=true",
           properties.deviceName);
       return nullptr;
     }
@@ -222,6 +225,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_EXT_fragment_shader_interlock = false;
   bool ext_1_3_EXT_shader_demote_to_helper_invocation = false;
   bool ext_1_3_KHR_dynamic_rendering = false;
+  bool ext_1_2_KHR_uniform_buffer_standard_layout = false;
   bool ext_EXT_non_seamless_cube_map = false;
   if (with_gpu_emulation) {
     // #15.
@@ -243,6 +247,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
       // #55.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
+      // #254. The emulated GPU's XeSystemConstants block puts an array of
+      // vec4 at offset 28, which std140's extended alignment forbids - it is
+      // only legal with uniformBufferStandardLayout. That feature is core in
+      // Vulkan 1.2, and the branch below only asks for it there. An Adreno 650
+      // reports Vulkan 1.1, so it never got asked, and its driver faulted
+      // inside its own shader compiler a few seconds in. Asking for the
+      // pre-promotion extension covers every 1.1 device that has it.
+      XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_uniform_buffer_standard_layout, 1, 2)
       // #277.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(EXT_shader_demote_to_helper_invocation, 1, 3)
       // #423.
@@ -350,10 +362,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDeviceUniformBufferStandardLayoutFeatures,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES>
+      features_1_2_KHR_uniform_buffer_standard_layout;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
       features_1_2.Link(supported_features_2, device_create_info);
+    } else if (ext_1_2_KHR_uniform_buffer_standard_layout) {
+      features_1_2_KHR_uniform_buffer_standard_layout.Link(supported_features_2,
+                                                           device_create_info);
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
       features_1_3.Link(supported_features_2, device_create_info);
@@ -610,6 +628,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxImageArrayLayers)
   XE_UI_VULKAN_LIMIT(maxStorageBufferRange)
   XE_UI_VULKAN_LIMIT(maxSamplerAllocationCount)
+  XE_UI_VULKAN_LIMIT(maxBoundDescriptorSets)
+  XE_UI_VULKAN_LIMIT(maxDescriptorSetUniformBuffersDynamic)
+  XE_UI_VULKAN_LIMIT(maxDescriptorSetStorageBuffersDynamic)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorSamplers)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorStorageBuffers)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorSampledImages)
@@ -668,6 +689,39 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
   }
 
+  // At warning level on purpose, so it survives into a player's diagnostic
+  // report - the feature list below is INFO, and Android ships at
+  // --log_level=warn, so none of it reaches the people whose devices are the
+  // ones failing.
+  //
+  // These two matter specifically: the emulated GPU's XeSystemConstants block
+  // puts an array of vec4 at offset 28, which std140 does not allow, and it
+  // is only legal with uniformBufferStandardLayout. That feature is requested
+  // below ONLY on a Vulkan 1.2 device; on 1.1 it is promoted-from
+  // VK_KHR_uniform_buffer_standard_layout, which this file does not ask for.
+  // An Adreno 650 faults inside its own driver a few seconds in, and whether
+  // it reports 1.1 decides if that is the reason.
+  const bool ubsl_core = properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+                         features_1_2.supported.uniformBufferStandardLayout;
+  const bool ubsl_ext =
+      ext_1_2_KHR_uniform_buffer_standard_layout &&
+      features_1_2_KHR_uniform_buffer_standard_layout.supported.uniformBufferStandardLayout;
+  // maxBoundDescriptorSets goes in the WARN line, not the INFO limit dump
+  // above: Android ships at --log_level=warn, and this is the limit that
+  // decided whether every Adreno 6xx device crashed. The build marker is here
+  // for the same reason - five test builds carried the same version string,
+  // and three reporters sent logs from the wrong one.
+  REXLOG_WARN("Vulkan device: API {}.{}.{}, uniformBufferStandardLayout={}, "
+              "maxBoundDescriptorSets={} [build: v14-load-stages]",
+              VK_API_VERSION_MAJOR(properties.apiVersion),
+              VK_API_VERSION_MINOR(properties.apiVersion),
+              VK_API_VERSION_PATCH(properties.apiVersion),
+              ubsl_core ? "yes (1.2 core)"
+                        : (ubsl_ext ? "yes (KHR extension)"
+                                    : "NO - the emulated GPU's uniform blocks are not "
+                                      "legal without it"),
+              properties.limits.maxBoundDescriptorSets);
+
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
@@ -677,6 +731,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)
+    }
+    if (with_gpu_emulation && ext_1_2_KHR_uniform_buffer_standard_layout) {
+      XE_UI_VULKAN_FEATURE_2(features_1_2_KHR_uniform_buffer_standard_layout,
+                             uniformBufferStandardLayout);
     }
   }
 

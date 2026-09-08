@@ -60,6 +60,13 @@ class VulkanDevice {
     uint32_t maxImageArrayLayers = 256;
     uint32_t maxStorageBufferRange = uint32_t(1) << 27;
     uint32_t maxSamplerAllocationCount = 4000;
+    // Vulkan's floor is 4, and Qualcomm's Adreno driver reports exactly that
+    // across the whole range (610 through 740), as does Mali. Anything that
+    // builds a pipeline layout has to fit inside it: the driver does not
+    // reject an over-wide layout, it faults inside vkCreatePipelineLayout.
+    uint32_t maxBoundDescriptorSets = 4;
+    uint32_t maxDescriptorSetUniformBuffersDynamic = 8;
+    uint32_t maxDescriptorSetStorageBuffersDynamic = 4;
     uint32_t maxPerStageDescriptorSamplers = 16;
     uint32_t maxPerStageDescriptorStorageBuffers = 4;
     uint32_t maxPerStageDescriptorSampledImages = 16;

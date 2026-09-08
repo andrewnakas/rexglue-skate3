@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 #include <rex/math.h>
 #include <rex/ui/vulkan/device.h>
@@ -136,8 +137,35 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* vulkan_device,
 
 // Explicitly accepting const uint32_t* to make sure attention is paid to the
 // alignment where this is called for safety on different host architectures.
+// Optionally rewrites SPIR-V through the optimizer first - see
+// vulkan_spirv_optimize in vulkan_util.cpp. Returns false and leaves the
+// output untouched when it is off or the optimizer declines, which is the
+// only behaviour any driver has seen until now.
+bool OptimizeSpirv(const uint32_t* code, size_t code_size_bytes,
+                   std::vector<uint32_t>& optimized_out);
+
 inline VkShaderModule CreateShaderModule(const VulkanDevice* const vulkan_device,
                                          const uint32_t* const code, const size_t code_size_bytes) {
+  // Every shader in the engine reaches the driver through here - the native
+  // renderer's own, the emulated GPU's translated guest shaders, and the
+  // built-in blit and gamma shaders - so this is the one place worth putting
+  // the Adreno workaround.
+  std::vector<uint32_t> optimized;
+  if (OptimizeSpirv(code, code_size_bytes, optimized)) {
+    VkShaderModuleCreateInfo optimized_create_info;
+    optimized_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    optimized_create_info.pNext = nullptr;
+    optimized_create_info.flags = 0;
+    optimized_create_info.codeSize = optimized.size() * sizeof(uint32_t);
+    optimized_create_info.pCode = optimized.data();
+    VkShaderModule optimized_module;
+    if (vulkan_device->functions().vkCreateShaderModule(vulkan_device->device(),
+                                                        &optimized_create_info, nullptr,
+                                                        &optimized_module) == VK_SUCCESS) {
+      return optimized_module;
+    }
+    // Fall through to the original bytes rather than fail the shader.
+  }
   VkShaderModuleCreateInfo shader_module_create_info;
   shader_module_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
   shader_module_create_info.pNext = nullptr;

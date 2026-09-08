@@ -306,6 +306,12 @@ void StartForcedExitWatchdog(const char* reason) {
 
 }  // namespace
 
+REXCVAR_DEFINE_DOUBLE(guest_time_scalar, 1.0, "General",
+                      "Rate the guest's clock advances relative to real time. 1.0 is normal; "
+                      "below 1.0 the game runs in slow motion. Used to tell a fixed-timestep "
+                      "catch-up spiral apart from a fixed per-frame cost.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(advanced_settings_overlay_enabled, false, "UI/Advanced",
                     "Enable the developer cvar browser on F4")
     .debug_only();
@@ -551,7 +557,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   // Runtime::Setup so mftb and KeQueryPerformanceFrequency agree.
   rex::chrono::Clock::set_guest_tick_frequency(50000000);
   rex::chrono::Clock::set_guest_system_time_base(rex::chrono::Clock::QueryHostSystemTime());
-  rex::chrono::Clock::set_guest_time_scalar(1.0);
+  // Diagnostic, and possibly more than that on a device that cannot keep up.
+  // A game with a fixed simulation step that is handed a 122 ms frame may run
+  // several catch-up steps to cover it, so the work per frame grows with how
+  // slow the frame already was - the classic spiral. Scaling the guest clock
+  // shrinks the elapsed time the guest sees, and whether the frame rate then
+  // moves says which it is: if the cost is catch-up, fps rises roughly in
+  // proportion; if the cost is per-frame regardless, nothing changes.
+  //
+  // Below 1.0 the game runs in slow motion, so this is not a free setting -
+  // it is here to answer the question, and 1.0 keeps today's behaviour.
+  rex::chrono::Clock::set_guest_time_scalar(REXCVAR_GET(guest_time_scalar));
   auto guest_tick_ratio = rex::chrono::Clock::guest_tick_ratio();
   REXLOG_INFO("Host guest clock initialized: frequency={} ratio={}/{}",
               rex::chrono::Clock::guest_tick_frequency(), guest_tick_ratio.first,
@@ -568,7 +584,17 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 
   auto status = runtime_->Setup(ppc_info_, std::move(config_));
   if (XFAILED(status)) {
-    REXLOG_ERROR("Runtime setup failed: {:08X}", status);
+    // Every other failure here puts up a dialog; this one used to return
+    // straight into teardown, and the queued repaint that followed ran against
+    // a half-torn-down presenter and crashed. The user saw a crash, not a
+    // reason. The most common cause by far is the guest address-space
+    // reservation - see Memory::Initialize, which logs the specifics.
+    auto msg = fmt::format(
+        "Runtime setup failed ({:08X}).\n\nThe most common cause is that this device could not "
+        "reserve the 4.5 GB of address space the guest needs. Check the log for details.",
+        status);
+    REXLOG_ERROR("{}", msg);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
 

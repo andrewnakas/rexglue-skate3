@@ -129,7 +129,45 @@ constexpr std::array<const char*, 7> kTexStoreLabels = {
 
 constexpr std::array<const char*, 3> kResolutionLabels = {"720p (1x)", "1440p (2x)",
                                                           "2160p (3x)"};
-constexpr std::array<const char*, 2> kAspectRatioLabels = {"16:9", "21:9 (Experimental)"};
+// Aspect ratio. Index 0 is off - skate3_ultrawide false, the game presents
+// 16:9 and the presenter pillarboxes. Every other index turns it on; index 1
+// leaves skate3_ultrawide_target_aspect at 0, which means "derive from the
+// panel at boot", and the rest name an aspect outright.
+//
+// Widening is not a stretch: the guest output target is allocated at this
+// aspect (ApplyNativeGuestOutputWideAspect), so the whole native scene and
+// every half-resolution target derived from it grow with it. 21:9 is about
+// 31% more pixels than 16:9. That is why 16:9 stays the default.
+//
+// Auto does not stay selected, and that is expected: ApplyUltrawideVideoDefaults
+// writes the aspect it derived back into the cvar at boot (the guest cull-plane
+// patch reads the cvar directly, so it has to be a real number by then). The
+// row therefore reads back as whichever preset that display is nearest. The
+// picture is identical either way - only the label settles from "Auto" onto
+// the ratio it resolved to.
+// Auto already matches any panel exactly - it reads the display - so these
+// presets exist to override it, and to name a ratio a handheld reports oddly.
+// The spread covers what Android handhelds and phones actually ship: 16:9
+// (Retroid Pocket 5, Odin 2 Portal), 18:9 and 18.5:9 (older tall phones),
+// 19:9 and 19.5:9 (most phones), 20:9 (Odin 2, Galaxy S23, Pixel), and 21:9
+// upward for ultrawide phones and desktop monitors.
+//
+// NOTHING NARROWER THAN 16:9 IS OFFERED, and that is a limit of the feature,
+// not an oversight: ApplyNativeGuestOutputWideAspect only ever widens the
+// guest output, and the guest cull patch clamps to 16:9..8.0. A 4:3 or 3:2
+// handheld (RG405M, Retroid Pocket Mini) letterboxes instead, and filling
+// those needs a Vert- path that narrows the frame - a different feature.
+constexpr std::array<const char*, 14> kAspectRatioLabels = {
+    "16:9",   "Auto (fill screen)", "17:9",   "18:9",   "18.5:9", "19:9",   "19.5:9",
+    "20:9",   "20.5:9",             "21:9",   "21.5:9", "22:9",   "24:9",   "32:9"};
+constexpr int kAspectRatioAutoIndex = 1;
+constexpr int kAspectRatioFirstPresetIndex = 2;
+constexpr std::array<double, 12> kAspectRatioPresets = {
+    17.0 / 9.0,   18.0 / 9.0,   18.5 / 9.0, 19.0 / 9.0, 19.5 / 9.0, 20.0 / 9.0,
+    20.5 / 9.0,   21.0 / 9.0,   21.5 / 9.0, 22.0 / 9.0, 24.0 / 9.0, 32.0 / 9.0};
+static_assert(kAspectRatioLabels.size() ==
+                  size_t(kAspectRatioFirstPresetIndex) + kAspectRatioPresets.size(),
+              "every label past Auto needs an aspect, and vice versa");
 constexpr std::array<double, 6> kFrameCapRates = {60.0, 90.0, 120.0, 144.0, 165.0, 240.0};
 constexpr std::array<const char*, 7> kFrameCapLabels = {"Unlimited", "60 FPS",  "90 FPS",
                                                         "120 FPS",   "144 FPS", "165 FPS",
@@ -437,6 +475,11 @@ std::vector<std::string_view> GetSimpleSettingsCvars() {
   if (HasCvar("skate3_ultrawide")) {
     cvars.push_back("skate3_ultrawide");
   }
+  // Without this the chosen aspect is lost on relaunch and every wide setting
+  // silently falls back to deriving from the display.
+  if (HasCvar("skate3_ultrawide_target_aspect")) {
+    cvars.push_back("skate3_ultrawide_target_aspect");
+  }
   if (HasCvar("skate3_field_of_view")) {
     cvars.push_back("skate3_field_of_view");
   }
@@ -697,6 +740,25 @@ int DrawDistanceIndexFromCvar() {
   }
   return NearestValueIndex(kDrawDistanceScales,
                            rex::cvar::Query<double>("skate3_draw_distance_scale"));
+}
+
+// The row's index, derived from the pair of cvars that back it. An aspect
+// that matches no preset - somebody set it by hand in android_args.txt or
+// settings.toml - shows as the nearest one rather than resetting the row.
+int AspectRatioIndexFromCvar() {
+  if (!HasCvar("skate3_ultrawide") || !rex::cvar::Query<bool>("skate3_ultrawide")) {
+    return 0;
+  }
+  if (!HasCvar("skate3_ultrawide_target_aspect")) {
+    return kAspectRatioAutoIndex;
+  }
+  // At or below 16:9 is the cvar's own "derive from the display" sentinel,
+  // which is what Auto stores; see ApplyUltrawideVideoDefaults.
+  const double aspect = rex::cvar::Query<double>("skate3_ultrawide_target_aspect");
+  if (aspect <= 16.0 / 9.0 + 0.01) {
+    return kAspectRatioAutoIndex;
+  }
+  return kAspectRatioFirstPresetIndex + NearestValueIndex(kAspectRatioPresets, aspect);
 }
 
 int StreamProbeIndexFromCvar() {
@@ -1327,8 +1389,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                 double(rex::cvar::Query<int32_t>("skate3_native_render_scene_tex_store_mb")))
           : 1;
   frame_cap_index_ = FrameCapIndexFromCvar();
-  aspect_ratio_index_ =
-      HasCvar("skate3_ultrawide") && rex::cvar::Query<bool>("skate3_ultrawide") ? 1 : 0;
+  aspect_ratio_index_ = AspectRatioIndexFromCvar();
   msaa_index_ = MsaaIndexFromCvar();
   shadow_quality_index_ = ShadowQualityIndexFromCvar();
   static_shadow_res_index_ = StaticShadowResIndexFromCvar();
@@ -1405,8 +1466,7 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
          device_index_ != DeviceIndexFromCvar(device_list_) ||
          resolution_scale_index_ != ResolutionIndexFromCvar() ||
          frame_cap_index_ != FrameCapIndexFromCvar() ||
-         (HasCvar("skate3_ultrawide") &&
-          (aspect_ratio_index_ != 0) != rex::cvar::Query<bool>("skate3_ultrawide")) ||
+         (HasCvar("skate3_ultrawide") && aspect_ratio_index_ != AspectRatioIndexFromCvar()) ||
          (HasMsaaCvar() && msaa_index_ != MsaaIndexFromCvar()) ||
          (HasShadowQualityCvars() && shadow_quality_index_ != ShadowQualityIndexFromCvar()) ||
          (HasStaticShadowCvars() &&
@@ -1543,6 +1603,15 @@ void SimpleSettingsDialog::SaveVideo() {
   SetBoolCvar("fullscreen", fullscreen_);
   if (HasCvar("skate3_ultrawide")) {
     SetBoolCvar("skate3_ultrawide", aspect_ratio_index_ != 0);
+    if (HasCvar("skate3_ultrawide_target_aspect")) {
+      // Auto and 16:9 both store 0, the cvar's "derive from the display"
+      // sentinel; only 16:9 also clears the bool, so that 0 is never read.
+      const double aspect =
+          aspect_ratio_index_ >= kAspectRatioFirstPresetIndex
+              ? kAspectRatioPresets[aspect_ratio_index_ - kAspectRatioFirstPresetIndex]
+              : 0.0;
+      rex::cvar::SetFlagByName("skate3_ultrawide_target_aspect", std::to_string(aspect));
+    }
   }
   if (HasFieldOfViewCvar()) {
     rex::cvar::SetFlagByName("skate3_field_of_view", std::to_string(field_of_view_));
@@ -2351,15 +2420,19 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.kind = RowSpec::kEnum;
         row.label = "Aspect Ratio";
         row.desc =
-            "21:9 widens the world rendering for ultrawide displays. Requires "
-            "the native renderer; the emulated renderer presents 16:9.";
-        row.value_note = "21:9 is experimental";
+            "Fills a wider screen instead of leaving black bars at the sides. "
+            "Auto matches this device's panel and is the one to pick. Wider "
+            "renders more pixels and costs performance - 21:9 is about a third "
+            "more than 16:9. Screens narrower than 16:9 cannot be filled. "
+            "Requires the native renderer; the emulated renderer presents 16:9.";
+        row.value_note = "wider costs performance";
         for (const char* label : kAspectRatioLabels) {
           row.options.push_back(label);
         }
         row.index = &aspect_ratio_index_;
         row.reset = [this] {
-          aspect_ratio_index_ = CvarDefaultBool("skate3_ultrawide", false) ? 1 : 0;
+          aspect_ratio_index_ =
+              CvarDefaultBool("skate3_ultrawide", false) ? kAspectRatioAutoIndex : 0;
         };
         rows.push_back(std::move(row));
       }

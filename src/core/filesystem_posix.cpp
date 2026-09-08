@@ -27,10 +27,17 @@
 #include <unistd.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/filesystem/host_buffer_fault_hook.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/string.h>
+
+#include <errno.h>
+
+#include <algorithm>
+#include <atomic>
 
 #include <dirent.h>
 #include <ftw.h>
@@ -45,6 +52,42 @@ using off64_t = off_t;
 #define ftello64 ftello
 #define ftruncate64 ftruncate
 #endif
+
+// Host reads are the one place bytes from disk enter guest memory, and the
+// guest's own file system code treats a read as all-or-nothing, because on the
+// console it was. A single pread() is allowed to return fewer bytes than asked,
+// or -1/EINTR when a signal lands while the kernel waits on a FUSE daemon - and
+// this runtime does signal its own threads (suspend, user callbacks). Builds up
+// to v0.1.17 issued one syscall and passed whatever came back up as success.
+// The handle loops now; these switches make the old shape reproducible on a
+// healthy device so the hypothesis can be tested rather than argued.
+REXCVAR_DEFINE_BOOL(filesystem_read_loop, true, "Filesystem",
+                    "Loop pread/pwrite until the requested count is satisfied, retrying "
+                    "EINTR/EAGAIN. Off restores the single-syscall behaviour of builds up "
+                    "to v0.1.17 - for A/B testing only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(filesystem_fault_short_cap, 0, "Filesystem",
+                     "Fault injection: cap every pread at this many bytes (0 = off). With "
+                     "filesystem_read_loop=false the guest then sees short reads.")
+    .range(0, 1 << 30)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(filesystem_fault_fail_every, 0, "Filesystem",
+                     "Fault injection: make every Nth pread fail with filesystem_fault_errno "
+                     "(0 = off).")
+    .range(0, 1 << 30)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(filesystem_fault_errno, 4, "Filesystem",
+                     "errno for injected read failures: 4 = EINTR (the loop retries it), "
+                     "5 = EIO (a hard failure the guest sees).")
+    .range(1, 200)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(filesystem_fault_path_substr, "", "Filesystem",
+                      "Fault injection applies only to paths containing this text (empty = "
+                      "every file).");
 
 namespace rex {
 
@@ -65,6 +108,30 @@ std::filesystem::path to_path(const std::u16string_view source) {
 }
 
 namespace filesystem {
+
+namespace {
+
+std::atomic<HostBufferFaultHook> g_host_buffer_fault_hook{nullptr};
+std::atomic<uint64_t> g_fault_injection_counter{0};
+std::atomic<uint64_t> g_io_warn_counter{0};
+
+// First eight, then powers of two: enough to see a pattern, never a flood.
+bool ShouldWarn(uint64_t* out_n) {
+  const uint64_t n = g_io_warn_counter.fetch_add(1, std::memory_order_relaxed);
+  *out_n = n + 1;
+  return n < 8 || (n & (n - 1)) == 0;
+}
+
+bool FaultInjectionMatches(const std::filesystem::path& path) {
+  const std::string& needle = REXCVAR_GET(filesystem_fault_path_substr);
+  return needle.empty() || path.string().find(needle) != std::string::npos;
+}
+
+}  // namespace
+
+void SetHostBufferFaultHook(HostBufferFaultHook hook) {
+  g_host_buffer_fault_hook.store(hook, std::memory_order_release);
+}
 
 std::filesystem::path GetExecutablePath() {
 #if REX_PLATFORM_MAC
@@ -218,15 +285,121 @@ class PosixFileHandle : public FileHandle {
   }
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
             size_t* out_bytes_read) override {
-    ssize_t out = pread(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_read = out;
-    return out >= 0 ? true : false;
+    const int32_t short_cap = REXCVAR_GET(filesystem_fault_short_cap);
+    const int32_t fail_every = REXCVAR_GET(filesystem_fault_fail_every);
+    const bool inject = (short_cap > 0 || fail_every > 0) && FaultInjectionMatches(path_);
+    const bool loop = REXCVAR_GET(filesystem_read_loop);
+    size_t done = 0;
+    uint32_t retries = 0;
+    uint32_t calls = 0;
+    bool fault_hook_used = false;
+    while (done < buffer_length) {
+      size_t want = buffer_length - done;
+      if (inject && short_cap > 0) {
+        want = std::min(want, size_t(short_cap));
+      }
+      ssize_t got;
+      if (inject && fail_every > 0 &&
+          (g_fault_injection_counter.fetch_add(1, std::memory_order_relaxed) %
+           uint64_t(fail_every)) == uint64_t(fail_every - 1)) {
+        errno = REXCVAR_GET(filesystem_fault_errno);
+        got = -1;
+      } else {
+        got = pread(handle_, static_cast<uint8_t*>(buffer) + done, want,
+                    static_cast<off_t>(file_offset + done));
+      }
+      ++calls;
+      if (got < 0) {
+        const int err = errno;
+        if (loop && (err == EINTR || err == EAGAIN) && ++retries <= 64) {
+          continue;
+        }
+        if (err == EFAULT && !fault_hook_used) {
+          fault_hook_used = true;
+          if (auto hook = g_host_buffer_fault_hook.load(std::memory_order_acquire);
+              hook && hook(buffer, buffer_length, path_.c_str(), file_offset)) {
+            continue;
+          }
+        }
+        uint64_t n = 0;
+        if (ShouldWarn(&n)) {
+          REXFS_WARN(
+              "host read FAILED: '{}' offset {} asked {} got {} errno {} ({}) - the guest is "
+              "told END_OF_FILE and its buffer keeps whatever it held (occurrence {})",
+              path_.string(), file_offset, buffer_length, done, err, strerror(err), n);
+        }
+        *out_bytes_read = done;  // never -1
+        return false;
+      }
+      if (got == 0) {
+        break;  // end of file; a short count here is legitimate
+      }
+      done += static_cast<size_t>(got);
+      if (!loop) {
+        break;  // the v0.1.17 shape: one syscall, whatever it returned
+      }
+    }
+    if (calls > 1 && done == buffer_length) {
+      // One pread did not satisfy the request and the next one continued: a
+      // genuine mid-file short read (FUSE, a signal), recovered by looping.
+      // Worth a line - on a regular file a complete read is one syscall, so
+      // this is the failure mode the QCS8550 handhelds are suspected of.
+      uint64_t n = 0;
+      if (ShouldWarn(&n)) {
+        REXFS_WARN("host read needed {} syscalls (short reads recovered by the loop): '{}' "
+                   "offset {} asked {} (occurrence {})",
+                   calls, path_.string(), file_offset, buffer_length, n);
+      }
+    } else if (!loop && done < buffer_length) {
+      uint64_t n = 0;
+      if (ShouldWarn(&n)) {
+        REXFS_WARN("host read SHORT with the loop disabled: '{}' offset {} asked {} got {} "
+                   "(occurrence {})",
+                   path_.string(), file_offset, buffer_length, done, n);
+      }
+    }
+    if (retries != 0) {
+      uint64_t n = 0;
+      if (ShouldWarn(&n)) {
+        REXFS_WARN("host read retried {} EINTR/EAGAIN: '{}' offset {} asked {} (occurrence {})",
+                   retries, path_.string(), file_offset, buffer_length, n);
+      }
+    }
+    *out_bytes_read = done;
+    return true;
   }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
-    ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_written = out;
-    return out >= 0 ? true : false;
+    const bool loop = REXCVAR_GET(filesystem_read_loop);
+    size_t done = 0;
+    uint32_t retries = 0;
+    while (done < buffer_length) {
+      const ssize_t put = pwrite(handle_, static_cast<const uint8_t*>(buffer) + done,
+                                 buffer_length - done, static_cast<off_t>(file_offset + done));
+      if (put < 0) {
+        const int err = errno;
+        if (loop && (err == EINTR || err == EAGAIN) && ++retries <= 64) {
+          continue;
+        }
+        uint64_t n = 0;
+        if (ShouldWarn(&n)) {
+          REXFS_WARN("host write FAILED: '{}' offset {} asked {} wrote {} errno {} ({}) "
+                     "(occurrence {})",
+                     path_.string(), file_offset, buffer_length, done, err, strerror(err), n);
+        }
+        *out_bytes_written = done;  // never -1
+        return false;
+      }
+      if (put == 0) {
+        break;
+      }
+      done += static_cast<size_t>(put);
+      if (!loop) {
+        break;
+      }
+    }
+    *out_bytes_written = done;
+    return true;
   }
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
   void Flush() override { fsync(handle_); }

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 
 #include <rex/logging.h>
@@ -158,21 +159,54 @@ int lzxdelta_apply_patch(rex::xex2_delta_patch* patch, size_t patch_len, uint32_
     if (cur_patch->compressed_len == 0 && cur_patch->uncompressed_len == 0 &&
         cur_patch->new_addr == 0 && cur_patch->old_addr == 0)
       break;
+    // Both operands of a "copy from old -> new" live inside the image being
+    // patched, so the two ranges can overlap - and memcpy is undefined when
+    // they do. That is not theoretical here: bionic picks its memcpy through
+    // an ifunc resolver, so two Android phones running THIS SAME BINARY on
+    // different CPU cores can copy in different directions and end up with
+    // different images. Three QCS8550 handhelds produced a bit-identical wrong
+    // image (hash 5E70418A885349E0) where an 8 Gen 1 produced the right one
+    // (16CDAE083CC474A3), from byte-identical input files, with nothing writing
+    // the image afterwards. memmove is defined for every case and costs
+    // nothing measurable on a patch applied once at load.
+    const uint32_t new_addr = cur_patch->new_addr;
+    const uint32_t old_addr = cur_patch->old_addr;
+    const uint32_t len = cur_patch->uncompressed_len;
+    // Note on the delta case below: it hands lzx_decompress a reference window
+    // that lives inside the same image it writes into. That is safe only because
+    // lzx_decompress copies the window into the decoder's own buffer before any
+    // output is produced - checked, and confirmed by measurement: forcing a
+    // private copy of the window changed nothing (137 blocks overlap here and
+    // the resulting image hash was identical). Do not "fix" it without
+    // re-checking that, and do not remove the copy in lzx_decompress.
+    const bool overlaps = len != 0 && new_addr < old_addr + len && old_addr < new_addr + len;
     switch (cur_patch->compressed_len) {
       case 0:  // fill with 0
-        std::memset((char*)dest + cur_patch->new_addr, 0, cur_patch->uncompressed_len);
+        std::memset((char*)dest + new_addr, 0, len);
         break;
       case 1:  // copy from old -> new
-        std::memcpy((char*)dest + cur_patch->new_addr, (char*)dest + cur_patch->old_addr,
-                    cur_patch->uncompressed_len);
+        if (overlaps && new_addr != old_addr) {
+          // One line per process, not per copy: this title has 92 of them and a
+          // report should say the condition exists, not drown in it.
+          static std::atomic<bool> announced{false};
+          if (!announced.exchange(true)) {
+            REXLOG_WARN(
+                "XEX patch: in-place copies in this title overlap (first: new {:08X} <- old "
+                "{:08X} len {:X}, {:X} bytes of overlap). memcpy is undefined here and picks "
+                "its direction per CPU, which assembled a different executable on different "
+                "phones; memmove is used instead",
+                new_addr, old_addr, len,
+                new_addr > old_addr ? old_addr + len - new_addr : new_addr + len - old_addr);
+          }
+        }
+        std::memmove((char*)dest + new_addr, (char*)dest + old_addr, len);
         break;
       default:                                     // delta patch
         patch_sz = cur_patch->compressed_len - 4;  // -4 because of patch_data field
 
         int result = lzx_decompress(cur_patch->patch_data, cur_patch->compressed_len,
-                                    (char*)dest + cur_patch->new_addr, cur_patch->uncompressed_len,
-                                    window_size, (char*)dest + cur_patch->old_addr,
-                                    cur_patch->uncompressed_len);
+                                    (char*)dest + new_addr, len, window_size,
+                                    (char*)dest + old_addr, len);
 
         if (result) {
           return result;

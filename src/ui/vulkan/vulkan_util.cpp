@@ -16,6 +16,34 @@
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/util.h>
 
+#include <spirv-tools/optimizer.hpp>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+// Run SPIRV-Tools' performance passes over a shader before the driver sees it.
+//
+// Qualcomm's Adreno driver compiles SPIR-V with its own LLVM stack, and older
+// builds of it segfault on shapes an optimizer would have folded away. The
+// same crash is reported against Filament (google/filament#5294 - a null
+// dereference inside QGLCCompileToIRShader, with the note that unoptimized
+// shaders are needed to reproduce it), Bevy, Flutter's Impeller and Unity:
+// always Adreno, never Mali or desktop.
+//
+// A Retroid Pocket 5 - Adreno 650 on driver 0746.0 from September 2023 -
+// faults inside vulkan.adreno.so about three seconds in, on the thread that
+// compiles guest shaders. A Galaxy S23 FE (Adreno 730, current driver) never
+// does. This exists to find out whether pre-optimising removes the shapes that
+// older compiler cannot handle.
+//
+// Off by default: it costs compile time on every shader and buys a working
+// driver nothing.
+REXCVAR_DEFINE_BOOL(vulkan_spirv_optimize, false, "UI/Vulkan",
+                    "Run the SPIR-V optimizer over shaders before creating them. Works around "
+                    "older Adreno drivers that crash in their own shader compiler on "
+                    "unoptimized SPIR-V.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -212,6 +240,48 @@ VkPipeline CreateComputePipeline(const VulkanDevice* const vulkan_device, VkPipe
       CreateComputePipeline(vulkan_device, layout, shader, specialization_info, entry_point);
   vulkan_device->functions().vkDestroyShaderModule(vulkan_device->device(), shader, nullptr);
   return pipeline;
+}
+
+bool OptimizeSpirv(const uint32_t* code, size_t code_size_bytes,
+                   std::vector<uint32_t>& optimized_out) {
+  if (!REXCVAR_GET(vulkan_spirv_optimize) || code == nullptr || code_size_bytes < 4) {
+    return false;
+  }
+  // Match the module's own SPIR-V version, do not assume one.
+  //
+  // Hardcoding SPV_ENV_VULKAN_1_1 here made the first attempt at this a
+  // no-op: every shader is SPIR-V 1.4, the optimizer rejected all of them
+  // with "Invalid SPIR-V binary version 1.4 for target environment SPIR-V
+  // 1.3", and the fallback quietly handed the driver the original bytes. The
+  // build looked like it disproved the theory when it had never tested it.
+  //
+  // Word 1 of a SPIR-V module is its version, packed as 0x00MMmm00.
+  const uint32_t spirv_version = code[1];
+  spv_target_env env = SPV_ENV_VULKAN_1_0;
+  switch (spirv_version) {
+    case 0x00010000u: env = SPV_ENV_VULKAN_1_0; break;
+    case 0x00010300u: env = SPV_ENV_VULKAN_1_1; break;
+    case 0x00010400u: env = SPV_ENV_VULKAN_1_1_SPIRV_1_4; break;
+    case 0x00010500u: env = SPV_ENV_VULKAN_1_2; break;
+    case 0x00010600u: env = SPV_ENV_VULKAN_1_3; break;
+    default:          env = SPV_ENV_VULKAN_1_1_SPIRV_1_4; break;
+  }
+  spvtools::Optimizer optimizer(env);
+  optimizer.SetMessageConsumer(
+      [](spv_message_level_t, const char*, const spv_position_t&, const char* message) {
+        if (message != nullptr) {
+          REXLOG_WARN("SPIR-V optimizer: {}", message);
+        }
+      });
+  optimizer.RegisterPerformancePasses();
+  std::vector<uint32_t> result;
+  if (!optimizer.Run(code, code_size_bytes / sizeof(uint32_t), &result) || result.empty()) {
+    // Leaving the shader as it was is the safe outcome: it is exactly what
+    // every driver has been handed until now.
+    return false;
+  }
+  optimized_out = std::move(result);
+  return true;
 }
 
 }  // namespace util

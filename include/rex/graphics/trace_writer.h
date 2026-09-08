@@ -36,8 +36,25 @@ class TraceWriter {
   void WritePrimaryBufferEnd();
   void WriteIndirectBufferStart(uint32_t base_ptr, uint32_t count);
   void WriteIndirectBufferEnd();
-  void WritePacketStart(uint32_t base_ptr, uint32_t count);
-  void WritePacketEnd();
+  // Inline null-checks on the two per-packet calls.
+  //
+  // Every other Write* here is per buffer or per resource; these two run for
+  // every packet the command processor executes, and with no trace open they
+  // were still a cross-translation-unit call each to reach a `if (!file_)
+  // return`. A profile of the command processor thread during Skate 3
+  // gameplay - the thread that a scheduler trace showed short of a core -
+  // found the pair at 2% of its cycles doing exactly nothing. The check is
+  // now on this side of the call.
+  void WritePacketStart(uint32_t base_ptr, uint32_t count) {
+    if (file_) {
+      WritePacketStartImpl(base_ptr, count);
+    }
+  }
+  void WritePacketEnd() {
+    if (file_) {
+      WritePacketEndImpl();
+    }
+  }
   void WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr);
   void WriteMemoryReadCached(uint32_t base_ptr, size_t length);
   void WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length);
@@ -51,6 +68,10 @@ class TraceWriter {
                       uint32_t gamma_ramp_rw_component);
 
  private:
+  // Out-of-line bodies for the two inline-guarded calls above.
+  void WritePacketStartImpl(uint32_t base_ptr, uint32_t count);
+  void WritePacketEndImpl();
+
   void WriteMemoryCommand(TraceCommandType type, uint32_t base_ptr, size_t length,
                           const void* host_ptr = nullptr);
 

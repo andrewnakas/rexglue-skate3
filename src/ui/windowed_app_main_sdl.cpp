@@ -601,20 +601,108 @@ struct AndroidStoreBudgets {
   const char* tier;
 };
 
-AndroidStoreBudgets PickAndroidStoreBudgets() {
+uint64_t AndroidTotalRamMb() {
   struct sysinfo info = {};
-  const uint64_t total_mb =
-      sysinfo(&info) == 0 ? (uint64_t(info.totalram) * uint64_t(info.mem_unit)) >> 20 : 0;
+  return sysinfo(&info) == 0 ? (uint64_t(info.totalram) * uint64_t(info.mem_unit)) >> 20 : 0;
+}
+
+// True where the machine is small enough that memory, not sharpness, is what
+// limits it. Everything gated on this leaves larger devices exactly as they
+// were.
+bool AndroidIsLowEnd() { return AndroidTotalRamMb() != 0 && AndroidTotalRamMb() < 4000; }
+
+// Which cores are the fast ones.
+//
+// "Eight cores" on a budget phone is rarely eight of the same thing: the Tab
+// A7 Lite measured here runs cpu0-3 at 2.3 GHz and cpu4-7 at 1.8 GHz, and left
+// to itself the scheduler had the slow four parked at their 400 MHz minimum
+// while the game struggled. Read the per-core ceiling and split on it rather
+// than assuming a layout, because the arrangement differs per SoC and the
+// fast cores are not always the low-numbered ones.
+//
+// Returns an empty string when every core has the same ceiling, which is the
+// signal not to set any affinity at all.
+std::string AndroidCoreList(bool fast) {
+  std::map<uint64_t, std::vector<int>> by_ceiling;
+  for (int cpu = 0; cpu < 64; ++cpu) {
+    std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                    "/cpufreq/cpuinfo_max_freq");
+    uint64_t khz = 0;
+    if (!f || !(f >> khz) || khz == 0) {
+      continue;
+    }
+    by_ceiling[khz].push_back(cpu);
+  }
+  if (by_ceiling.size() < 2) {
+    return {};  // one cluster, or nothing readable: leave placement alone
+  }
+  // "Fast" is every core that is not in the SLOWEST cluster - not the single
+  // fastest cluster.
+  //
+  // Taking only the top group assumes a two-cluster big/little phone, and
+  // current ones have three. A Galaxy S23 FE reports 4x1.79, 3x2.50 and one
+  // 2.99 GHz prime core, so the top group is that one core: every
+  // frame-critical thread landed on cpu7 together while three 2.5 GHz cores
+  // sat idle, and the phone went from a locked 60 to visibly slow. Measured
+  // after this change: 60.1 fps, p95 16.66 ms, 404% CPU across cpu4-7.
+  std::vector<int> cores;
+  for (auto it = by_ceiling.begin(); it != by_ceiling.end(); ++it) {
+    const bool is_slowest = it == by_ceiling.begin();
+    if (fast != is_slowest) {
+      cores.insert(cores.end(), it->second.begin(), it->second.end());
+    }
+  }
+  std::string out;
+  for (const int c : cores) {
+    if (!out.empty()) {
+      out += '+';
+    }
+    out += std::to_string(c);
+  }
+  return out;
+}
+
+// Keep the threads a frame waits on off the slow cores, and push the ones that
+// only have to keep up onto them. Names must match what the threads call
+// themselves, and only the first 15 characters survive (the thread layer
+// truncates before matching), so every prefix here is short by construction.
+//
+// Only positive nice appears: an unprivileged app is refused a negative one,
+// so lowering a background thread is the half of the lever that actually
+// works.
+std::string AndroidThreadPlacement() {
+  const std::string fast = AndroidCoreList(true);
+  const std::string slow = AndroidCoreList(false);
+  if (fast.empty() || slow.empty()) {
+    return {};
+  }
+  const std::string f = "cpu:" + fast;
+  const std::string s = "cpu:" + slow;
+  return
+      // The frame depends on these finishing.
+      "Main XThread=" + f + ";GPU Commands=" + f + ";render_thread=" + f +
+      ";Kernel Dispatch=" + f +
+      // Audio stays fast too: starving it is audible, and it is cheap.
+      ";Audio Worker=" + f + ";RwAudioCore=" + f +
+      // These only have to keep up with streaming, and they are what competes
+      // with the frame today.
+      ";XMA Decoder=" + s + ",nice:5;rwfilesys=" + s + ",nice:5;load_thread=" + s +
+      ",nice:5;presence_thread=" + s + ",nice:10";
+}
+
+AndroidStoreBudgets PickAndroidStoreBudgets() {
+  const uint64_t total_mb = AndroidTotalRamMb();
   AndroidStoreBudgets b;
   if (total_mb == 0) {
     b = {288, 224, "unknown"};
   } else if (total_mb >= 5000) {
     b = {288, 224, "standard (6 GB+)"};
   } else {
-    // 256 is the floor both stores are clamped to in
-    // skate3_native_scene_gpu.cpp, so asking for less only produces a warning
-    // and the same allocation. Say what will actually happen.
-    b = {256, 256, "small (clamped at the 256 MB floor)"};
+    // The stores used to be clamped at 256 MB apiece, which on a 3 GB device
+    // pinned half a gigabyte while the system paged gigabytes through zram.
+    // The floor is 64 now, so this can ask for what the device can actually
+    // spare.
+    b = {128, 96, "small (under 4 GB)"};
   }
   std::fprintf(stderr, "store budgets: %s tier (%llu MB RAM) -> tex %u MB, mesh %u MB\n", b.tier,
                (unsigned long long)total_mb, b.tex_mb, b.mesh_mb);
@@ -654,13 +742,44 @@ std::vector<std::string> BuildAndroidArguments() {
       // same reason, Metal having no geometry shaders at all.
       "--vulkan_require_geometry_shader=false",
       "--vulkan_require_fill_mode_non_solid=false",
+      // Same reasoning, and the one that turned away a Galaxy S20 FE: an Arm
+      // Mali-G77 reports no vertexPipelineStoresAndAtomics and the device was
+      // refused outright, before anything was drawn - the app opened and shut
+      // again, which reads as "it crashes when I press the button". The
+      // command processor already routes vertex memexport through compute
+      // shaders when this is absent; only a draw that genuinely exports from a
+      // vertex shader fails, and it fails where it happens rather than at
+      // startup.
+      //
+      // This costs nothing on a GPU that has the feature, because the check it
+      // relaxes passes there anyway - no device that works today is affected.
+      "--vulkan_require_vertex_pipeline_stores_and_atomics=false",
+      // TEST BUILD: pre-optimise SPIR-V before the driver compiles it. Older
+      // Adreno drivers segfault in their own shader compiler on unoptimized
+      // input - a Retroid Pocket 5 (Adreno 650, driver 0746.0) faults inside
+      // vulkan.adreno.so three seconds in, where an Adreno 730 on a current
+      // driver never does. Costs shader compile time, so this is not a
+      // default; it is here to find out whether it is the fix.
+      "--vulkan_spirv_optimize=true",
       "--skate3_auto_install_dlc=true",
       "--vulkan_log_debug_messages=false",
       "--skate3_native_render_scene_perf_log=false",
       "--presenter_present_cadence_log=false",
       "--vulkan_present_timing_log=false",
       // Mitigation for the WorldPresentation cross-thread use-after-free.
+      //
+      // NOT the fix for the AYN Thor. That was read wrongly here for two
+      // rounds: the Thor's "Call to invalid or unregistered function at guest
+      // address 0xFFFDFFFF" is sub_82B3CD38 called with a NULL format
+      // descriptor, not a freed object - the descriptor pointer is r10, which
+      // is 0 in every occurrence, and the r3=6 in the log is the next argument
+      // already loaded. The cause is the unlocked rw::audio::core command
+      // queue; see src/skate3_audio_fixes.cpp, which serialises the appends
+      // against the drain. Widening this cvar was tried at 3000 ms and the
+      // Thor crashed identically, which is consistent - it was never this
+      // path. Left at the shipped value.
       "--skate3_instance_free_defer_ms=250",
+
       // FIFO on a 60 Hz mode (the activity picks it) paces a locked 60; the
       // cap keeps the guest from running ahead of the panel.
       "--skate3_guest_fps_cap=60",
@@ -692,9 +811,148 @@ std::vector<std::string> BuildAndroidArguments() {
       "--skate3_draw_distance_scale=1.0",
       "--skate3_lod_distance_scale=1.0",
       "--gpu_wait_reg_mem_timeout_ms=20",
+      // Stop the two spinners fighting the threads they are waiting for.
+      //
+      // Both of these were low-end-only, on the theory that a phone with spare
+      // cores can afford to spin for latency. It cannot, and the fast phone
+      // showed it plainest. On a Galaxy S23 FE - four performance cores, the
+      // best device this port has - a scheduler trace of ordinary gameplay put
+      // the command processor RUNNABLE WITH NO CORE for 7.8 of 50 seconds
+      // while a profile of that same thread put its idle yield loop at 14.4%
+      // of the cycles it did get. The guest's own frame ends by spinning in
+      // D3D Swap until the command processor drains the ring; during the
+      // 60-90 ms hitches that spin was 15% of the render thread, six to seven
+      // times its normal share. Every one of those spins is a core taken away
+      // from the thread whose progress would end the wait.
+      //
+      // Neither number is a low-memory property. They are properties of having
+      // more busy threads than fast cores, which is every Android device.
+      "--gpu_idle_spin_iterations=32",
+      "--rtl_critical_section_max_spin=256",
       "--audio_device_channels=2",
       "--audio_device_sample_frames=512",
   };
+
+  // Replace, never append.
+  //
+  // Two copies of the same scalar option make CLI11 throw, and that failure is
+  // not local: the whole parse is abandoned, every argument here is lost, and
+  // the app comes up on stock defaults with no game data root - a black screen
+  // and an exit. The low-end block below deliberately restates values the base
+  // list already set, so it must go through this rather than push_back.
+  auto set_arg = [&args](std::string_view key, const std::string& value) {
+    const std::string prefixed = "--" + std::string(key) + "=";
+    for (std::string& existing : args) {
+      if (existing.rfind(prefixed, 0) == 0) {
+        existing = prefixed + value;
+        return;
+      }
+    }
+    args.push_back(prefixed + value);
+  };
+
+  // Keep the frame's threads on the fast cluster where there is one. Empty on
+  // a machine whose cores are all alike, and then nothing is set.
+  if (const std::string placement = AndroidThreadPlacement(); !placement.empty()) {
+    set_arg("android_thread_placement_map", placement);
+    std::fprintf(stderr, "thread placement: %s\n", placement.c_str());
+  }
+
+  // Under 4 GB the machine is short of memory before it is short of anything
+  // else, and it is usually short of CPU too. None of this touches a larger
+  // device.
+  if (AndroidIsLowEnd()) {
+    std::fprintf(stderr, "low-end profile: on (%llu MB RAM)\n",
+                 (unsigned long long)AndroidTotalRamMb());
+    // Drop the top mip of anything sizeable, and a second level from the
+    // giants: 16x fewer bytes and 16x less CPU decode on exactly the textures
+    // that fill the store, which matters twice over where the GPU cannot
+    // sample the compressed format and every block is expanded by hand.
+    set_arg("skate3_native_render_scene_tex_base_mip_px", "256");
+    set_arg("skate3_native_render_scene_tex_base_mip2_px", "1024");
+    // Half the console's own draw distance.
+    set_arg("skate3_draw_distance_scale", "0.5");
+    set_arg("skate3_lod_distance_scale", "0.5");
+    // (rtl_critical_section_max_spin and gpu_idle_spin_iterations used to be
+    // set here. They are in the base list above now - the measurement that
+    // justified them came off the fastest device, not the slowest.)
+    // Build the guest's static-world command packets every other frame. The
+    // native renderer suppresses them, so nothing reads what this produces,
+    // but it is the guest render thread's largest per-item cost.
+    set_arg("skate3_native_render_guest_static_refresh", "2");
+    // Simulate the crowd every other frame. Measured as the difference
+    // between a menu and the world on a Tab A7 Lite: 56 fps against 6, same
+    // renderer, same GPU, GPU idle in both.
+    set_arg("skate3_native_render_lw_refresh", "2");
+  }
+
+  // Everything the settings menu can write is a DEFAULT here, not an override.
+  //
+  // cvar::LoadConfig applies settings.toml first and the command line second,
+  // so an argument named here silently undoes the player's choice at the next
+  // launch: the menu writes the file, this overwrites it on the way back in,
+  // and the row looks broken. Reported from the phone as settings not saving
+  // after a session, and it was every graphics row at once - resolution,
+  // V-Sync, MSAA, shadows, ambient occlusion, bloom, sun shafts, draw
+  // distance, the frame cap and both store budgets were all being forced back.
+  //
+  // The iOS list has the same shape and solved it for the two store budgets
+  // only; this covers the whole overlap. Only keys the settings overlay itself
+  // persists are listed, so nothing structural - the data roots, the log file,
+  // the Vulkan feature relaxations, thread placement - can be dropped by a
+  // stray line in the file.
+  //
+  // A substring scan rather than a TOML parse, for the same reason as the iOS
+  // block above: this runs before the cvar system exists. The worst case of
+  // being crude is that a commented-out line suppresses a default and the
+  // cvar's own compiled default applies instead, which is still a working
+  // configuration.
+  {
+    static constexpr std::string_view kPlayerOwned[] = {
+        "resolution_scale",
+        "draw_resolution_scale_x",
+        "draw_resolution_scale_y",
+        "vsync",
+        "skate3_native_render_scene",
+        "skate3_native_render_scene_msaa",
+        "skate3_native_render_scene_shadow_static_size",
+        "skate3_native_render_scene_shadow_pcss",
+        "skate3_native_render_scene_ssao",
+        "skate3_native_render_scene_bloom",
+        "skate3_native_render_scene_shafts",
+        "skate3_native_render_scene_tex_store_mb",
+        "skate3_native_render_scene_mesh_store_mb",
+        "skate3_draw_distance_scale",
+        "skate3_lod_distance_scale",
+        "skate3_guest_fps_cap",
+        "skate3_guest_fps_cap_auto",
+        "skate3_ultrawide",
+        "skate3_ultrawide_target_aspect",
+    };
+    std::string settings;
+    {
+      std::ifstream in(root / "user" / "settings.toml");
+      if (in) {
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        settings = buf.str();
+      }
+    }
+    if (!settings.empty()) {
+      for (const std::string_view key : kPlayerOwned) {
+        if (settings.find(key) == std::string::npos) {
+          continue;  // never chosen: the shipped default still applies
+        }
+        const std::string prefixed = "--" + std::string(key) + "=";
+        args.erase(std::remove_if(args.begin(), args.end(),
+                                  [&](const std::string& arg) {
+                                    return arg.rfind(prefixed, 0) == 0;
+                                  }),
+                   args.end());
+      }
+    }
+  }
+
   return ApplyArgumentFileOverrides(std::move(args), root / "user" / "android_args.txt",
                                     "android_args");
 }

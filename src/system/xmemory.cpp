@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <utility>
 
@@ -91,6 +92,41 @@ static memory::Memory* active_memory_ = nullptr;
 namespace {
 
 constexpr size_t kGuestBackingLength = 0x120001000ull;
+constexpr size_t kGuestMappingLength = 0x120000000ull;
+
+#if REX_PLATFORM_MAC
+// MapViews reports success as 0/1 by contract, which is enough to drive the
+// probe loop and useless in a bug report: "no continuous block" reads the same
+// whether the kernel refused a 4.5 GB reservation outright or one file view
+// landed on top of something. Record the failing step out of band so the
+// failure path can say which.
+struct MapViewsFailure {
+  const char* step = nullptr;
+  int err = 0;
+  int view_index = -1;
+};
+MapViewsFailure last_map_views_failure_;
+
+// Largest contiguous PROT_NONE reservation this process can still obtain.
+// Only called once, on the failure path: the answer separates "this device
+// caps the address space below what the guest needs" from "the range is there
+// but something is in the way", and no amount of retrying tells them apart.
+size_t ProbeLargestReservation() {
+  size_t lo = 0;
+  size_t hi = kGuestMappingLength;  // known-failing when we get here
+  while (hi - lo > 16ull * 1024 * 1024) {
+    size_t mid = lo + (hi - lo) / 2;
+    void* p = mmap(nullptr, mid, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) {
+      hi = mid;
+    } else {
+      munmap(p, mid);
+      lo = mid;
+    }
+  }
+  return lo;
+}
+#endif
 
 bool ShouldSkipHostCommit(const BaseHeap& heap) {
 #if REX_PLATFORM_MAC
@@ -188,6 +224,27 @@ bool Memory::Initialize() {
   }
 #endif
   if (!mapping_base_) {
+#if REX_PLATFORM_MAC
+    const auto& failure = last_map_views_failure_;
+    REXSYS_ERROR("Guest mapping failed at step '{}' (view {}): errno {} ({})",
+                 failure.step ? failure.step : "unknown", failure.view_index, failure.err,
+                 failure.err ? std::strerror(failure.err) : "none");
+    size_t largest = ProbeLargestReservation();
+    REXSYS_ERROR("Guest needs {} MB of contiguous address space; the largest reservation this "
+                 "process can obtain is {} MB.",
+                 kGuestMappingLength / (1024 * 1024), largest / (1024 * 1024));
+#if REX_PLATFORM_IOS
+    // iOS only hands a process the full 64-bit address space ("jumbo" mode)
+    // when it carries com.apple.developer.kernel.extended-virtual-addressing.
+    // A14 and newer devices get a large space without it, which is why this
+    // has never shown up on an A15; A13 and older do not, and free-Apple-ID
+    // signing (AltStore, SideStore, LiveContainer) strips the entitlement
+    // because a personal team cannot be granted it.
+    REXSYS_ERROR("On iOS this is the extended-virtual-addressing limit. Devices older than the "
+                 "A14 need the com.apple.developer.kernel.extended-virtual-addressing "
+                 "entitlement, which sideload signing with a free Apple ID removes.");
+#endif
+#endif
     REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
     assert_always();
     return false;
@@ -342,12 +399,6 @@ static const struct {
     },
 };
 
-namespace {
-
-constexpr size_t kGuestMappingLength = 0x120000000ull;
-
-}  // namespace
-
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
 
@@ -358,12 +409,14 @@ int Memory::MapViews(uint8_t* mapping_base) {
   void* reservation =
       mmap(mapping_base, kGuestMappingLength, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
   if (reservation == MAP_FAILED) {
+    last_map_views_failure_ = {"reservation", errno, -1};
     return 1;
   }
   if (mapping_base && reservation != mapping_base) {
     if (reservation != MAP_FAILED) {
       munmap(reservation, kGuestMappingLength);
     }
+    last_map_views_failure_ = {"reservation-moved", 0, -1};
     return 1;
   }
   mapping_base = reinterpret_cast<uint8_t*>(reservation);
@@ -380,6 +433,7 @@ int Memory::MapViews(uint8_t* mapping_base) {
     if (!views_.all_views[n]) {
       // Failed, so bail and try again.
 #if REX_PLATFORM_MAC
+      last_map_views_failure_ = {"file-view", errno, int(n)};
       munmap(mapping_base, kGuestMappingLength);
       std::fill(std::begin(views_.all_views), std::end(views_.all_views), nullptr);
 #else

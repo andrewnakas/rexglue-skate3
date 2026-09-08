@@ -56,6 +56,16 @@ REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 // usually what lets the awaited value be written. The frame it gives up on may
 // be visually wrong, and it says so in the log. Zero restores the original
 // wait-forever behaviour.
+REXCVAR_DEFINE_INT32(
+    gpu_idle_spin_iterations, 500, "GPU",
+    "How many yields the command processor makes while waiting for new work "
+    "before it sleeps on its event instead. The default trades a little CPU "
+    "for latency, which is right when spare cores exist; on a device with "
+    "many slow cores it burns one of them in front of the very threads that "
+    "would supply the work.")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(gpu_wait_reg_mem_timeout_ms, 500, "GPU",
                      "Abandon a WAIT_REG_MEM poll after this many milliseconds (0 = wait forever)");
 
@@ -476,9 +486,15 @@ void CommandProcessor::WorkerThreadMain() {
       // event is too high.
       PrepareForWait();
       uint32_t loop_count = 0;
+      // How long to keep yielding before falling back to the event wait. The
+      // comment above is right on a desktop, where the event round trip costs
+      // more than the spin. It inverts on a phone: yielding here is one of
+      // eight slow cores burned while the guest threads that would end the
+      // stall are queued behind it.
+      const uint32_t idle_spin = uint32_t(REXCVAR_GET(gpu_idle_spin_iterations));
       do {
         // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
+        if (loop_count > idle_spin) {
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
@@ -627,7 +643,19 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  // Ask the logger before asking the register table.
+  //
+  // GetRegisterInfo is a switch over the entire Xenos register table, and the
+  // only thing this call site wants from it is whether the index has a name,
+  // to decide whether to emit a debug line the shipped log level discards. It
+  // ran on every register write. This is the hottest path in the command
+  // processor: a profile of that thread during Skate 3 gameplay put
+  // WriteRegister at 5.5% of its cycles with GetRegisterInfo at a further
+  // 2.5%, on the one thread that a scheduler trace showed runnable-with-no-core
+  // for 7.8 of 50 seconds. should_log is a load and a compare.
+  if (auto* gpu_log = ::rex::GetLoggerRaw(::rex::log::gpu());
+      gpu_log && gpu_log->should_log(spdlog::level::debug) &&
+      !regs.GetRegisterInfo(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 

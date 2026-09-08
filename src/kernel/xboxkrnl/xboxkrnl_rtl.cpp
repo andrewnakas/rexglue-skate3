@@ -16,6 +16,7 @@
 #include <string>
 
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -30,6 +31,15 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
+
+REXCVAR_DEFINE_INT32(
+    rtl_critical_section_max_spin, 0, "CPU",
+    "Cap the guest's critical-section spin count. 0 uses whatever the title "
+    "asked for (up to 65280 iterations). A low value suits machines with many "
+    "slow cores sharing one cache, where every waiter spinning on the same "
+    "line costs more than blocking; it is a pessimisation on a fast desktop.")
+    .range(0, 65280)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -379,6 +389,16 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
   uint32_t spin_count = cs->header.absolute * 256;
+  // The guest asks for up to 65280 iterations. That was written for a console
+  // whose three cores each had their own cache slice; on a phone with eight
+  // in-order cores sharing one L2 and no large-system atomics, every waiter
+  // hammering the same line is worse than not spinning at all. The cap lets a
+  // device say so. 0 keeps the guest's own count, so nothing changes unless a
+  // profile opts in.
+  if (const uint32_t cap = uint32_t(REXCVAR_GET(rtl_critical_section_max_spin));
+      cap != 0 && spin_count > cap) {
+    spin_count = cap;
+  }
 
   if (cs->owning_thread == cur_thread) {
     // We already own the lock.
@@ -395,6 +415,16 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
       cs->recursion_count = 1;
       return;
     }
+#if defined(__aarch64__)
+    // A hint to the core that this is a spin, so it can let the other hardware
+    // thread run and back off the coherency traffic. Free where it means
+    // nothing; on an in-order core it is the difference between backing off
+    // and saturating the interconnect. Every 64 so an uncontended acquire in
+    // the first few iterations pays nothing.
+    if ((spin_count & 63u) == 0u) {
+      __asm__ __volatile__("yield" ::: "memory");
+    }
+#endif
   }
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
@@ -418,11 +448,31 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
       // Geometric, so a genuinely stuck lock reports a handful of times rather
       // than once a second forever.
       if (waited_s == 5 || (waited_s > 5 && (waited_s & (waited_s - 1)) == 0)) {
+        // Name both threads. owner_thread is the guest X_KTHREAD pointer,
+        // which appears nowhere else in any log or crash report, so on its own
+        // it identifies the one thread worth looking at and then refuses to
+        // say which it is. Walking the object table costs nothing here: this
+        // runs only after five seconds of waiting.
+        std::string owner_name = "?";
+        std::string waiter_name = "?";
+        if (auto* ks = rex::system::KernelState::shared(); ks != nullptr) {
+          for (const auto& t : ks->object_table()->GetObjectsByType<XThread>()) {
+            if (!t) {
+              continue;
+            }
+            if (t->guest_object() == uint32_t(cs->owning_thread)) {
+              owner_name = t->thread_name();
+            }
+            if (t->guest_object() == cur_thread) {
+              waiter_name = t->thread_name();
+            }
+          }
+        }
         REXLOG_WARN(
-            "RtlEnterCriticalSection: waiting {}s for cs={:08X} owner_thread={:08X} "
-            "lock_count={} recursion={} (this thread={:08X})",
-            waited_s, uint32_t(cs.guest_address()), uint32_t(cs->owning_thread),
-            int32_t(cs->lock_count), uint32_t(cs->recursion_count), cur_thread);
+            "RtlEnterCriticalSection: waiting {}s for cs={:08X} owner_thread={:08X} '{}' "
+            "lock_count={} recursion={} (this thread={:08X} '{}')",
+            waited_s, uint32_t(cs.guest_address()), uint32_t(cs->owning_thread), owner_name,
+            int32_t(cs->lock_count), uint32_t(cs->recursion_count), cur_thread, waiter_name);
       }
     }
   }

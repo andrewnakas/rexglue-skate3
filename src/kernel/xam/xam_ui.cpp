@@ -74,28 +74,44 @@ class XamDialog : public rex::ui::ImGuiDialog {
   std::function<void()> close_callback_ = nullptr;
 };
 
+// Both dispatchers used to take an already-constructed dialog. ImGuiDialog's
+// constructor registers it with the drawer at once, so the UI thread could
+// draw it - and on OK/Cancel/Enter, or when the modal failed to open on its
+// first frame, close and delete it - while the close callback and the
+// completion fence were only installed ~100 ms later (kernel_overlapped_delay_ms)
+// from the Kernel Dispatch thread. A dialog dismissed in that window was
+// deleted underneath the dispatch thread: a Retroid Pocket 6 died exactly there,
+// at the skater-name prompt, with set_close_callback() writing into a freed
+// dialog. The dialog is therefore built by a factory, and construction, the
+// close callback and the fence all happen inside ONE call on the UI thread -
+// the same thread that draws and deletes - so nothing can close it first.
 template <typename T>
-X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callback,
-                             uint32_t overlapped) {
+X_RESULT xeXamDispatchDialog(std::function<T*()> make_dialog,
+                             std::function<X_RESULT(T*)> close_callback, uint32_t overlapped) {
   auto pre = []() {
     // Broadcast XN_SYS_UI = true
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
-  auto run = [dialog, close_callback]() -> X_RESULT {
-    X_RESULT result;
-    dialog->set_close_callback(
-        [&dialog, &result, &close_callback]() { result = close_callback(dialog); });
+  auto run = [make_dialog, close_callback]() -> X_RESULT {
+    X_RESULT result = X_ERROR_CANCELLED;
     rex::thread::Fence fence;
+    T* dialog = nullptr;
     rex::ui::WindowedAppContext* app_context = REX_KERNEL_STATE()->emulator()->app_context();
-    if (app_context &&
-        app_context->CallInUIThreadSynchronous([&dialog, &fence]() { dialog->Then(&fence); })) {
+    const bool shown = app_context && app_context->CallInUIThreadSynchronous([&]() {
+      dialog = make_dialog();
+      if (!dialog) {
+        return;
+      }
+      dialog->set_close_callback(
+          [dialog, &result, close_callback]() { result = close_callback(dialog); });
+      dialog->Then(&fence);
+    });
+    if (shown && dialog) {
       ++xam_dialogs_shown_;
       fence.Wait();
       --xam_dialogs_shown_;
-    } else {
-      delete dialog;
     }
-    // dialog should be deleted at this point!
+    // The drawer deleted the dialog after running its close callback.
     return result;
   };
   auto post = []() {
@@ -118,29 +134,38 @@ X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callba
 }
 
 template <typename T>
-X_RESULT xeXamDispatchDialogEx(T* dialog,
+X_RESULT xeXamDispatchDialogEx(std::function<T*()> make_dialog,
                                std::function<X_RESULT(T*, uint32_t&, uint32_t&)> close_callback,
                                uint32_t overlapped) {
   auto pre = []() {
     // Broadcast XN_SYS_UI = true
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
-  auto run = [dialog, close_callback](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
-    rex::ui::WindowedAppContext* app_context = REX_KERNEL_STATE()->emulator()->app_context();
-    X_RESULT result;
-    dialog->set_close_callback([&dialog, &result, &extended_error, &length, &close_callback]() {
-      result = close_callback(dialog, extended_error, length);
-    });
+  auto run = [make_dialog, close_callback](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    // Defaults mirror a cancelled dialog, for the case where there is no UI
+    // thread to show one (shutdown).
+    X_RESULT result = X_ERROR_SUCCESS;
+    extended_error = X_ERROR_CANCELLED;
+    length = 0;
     rex::thread::Fence fence;
-    if (app_context &&
-        app_context->CallInUIThreadSynchronous([&dialog, &fence]() { dialog->Then(&fence); })) {
+    T* dialog = nullptr;
+    rex::ui::WindowedAppContext* app_context = REX_KERNEL_STATE()->emulator()->app_context();
+    const bool shown = app_context && app_context->CallInUIThreadSynchronous([&]() {
+      dialog = make_dialog();
+      if (!dialog) {
+        return;
+      }
+      dialog->set_close_callback([dialog, &result, &extended_error, &length, close_callback]() {
+        result = close_callback(dialog, extended_error, length);
+      });
+      dialog->Then(&fence);
+    });
+    if (shown && dialog) {
       ++xam_dialogs_shown_;
       fence.Wait();
       --xam_dialogs_shown_;
-    } else {
-      delete dialog;
     }
-    // dialog should be deleted at this point!
+    // The drawer deleted the dialog after running its close callback.
     return result;
   };
   auto post = []() {
@@ -246,6 +271,7 @@ class MessageBoxDialog : public XamDialog {
       first_draw = true;
     }
     if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      was_open_ = true;
       if (description_.size()) {
         ImGui::Text("%s", description_.c_str());
       }
@@ -263,13 +289,22 @@ class MessageBoxDialog : public XamDialog {
       ImGui::Spacing();
       ImGui::Spacing();
       ImGui::EndPopup();
-    } else {
+    } else if (was_open_) {
+      // Open last frame, gone now: ImGui closed it from outside. A cancel.
+      Close();
+    } else if (++frames_never_open_ > 30) {
+      // Half a second of frames without the modal ever appearing: give up rather
+      // than leave the guest waiting on a dialog that cannot be shown. Closing on
+      // the very first failed frame, as before, cancelled dialogs that would have
+      // opened a frame later.
       Close();
     }
   }
 
  private:
   bool has_opened_ = false;
+  bool was_open_ = false;
+  uint32_t frames_never_open_ = 0;
   std::string title_;
   std::string description_;
   std::vector<std::string> buttons_;
@@ -332,9 +367,13 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     const Runtime* emulator = REX_KERNEL_STATE()->emulator();
     ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
     if (imgui_drawer) {
+      // Read the guest text now, on the calling thread; the dialog itself is
+      // built later, on the UI thread (see xeXamDispatchDialog).
+      const std::string text = rex::string::to_utf8(text_ptr.value());
       result = xeXamDispatchDialog<MessageBoxDialog>(
-          new MessageBoxDialog(imgui_drawer, title, rex::string::to_utf8(text_ptr.value()), buttons,
-                               active_button),
+          [imgui_drawer, title, text, buttons, active_button]() {
+            return new MessageBoxDialog(imgui_drawer, title, text, buttons, active_button);
+          },
           close, overlapped.guest_address());
     } else {
       // Fallback to headless if no drawer available
@@ -381,6 +420,7 @@ class KeyboardInputDialog : public XamDialog {
       focus_request_frames_ = 10;
     }
     if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      was_open_ = true;
       if (description_.size()) {
         ImGui::TextWrapped("%s", description_.c_str());
       }
@@ -418,13 +458,20 @@ class KeyboardInputDialog : public XamDialog {
       }
       ImGui::Spacing();
       ImGui::EndPopup();
-    } else {
+    } else if (was_open_) {
+      // Open last frame, gone now: ImGui closed it from outside. A cancel.
+      Close();
+    } else if (++frames_never_open_ > 30) {
+      // See MessageBoxDialog: do not cancel on the first frame the modal is not
+      // yet open.
       Close();
     }
   }
 
  private:
   bool has_opened_ = false;
+  bool was_open_ = false;
+  uint32_t frames_never_open_ = 0;
   uint32_t focus_request_frames_ = 0;
   std::string title_;
   std::string description_;
@@ -499,8 +546,10 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
     if (imgui_drawer) {
       uint32_t buffer_length_safe = buffer_length + 1;  // +1 for null terminator, just in case
       result = xeXamDispatchDialogEx<KeyboardInputDialog>(
-          new KeyboardInputDialog(imgui_drawer, title_str, desc_str, def_text_str,
-                                  buffer_length_safe),
+          [imgui_drawer, title_str, desc_str, def_text_str, buffer_length_safe]() {
+            return new KeyboardInputDialog(imgui_drawer, title_str, desc_str, def_text_str,
+                                           buffer_length_safe);
+          },
           close, overlapped.guest_address());
     } else {
       // Fallback to headless
@@ -542,10 +591,13 @@ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
   ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
   if (imgui_drawer) {
     xeXamDispatchDialog<MessageBoxDialog>(
-        new MessageBoxDialog(imgui_drawer, "Disc Read Error",
-                             "There's been an issue reading content from the game disc.\nThis is "
-                             "likely caused by bad or unimplemented file IO calls.",
-                             {"OK"}, 0),
+        [imgui_drawer]() {
+          return new MessageBoxDialog(
+              imgui_drawer, "Disc Read Error",
+              "There's been an issue reading content from the game disc.\nThis is "
+              "likely caused by bad or unimplemented file IO calls.",
+              std::vector<std::string>{"OK"}, 0);
+        },
         [](MessageBoxDialog*) -> X_RESULT { return X_ERROR_SUCCESS; }, 0);
   } else {
     // No UI available - log prominently and pause to let user see the error

@@ -22,6 +22,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -61,6 +62,11 @@ void aes_decrypt_buffer(const uint8_t* session_key, const uint8_t* input_buffer,
 
 namespace rex::runtime {
 
+REXCVAR_DEFINE_STRING(xex_dump_image_dir, "", "Kernel",
+                      "Write every loaded XEX image, decompressed and patched, into this "
+                      "directory as <name>_<base>_<size>.bin (same as the "
+                      "REXGLUE_DUMP_XEX_IMAGE_DIR environment variable). Empty = off.");
+
 namespace {
 
 std::string DumpSafeModuleName(std::string_view name) {
@@ -74,8 +80,30 @@ std::string DumpSafeModuleName(std::string_view name) {
   return safe.empty() ? "module" : safe;
 }
 
+namespace {
+// A fingerprint of the loaded image, logged at each stage of loading. Three
+// QCS8550 handhelds build a bit-identical image that differs from an 8 Gen 1's
+// while every input file is byte-identical and the per-block hashes of the
+// decrypted, compressed stream all verify. Whatever diverges, this says at
+// which stage: the base decompression, or the title update on top of it.
+uint64_t FingerprintImage(const uint8_t* p, size_t n) {
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < n; ++i) {
+    h ^= p[i];
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+}  // namespace
+
 void MaybeDumpLoadedXexImage(const XexModule& module) {
   const char* dump_dir_value = std::getenv("REXGLUE_DUMP_XEX_IMAGE_DIR");
+  // An Android app cannot be handed an environment variable, so the same switch
+  // is also a cvar; a directory named there wins over an empty environment.
+  const std::string& cvar_dir = REXCVAR_GET(xex_dump_image_dir);
+  if ((!dump_dir_value || !*dump_dir_value) && !cvar_dir.empty()) {
+    dump_dir_value = cvar_dir.c_str();
+  }
   if (!dump_dir_value || !*dump_dir_value) {
     return;
   }
@@ -488,7 +516,18 @@ int XexModule::ApplyPatch(XexModule* module) {
     xex2_version source_ver, target_ver;
     source_ver = patch_header->source_version();
     target_ver = patch_header->target_version();
-    REXLOG_INFO(
+    // WARN, not INFO, and it is not a warning - it is a fact a report has to
+    // carry. This build's recompiled code was generated from the PATCHED image,
+    // so whether the patch actually applied decides whether every static
+    // address in it points at the right bytes. Shipped builds log at warn, so
+    // at INFO this line was absent from every tester report, and "did this
+    // device run patched code" stayed unanswerable while a device that stops on
+    // a frontend screen was being diagnosed. The failure paths above are all
+    // ERROR; success has to be visible too, or its absence proves nothing.
+    REXLOG_WARN("XEX image {:08X}: patched, fingerprint {:016X}", module->base_address_,
+                FingerprintImage(memory()->TranslateVirtual(module->base_address_),
+                                 module->image_size()));
+    REXLOG_WARN(
         "XEX patch applied successfully: base version: {}.{}.{}.{}, new "
         "version: {}.{}.{}.{}",
         (uint32_t)source_ver.major, (uint32_t)source_ver.minor, (uint32_t)source_ver.build,
@@ -519,7 +558,31 @@ int XexModule::ReadImage(const void* xex_addr, size_t xex_length, bool use_dev_k
     return 0;
   }
 
-  memory()->LookupHeap(base_address_)->Reset();
+  {
+    // This used to be heap->Reset(), which clears the page table of the WHOLE
+    // 0x80000000-0x8FFFFFFF heap, not this module's range. Skate 3 loads a
+    // second module (EAWebkit, at 0x88000000, same heap) about three minutes
+    // into a session, and that reset erased the bookkeeping for the title
+    // image at 0x82000000 while the game was running on it. Only this module's
+    // own range is released now, and only when a previous attempt left it
+    // allocated - the devkit-key retry in Load() reaches here a second time.
+    auto* heap = memory()->LookupHeap(base_address_);
+    rex::memory::HeapAllocationInfo info = {};
+    if (heap && heap->QueryRegionInfo(base_address_, &info) && info.state != 0) {
+      if (info.allocation_base == base_address_) {
+        REXLOG_WARN(
+            "XEX {:08X}: image range already allocated ({:08X} bytes); releasing it before "
+            "reloading",
+            base_address_, info.allocation_size);
+        heap->Release(base_address_);
+      } else {
+        REXLOG_ERROR(
+            "XEX {:08X}: image range overlaps a live allocation based at {:08X}; leaving the "
+            "heap alone (the fixed allocation below will report the conflict)",
+            base_address_, info.allocation_base);
+      }
+    }
+  }
 
   aes_decrypt_buffer(use_dev_key ? xe_xex2_devkit_key : xe_xex2_retail_key,
                      reinterpret_cast<const uint8_t*>(xex_security_info()->aes_key), 16,
@@ -728,7 +791,9 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
   int result_code = 0;
 
   uint8_t block_calced_digest[0x14];
+  uint32_t blocks_seen = 0;
   while (cur_block->block_size) {
+    ++blocks_seen;
     const uint8_t* pnext = p + cur_block->block_size;
     const auto* next_block = (const xex2_compressed_block_info*)p;
 
@@ -780,6 +845,12 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
       // Decompress into XEX base
       result_code = lzx_decompress(compress_buffer, d - compress_buffer, buffer, uncompressed_size,
                                    compression_info->normal.window_size, nullptr, 0);
+
+      REXLOG_WARN(
+          "XEX image {:08X}: base decompressed, {} block(s) of verified input -> {:08X} bytes, "
+          "fingerprint {:016X}",
+          base_address_, blocks_seen, uncompressed_size,
+          result_code ? 0ull : FingerprintImage(buffer, uncompressed_size));
     } else {
       REXLOG_ERROR("Unable to allocate XEX memory at {:08X}-{:08X}.", base_address_,
                    uncompressed_size);

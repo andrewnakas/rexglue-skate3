@@ -13,11 +13,14 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <fmt/format.h>
+
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <atomic>
+#include <string>
 
 #include <rex/cvar.h>
 #include <rex/memory.h>
@@ -69,19 +72,53 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
   static std::atomic<uint64_t> s_count{0};
   const uint64_t n = s_count.fetch_add(1, std::memory_order_relaxed);
   if (n < 8 || (n & (n - 1)) == 0) {
-    // The registers say WHY the pointer was bad, which the target alone cannot.
-    // The recompiled virtual-call shape is: r31 = object, r11 = *object (the
-    // vtable), r10 = vtable[n] (the method, which becomes ctr). So a poison
-    // value like BCBCBCBC in r31 means the object was freed, a plausible r31
-    // with a garbage r11 means its memory was never constructed, and a sane
-    // r11 with a garbage r10 means the vtable itself is wrong.
+    // Dump the whole volatile set and walk the guest stack, because a fixed
+    // handful of registers is not enough to read one of these.
+    //
+    // This used to print r3/r10/r11/r31 with a comment asserting the call was
+    // always the shape "r31 = object, r11 = *object, r10 = the method". That
+    // is ONE shape the recompiler emits, not the only one, and reading a real
+    // fault through it cost two rounds of wrong fixes: the object had actually
+    // been loaded into r10, r3 already held the next argument, and the small
+    // integer sitting in r3 was mistaken for the object. Print the registers
+    // and let the disassembly at `lr` say which of them mattered.
+    //
+    // The backchain is what actually names the caller: PowerPC stores the
+    // previous frame pointer at 0(r1) and that frame's return address at
+    // -8 from it, so the chain walks without any unwind data. Bounded, and
+    // every link is range-checked, because r1 itself may be the thing that
+    // went wrong.
+    std::string backtrace;
+    if (Runtime* runtime = Runtime::instance()) {
+      if (rex::memory::Memory* mem = runtime->memory()) {
+        uint32_t sp = ctx.r1.u32;
+        for (int depth = 0; depth < 8 && sp != 0; ++depth) {
+          uint8_t* frame = mem->TranslateVirtual(sp);
+          if (frame == nullptr) break;
+          const uint32_t next = memory::load_and_swap<uint32_t>(frame);
+          if (next <= sp || next == 0) break;  // stacks grow down; not a frame
+          uint8_t* next_frame = mem->TranslateVirtual(next - 8);
+          if (next_frame == nullptr) break;
+          const uint32_t ret = memory::load_and_swap<uint32_t>(next_frame);
+          if (ret == 0) break;
+          backtrace += fmt::format(" {:08X}", ret);
+          sp = next;
+        }
+      }
+    }
     REXCPU_ERROR(
         "Call to invalid or unregistered function at guest address 0x{:08X} "
         "(occurrence {}, guest lr=0x{:08X}); returning to the caller instead of "
-        "aborting - guest state is already wrong at this point "
-        "| r3={:08X} r10={:08X} r11={:08X} r31={:08X}",
+        "aborting - guest state is already wrong at this point"
+        "\n  r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X}"
+        "\n  r9={:08X} r10={:08X} r11={:08X} r12={:08X} r30={:08X} r31={:08X}"
+        "\n  r1={:08X} guest backchain:{}",
         ctx.last_indirect_target, n + 1, uint32_t(ctx.lr), uint32_t(ctx.r3.u32),
-        uint32_t(ctx.r10.u32), uint32_t(ctx.r11.u32), uint32_t(ctx.r31.u32));
+        uint32_t(ctx.r4.u32), uint32_t(ctx.r5.u32), uint32_t(ctx.r6.u32),
+        uint32_t(ctx.r7.u32), uint32_t(ctx.r8.u32), uint32_t(ctx.r9.u32),
+        uint32_t(ctx.r10.u32), uint32_t(ctx.r11.u32), uint32_t(ctx.r12.u32),
+        uint32_t(ctx.r30.u32), uint32_t(ctx.r31.u32), uint32_t(ctx.r1.u32),
+        backtrace.empty() ? " (none)" : backtrace.c_str());
   }
 }
 
