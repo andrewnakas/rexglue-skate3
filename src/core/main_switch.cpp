@@ -95,19 +95,8 @@ bool InitializeSwitchApp() {
     std::error_code ec;
     std::filesystem::create_directories("sdmc:/switch/skate3", ec);
     if (std::freopen("sdmc:/switch/skate3/stderr.log", "w", stderr)) {
-      setvbuf(stderr, nullptr, _IONBF, 0);
+      setvbuf(stderr, nullptr, _IOLBF, 0);
       stderr_fd_ = fileno(stderr);
-      // Committing on every write would make logging cost an SD round trip, so
-      // a small thread does it on a timer instead. The window of loss is the
-      // sync interval, not the whole run.
-      std::thread([]() {
-        for (;;) {
-          svcSleepThread(100ull * 1000 * 1000);  // 100 ms
-          if (stderr_fd_ >= 0) {
-            fsync(stderr_fd_);
-          }
-        }
-      }).detach();
     }
   }
 
@@ -232,14 +221,22 @@ bool SwitchHasNxlinkStdio() { return nxlink_stdio_; }
 namespace rex {
 
 void SwitchFlushLog() {
-  std::fflush(stderr);
-  std::fflush(stdout);
   const int fd = stderr_fd_.load();
-  if (fd >= 0) {
-    // Commits the file size, not just the bytes. Without this a crash leaves
-    // the log looking as though execution stopped where the last sync landed.
-    fsync(fd);
+  if (fd < 0) {
+    std::fflush(stderr);
+    std::fflush(stdout);
+    return;
   }
+  // fsync bypasses stdio and talks to the filesystem directly, so it must not
+  // run while another thread is part-way through a write to the same handle.
+  flockfile(stderr);
+  std::fflush(stderr);
+  // Commits the file's size, not just its bytes. Without this a crash leaves
+  // the log looking as though execution stopped wherever the filesystem last
+  // committed, which is not where the fault is.
+  fsync(fd);
+  funlockfile(stderr);
+  std::fflush(stdout);
 }
 
 }  // namespace rex

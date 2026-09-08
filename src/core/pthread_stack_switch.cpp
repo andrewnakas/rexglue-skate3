@@ -55,7 +55,16 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
     // Leave the caller's request alone rather than fail the thread outright.
     return __real_pthread_create(thread, attr, start_routine, arg);
   }
-  return __real_pthread_create(thread, &local, start_routine, arg);
+
+  const int rc = __real_pthread_create(thread, &local, start_routine, arg);
+  if (rc == 0) {
+    return 0;
+  }
+  // A bigger stack is an improvement, not a requirement. If the larger request
+  // cannot be satisfied - most likely because memory is tight - fall back to
+  // what the caller originally asked for rather than fail the thread and turn
+  // a tuning change into a crash.
+  return __real_pthread_create(thread, attr, start_routine, arg);
 }
 
 }  // extern "C"
