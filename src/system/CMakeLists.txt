@@ -107,11 +107,21 @@ target_link_libraries(rexruntime
         fmt::fmt
         spdlog::spdlog
         tomlplusplus
-        SDL3::SDL3
     PRIVATE
         aes128
         mspack
 )
+
+# SDL comes in through the ui, audio and input libraries, which is where it is
+# actually used; naming it here as well is only a convenience for consumers
+# that link the runtime alone. On a build without SDL the target does not
+# exist, and referencing a target that does not exist is a configure error
+# rather than something the generator can skip.
+if(REXGLUE_USE_SDL)
+    target_link_libraries(rexruntime PUBLIC SDL3::SDL3)
+elseif(REX_SWITCH)
+    target_link_libraries(rexruntime PUBLIC nx)
+endif()
 
 if(REXGLUE_ENABLE_TRACY)
     target_link_libraries(rexruntime PUBLIC TracyClient)

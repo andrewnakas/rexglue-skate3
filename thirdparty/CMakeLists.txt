@@ -62,10 +62,21 @@ if(REXGLUE_BUILD_TESTS)
     list(APPEND REQUIRED_SUBMODULES catch2)
 endif()
 
+# Checks that each dependency actually has sources, rather than that it has a
+# .git entry. The point is to catch the uninitialised case - an empty directory
+# where a library should be - and an empty directory is what that case really
+# looks like. Testing for .git additionally rejects a perfectly good vendored
+# or worktree-shared copy, which is how this tree is laid out for the Switch
+# build and after any submodule is re-provisioned by hand.
 foreach(submodule ${REQUIRED_SUBMODULES})
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/.git")
+    set(_submodule_dir "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}")
+    set(_submodule_contents "")
+    if(EXISTS "${_submodule_dir}")
+        file(GLOB _submodule_contents "${_submodule_dir}/*")
+    endif()
+    if(NOT _submodule_contents)
         message(FATAL_ERROR
-            "Git submodule '${submodule}' is not initialized.\n"
+            "Dependency '${submodule}' is empty or missing at ${_submodule_dir}.\n"
             "Please run: git submodule update --init --recursive\n"
             "from the repository root directory."
         )
