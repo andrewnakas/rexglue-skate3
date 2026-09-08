@@ -61,7 +61,7 @@ std::string path_to_utf8(const std::filesystem::path& path) {
 }
 
 std::u16string path_to_utf16(const std::filesystem::path& path) {
-  return rex::to_utf16(path.string());
+  return rex::string::to_utf16(path.string());
 }
 
 std::filesystem::path to_path(const std::string_view source) {
@@ -69,7 +69,7 @@ std::filesystem::path to_path(const std::string_view source) {
 }
 
 std::filesystem::path to_path(const std::u16string_view source) {
-  return std::filesystem::path(rex::to_utf8(source));
+  return std::filesystem::path(rex::string::to_utf8(source));
 }
 
 namespace filesystem {
@@ -106,12 +106,10 @@ void SetHostBufferFaultHook(HostBufferFaultHook hook) {
 }
 
 std::filesystem::path GetExecutablePath() {
-  const int argc = envGetArgc();
-  if (argc > 0) {
-    if (char** argv = static_cast<char**>(envGetArgv()); argv && argv[0] && argv[0][0]) {
-      return std::filesystem::path(argv[0]);
-    }
-  }
+  // libnx exposes no argument count outside main(), so the path hbmenu
+  // launched us from cannot be recovered here. It would not be useful anyway:
+  // over nxlink the NRO runs from a temporary location, and everything that
+  // matters resolves against the fixed root below rather than against this.
   return std::filesystem::path(kDefaultExecutablePath);
 }
 

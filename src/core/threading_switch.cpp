@@ -907,7 +907,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   int priority() {
     WaitStarted();
-    u32 value = 0;
+    s32 value = 0;
     if (R_FAILED(svcGetThreadPriority(&value, native_thread_handle()))) {
       return -1;
     }

@@ -137,8 +137,12 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
   thread_context.sp = ctx->sp.x;
   thread_context.pc = ctx->pc.x;
   thread_context.pstate = ctx->pstate;
-  thread_context.fpsr = ctx->fpsr;
-  thread_context.fpcr = ctx->fpcr;
+  // Left at zero: the kernel's exception dump carries the NEON registers but
+  // not the floating-point status and control words. They appear in a full
+  // ThreadContext, which is what a debugger reads, not in what a faulting
+  // thread is handed.
+  thread_context.fpsr = 0;
+  thread_context.fpcr = 0;
   for (size_t i = 0; i < 32; ++i) {
     std::memcpy(&thread_context.v[i], &ctx->fpu_gprs[i], sizeof(thread_context.v[i]));
   }
