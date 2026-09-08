@@ -17,9 +17,20 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH,
 
 #include <sys/time.h>
 
+#include <cerrno>
+
+#include <rex/logging.h>
+
 namespace rex::chrono {
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_SWITCH
+// libnx implements exactly two clock ids, CLOCK_REALTIME (1) and
+// CLOCK_MONOTONIC (4); its clock_gettime rejects everything else with EINVAL.
+// CLOCK_MONOTONIC_RAW is 5, so asking for it fails every single time - and
+// because the assert below compiles out in release, the failure was silent and
+// the timestamp was whatever the uninitialised timespec happened to hold.
+// Every monotonic time in the runtime was garbage, which stopped the vblank
+// pacer from ever deciding a frame interval had elapsed.
 constexpr clockid_t kHostClock = CLOCK_MONOTONIC;
 #else
 constexpr clockid_t kHostClock = CLOCK_MONOTONIC_RAW;
@@ -38,11 +49,27 @@ uint64_t Clock::host_tick_frequency_platform() {
 }
 
 uint64_t Clock::host_tick_count_platform() {
-  timespec tp;
+  // Zeroed, and the result checked: a failing clock_gettime leaves this
+  // untouched, and reading an uninitialised timespec turns a clock error into
+  // arbitrary time travel rather than an obvious stop. The assert is a
+  // debug-only aid and does not run in the builds that ship.
+  timespec tp = {};
   int error = clock_gettime(kHostClock, &tp);
   assert_zero(error);
+  if (error != 0) {
+    // A clock that cannot be read is not something to paper over with a
+    // plausible-looking number: everything paced by it would misbehave in ways
+    // that look like anything but a broken clock.
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      REXSYS_ERROR("clock_gettime({}) failed with errno {}; monotonic time is unavailable",
+                   int(kHostClock), errno);
+    }
+    return 0;
+  }
 
-  return tp.tv_nsec + tp.tv_sec * 1000000000ull;
+  return uint64_t(tp.tv_nsec) + uint64_t(tp.tv_sec) * 1000000000ull;
 }
 
 uint64_t Clock::QueryHostSystemTime() {
