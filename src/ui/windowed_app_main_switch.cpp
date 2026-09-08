@@ -279,16 +279,20 @@ int main(int argc, char** argv) {
 
     const bool initialized = app->OnInitialize();
     result = initialized ? app_context.RunMainLoop() : EXIT_FAILURE;
-  }
 
-  // Deliberately no teardown of the app or the runtime, for the same reason as
-  // macOS and Android: guest threads cannot be reliably stopped - Horizon has
-  // nothing like pthread_cancel, and recompiled code never reaches a
-  // cancellation point - so the destructor chain would race still-running
-  // threads over freed kernel objects. Flush the logs and leave.
-  rex::FlushLogging();
-  rex::ShutdownSwitchApp();
-  std::_Exit(result);
+    // Leaked on purpose, and the exit happens here rather than after the
+    // enclosing scope, for the same reason as macOS and Android: guest threads
+    // cannot be reliably stopped - Horizon has nothing like pthread_cancel, and
+    // recompiled code never reaches a cancellation point - so running the
+    // destructor chain would race still-running threads over freed kernel
+    // objects. Leaving the scope was doing exactly that: ~ReXApp ran on the way
+    // out and hit std::terminate on a thread that was still going.
+    (void)app.release();
+
+    rex::FlushLogging();
+    rex::ShutdownSwitchApp();
+    std::_Exit(result);
+  }
 }
 
 #endif  // REX_PLATFORM_SWITCH
