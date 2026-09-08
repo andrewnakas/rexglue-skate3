@@ -192,6 +192,14 @@ class SwitchFileHandle : public FileHandle {
     const bool loop = REXCVAR_GET(filesystem_read_loop);
     std::lock_guard<std::mutex> guard(lock_);
 
+    // Every read here is an lseek and a read through fsdev, and each of those
+    // is an IPC round trip to the filesystem service - nothing like the page
+    // cache the same code sits on when it runs on a phone. Whether that is what
+    // makes loading take minutes is a question worth answering with numbers
+    // rather than argument, so the cost is measured and reported periodically.
+    struct timespec io_start = {};
+    clock_gettime(CLOCK_MONOTONIC, &io_start);
+
     // Seek and read are two calls without pread to fuse them, so the lock is
     // what keeps another thread from moving the cursor in between.
     if (lseek(handle_, off_t(file_offset), SEEK_SET) < 0) {
@@ -226,6 +234,27 @@ class SwitchFileHandle : public FileHandle {
       done += size_t(got);
       if (!loop) {
         break;
+      }
+    }
+
+    {
+      struct timespec io_end = {};
+      clock_gettime(CLOCK_MONOTONIC, &io_end);
+      const uint64_t elapsed_ns =
+          uint64_t(io_end.tv_sec - io_start.tv_sec) * 1000000000ull +
+          uint64_t(io_end.tv_nsec) - uint64_t(io_start.tv_nsec);
+
+      static std::atomic<uint64_t> io_calls{0};
+      static std::atomic<uint64_t> io_bytes{0};
+      static std::atomic<uint64_t> io_nanos{0};
+      const uint64_t c = io_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+      const uint64_t b = io_bytes.fetch_add(done, std::memory_order_relaxed) + done;
+      const uint64_t t = io_nanos.fetch_add(elapsed_ns, std::memory_order_relaxed) + elapsed_ns;
+      if ((c % 20000) == 0) {
+        const uint64_t seconds = t / 1000000000ull;
+        REXFS_WARN("[io] {} reads, {} MB, {}.{:03} s in read(), avg {} bytes, {} KB/s", c,
+                   b >> 20, seconds, (t / 1000000ull) % 1000, b / c,
+                   t ? (b * 1000000ull) / (t / 1000ull) >> 10 : 0);
       }
     }
 
