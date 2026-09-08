@@ -1,5 +1,8 @@
 /*
- * Bigger default stacks for std::thread on Horizon.
+ * pthread gaps and defaults on Horizon.
+ *
+ * Two unrelated problems with devkitA64's pthread layer, both of which stop
+ * std::thread working the way portable code expects.
  *
  * devkitA64's pthread_attr_init zeroes the attribute, and libnx turns a zero
  * stack size into 128 KB. Every std::thread in the engine therefore runs on a
@@ -68,3 +71,28 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
 }
 
 }  // extern "C"
+
+/*
+ * pthread_detach is not implemented at all. libnx supplies thread_create,
+ * thread_exit, thread_join and thread_self, but no thread_detach, so the weak
+ * tail-call in libc's pthread_detach is linked out and the function falls
+ * through to "return ENOSYS". std::thread::detach() turns that into a thrown
+ * std::system_error, which is what killed startup: the crash reporter's own
+ * watchdog detaches its thread, so the process died reporting "Function not
+ * implemented" before the game ever ran. Thirteen call sites across the engine
+ * do the same thing.
+ *
+ * Reporting success is the honest answer here: the thread really is running and
+ * really will never be joined, which is what the caller asked for. What is lost
+ * is the cleanup - libnx keeps the thread's bookkeeping and its stack until it
+ * is joined, and nothing will now join it, so a detached thread's stack is not
+ * returned when it exits. Every detach site in this engine is either a thread
+ * that runs for the life of the process (the watchdog, the samplers, the
+ * decode prewarm workers) or a rare one-shot, so nothing here detaches in a
+ * loop. Somewhere that did would need a joinable thread the engine owns
+ * instead.
+ */
+extern "C" int __wrap_pthread_detach(pthread_t thread) {
+  (void)thread;
+  return 0;
+}
