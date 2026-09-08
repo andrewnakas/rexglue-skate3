@@ -13,6 +13,8 @@
 #include <rex/chrono/clock.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
+#include <atomic>
+
 #include <rex/system/xtimer.h>
 
 namespace rex::system {
@@ -75,6 +77,21 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
                   callback_routine_, callback_routine_arg_, time_low, time_high);
       callback_thread_->EnqueueApc(callback_routine_, callback_routine_arg_, time_low, time_high);
     };
+  }
+
+  // How far out the timer is actually being armed. Every guest thread in this
+  // port is parked on an Event, a Semaphore or a Timer with nothing signalling
+  // them, and a due time computed from a clock that does not behave would arm
+  // timers so far ahead that they never fire - which looks exactly like this.
+  {
+    const auto delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              due_tp - std::chrono::clock_cast<WinSystemClock>(XSystemClock::now()))
+                              .count();
+    static std::atomic<uint64_t> armed{0};
+    const uint64_t n = armed.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n % 500) == 0) {
+      REXSYS_WARN("[timer] arm #{}: due in {} ms, period {} ms", n, delta_ms, period_ms);
+    }
   }
 
   bool result;
