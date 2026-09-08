@@ -32,7 +32,11 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #endif
 #include <rex/audio/audio_system.h>
+#if REX_PLATFORM_SWITCH
+#include <rex/audio/audout/audout_audio_system.h>
+#else
 #include <rex/audio/sdl/sdl_audio_system.h>
+#endif
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
 #include <rex/system.h>
@@ -708,7 +712,13 @@ bool ReXApp::SetupPresentation() {
   if (!candidates.empty()) {
     config_.graphics = candidates[candidate_index].make();
   }
+#if REX_PLATFORM_SWITCH
+  // audout rather than audren: the guest has already mixed its six channels
+  // down, so the submixes and effects audren offers would all go unused.
+  config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::audout::AudoutAudioSystem);
+#else
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
+#endif
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
 

@@ -238,6 +238,17 @@ endif()
 # Build config as compile definition (multi-config generators don't know config at configure time)
 add_compile_definitions(REXGLUE_BUILD_CONFIG="$<CONFIG>")
 
+# Whether SDL is in this build, for the code that has to ask. Deliberately set
+# HERE, after the platform chain above may have forced the option off, and
+# always to an explicit 0 or 1 - an undefined macro tests as 0 in #if, so a
+# missing definition would silently remove SDL from every platform that does
+# want it rather than failing the build.
+if(REXGLUE_USE_SDL)
+    add_compile_definitions(REXGLUE_HAS_SDL=1)
+else()
+    add_compile_definitions(REXGLUE_HAS_SDL=0)
+endif()
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_version.cmake)
 rex_resolve_version(REXGLUE_FULL_VERSION
     FLOOR_MAJOR ${PROJECT_VERSION_MAJOR}

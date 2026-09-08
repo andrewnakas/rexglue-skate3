@@ -27,7 +27,12 @@
 #if REX_PLATFORM_MOBILE
 #include <rex/input/touch_input_driver.h>
 #endif
+#if REXGLUE_HAS_SDL
 #include <rex/input/sdl/sdl_input_driver.h>
+#endif
+#if REX_PLATFORM_SWITCH
+#include <rex/input/hid/hid_input_driver.h>
+#endif
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -39,14 +44,17 @@ namespace {
 constexpr const char* kDefaultInputBackend =
 #if REX_PLATFORM_WIN32
     "xinput";
+#elif REX_PLATFORM_SWITCH
+    "hid";
 #else
     "sdl";
 #endif
 
 }  // namespace
 
-REXCVAR_DEFINE_STRING(input_backend, kDefaultInputBackend, "Input", "Input backend: sdl, xinput")
-    .allowed({"sdl", "xinput"});
+REXCVAR_DEFINE_STRING(input_backend, kDefaultInputBackend, "Input",
+                      "Input backend: sdl, xinput, hid")
+    .allowed({"sdl", "xinput", "hid"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
 // Back+Start is deliberately not the default: Steam Input uses View+Menu
@@ -485,12 +493,23 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     }
 #endif
 
+#if REXGLUE_HAS_SDL
     if (REXCVAR_GET(input_backend) == "sdl") {
       auto sdl_driver = std::make_unique<sdl::SDLInputDriver>(nullptr, 0);
       if (sdl_driver->Setup() == X_STATUS_SUCCESS) {
         input->AddDriver(std::move(sdl_driver));
       }
     }
+#endif
+
+#if REX_PLATFORM_SWITCH
+    if (REXCVAR_GET(input_backend) == "hid") {
+      auto hid_driver = std::make_unique<hid::HidInputDriver>(nullptr, 0);
+      if (hid_driver->Setup() == X_STATUS_SUCCESS) {
+        input->AddDriver(std::move(hid_driver));
+      }
+    }
+#endif
 
 #if REX_PLATFORM_MOBILE
     // Touch driver last of the real drivers: it declines while a physical
