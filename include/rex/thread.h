@@ -40,6 +40,14 @@ void AndroidInitialize();
 void AndroidShutdown();
 #endif
 
+#if REX_PLATFORM_SWITCH
+// Latches the main thread's handle and parses the placement map, so that every
+// thread named later can be given a core and a priority. Called from
+// InitializeSwitchApp.
+void SwitchInitialize();
+void SwitchShutdown();
+#endif
+
 // This is more like an Event with self-reset when returning from Wait()
 class Fence {
  public:

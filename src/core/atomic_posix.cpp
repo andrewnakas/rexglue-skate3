@@ -1,7 +1,10 @@
 #include <rex/platform.h>
 #include <rex/thread/atomic.h>
 
-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH,
+              "This file is POSIX-only");
+// Horizon is not POSIX, but newlib supplies everything this file actually
+// touches, so devkitA64 builds it unchanged rather than needing a twin.
 
 namespace rex::thread {
 

@@ -40,6 +40,12 @@
 #define REX_PLATFORM_MAC 1
 #elif defined(WIN32) || defined(_WIN32)
 #define REX_PLATFORM_WIN32 1
+#elif defined(__SWITCH__)
+// Horizon. Not a UNIX: no signals, no mmap, no dynamic loading, and libnx
+// rather than a libc that owns the process. It is deliberately NOT also
+// REX_PLATFORM_LINUX - almost nothing the Linux paths do survives here - but it
+// IS mobile: one full-screen window, a touch screen, a fixed app root.
+#define REX_PLATFORM_SWITCH 1
 #elif defined(__ANDROID__)
 #define REX_PLATFORM_ANDROID 1
 #define REX_PLATFORM_LINUX 1
@@ -64,6 +70,9 @@
 #ifndef REX_PLATFORM_ANDROID
 #define REX_PLATFORM_ANDROID 0
 #endif
+#ifndef REX_PLATFORM_SWITCH
+#define REX_PLATFORM_SWITCH 0
+#endif
 #ifndef REX_PLATFORM_GNU_LINUX
 #define REX_PLATFORM_GNU_LINUX 0
 #endif
@@ -75,8 +84,10 @@
 // no desktop file dialogs, and a settings menu sized for fingers. iOS and
 // Android share every one of those traits even though one is Darwin and the
 // other is Linux, so code that is about the device class rather than the OS
-// tests this instead of REX_PLATFORM_IOS.
-#if REX_PLATFORM_IOS || REX_PLATFORM_ANDROID
+// tests this instead of REX_PLATFORM_IOS. The Switch is a handheld with a
+// touch screen and a fixed app root, so it joins them - the console differs
+// from a phone in its scheduler and its memory, not in its device class.
+#if REX_PLATFORM_IOS || REX_PLATFORM_ANDROID || REX_PLATFORM_SWITCH
 #define REX_PLATFORM_MOBILE 1
 #else
 #define REX_PLATFORM_MOBILE 0

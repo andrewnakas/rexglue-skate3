@@ -209,6 +209,15 @@ bool Memory::Initialize() {
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
   mapping_base_ = 0;
+#if REX_PLATFORM_SWITCH
+  // Horizon does not let a process pick its own addresses: libnx's virtmem
+  // allocator hands out the one region where the mapping syscalls will accept a
+  // destination, and CreateFileMappingHandle has already reserved the window
+  // there. Probing powers of two would only find addresses the kernel refuses.
+  if (!MapViews(rex::memory::SwitchGuestWindowBase())) {
+    mapping_base_ = views_.all_views[0];
+  }
+#else
   for (size_t n = 32; n < 64; n++) {
     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
     if (!MapViews(mapping_base)) {
@@ -216,6 +225,7 @@ bool Memory::Initialize() {
       break;
     }
   }
+#endif
 #if REX_PLATFORM_MAC
   if (!mapping_base_) {
     if (!MapViews(nullptr)) {

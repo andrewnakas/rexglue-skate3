@@ -272,7 +272,12 @@ target_compile_options(imgui PRIVATE -w)
 
 #=============================================================================
 # SDL3 - Cross-platform media layer
+#
+# Skipped entirely on targets that do not use it. The Switch is the only one so
+# far: devkitPro ships SDL2 and this needs SDL3, and libnx already provides
+# everything SDL would be wrapping - a single NWindow, audout, hid.
 #=============================================================================
+if(REXGLUE_USE_SDL)
 set(SDL_INSTALL ON CACHE BOOL "" FORCE)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
@@ -336,6 +341,7 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
 endif()
 
 add_subdirectory(sdl3)
+endif()  # REXGLUE_USE_SDL
 
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)

@@ -16,7 +16,7 @@
 
 #include <rex/platform.h>
 
-#if REX_PLATFORM_ANDROID || REX_PLATFORM_IOS
+#if REX_PLATFORM_ANDROID || REX_PLATFORM_IOS || REX_PLATFORM_SWITCH
 
 #include <rex/thread/fiber.h>
 

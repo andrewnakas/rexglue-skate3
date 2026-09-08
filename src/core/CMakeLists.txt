@@ -45,6 +45,39 @@ if(WIN32)
         system_win.cpp
         threading_win.cpp
     )
+elseif(REX_SWITCH)
+    # Horizon is not a UNIX and CMake knows it as Generic, so this branch has to
+    # precede the UNIX one. Three of the POSIX files are portable enough to
+    # reuse as they are - atomics, the monotonic clock and the string helpers
+    # all sit on newlib and libstdc++ - and their platform assertions were
+    # widened to say so. Everything else is written against libnx: there are no
+    # signals, no mmap, no dlopen and no pthread_create here.
+    enable_language(ASM)
+    enable_language(C)
+    target_sources(rexcore PRIVATE
+        atomic_posix.cpp
+        clock_posix.cpp
+        math_gcc.cpp
+        string_posix.cpp
+        dbg_switch.cpp
+        dynlib_switch.cpp
+        exception_handler_switch.cpp
+        execinfo_switch.cpp
+        filesystem_switch.cpp
+        main_switch.cpp
+        mapped_memory_switch.cpp
+        memory_switch.cpp
+        seh_switch.cpp
+        socket_switch.cpp
+        system_switch.cpp
+        threading_switch.cpp
+        # The guest's fibers are hand-written AArch64: no OS involvement, so the
+        # same two files the phones use assemble unchanged here.
+        fiber_aarch64.cpp
+        fiber_aarch64.S
+        # Newlib is missing a handful of symbols the Vulkan driver references.
+        switch/nvk_compat.c
+    )
 elseif(UNIX)
     target_sources(rexcore PRIVATE
         atomic_posix.cpp
@@ -89,7 +122,10 @@ target_include_directories(rexcore PRIVATE
     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
 )
 
-if(UNIX)
+if(REX_SWITCH)
+    # libnx is the whole platform library: no pthread, no dl, no rt.
+    target_link_libraries(rexcore PRIVATE nx)
+elseif(UNIX)
     if(ANDROID)
         # Bionic folds pthread, rt and dl into libc; there are no separate
         # libraries to link, and -lpthread/-lrt fail outright.
