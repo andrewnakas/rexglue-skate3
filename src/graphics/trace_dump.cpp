@@ -65,7 +65,7 @@ int TraceDump::Main(const std::vector<std::string>& args) {
   }
 
   // Normalize the path and make absolute.
-  auto abs_path = std::filesystem::absolute(path);
+  auto abs_path = rex::filesystem::ToAbsolute(path);
   REXGPU_INFO("Loading trace file {}...", rex::path_to_utf8(abs_path));
 
   if (!Setup()) {

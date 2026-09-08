@@ -10,6 +10,7 @@
  */
 
 #include <cstring>
+#include <rex/filesystem.h>
 #include <string>
 
 #include <rex/platform.h>
@@ -83,7 +84,7 @@ KernelState::KernelState(Runtime* emulator)
 
   auto user_data_root = emulator_->user_data_root();
   if (!user_data_root.empty()) {
-    user_data_root = std::filesystem::absolute(user_data_root);
+    user_data_root = rex::filesystem::ToAbsolute(user_data_root);
   }
   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
 

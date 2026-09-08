@@ -10,6 +10,7 @@
  */
 
 #include <rex/chrono/clock.h>
+#include <rex/filesystem.h>
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
@@ -276,7 +277,7 @@ bool Runtime::SetupVfs() {
     return true;
   }
 
-  auto abs_game_root = std::filesystem::absolute(game_data_root_);
+  auto abs_game_root = rex::filesystem::ToAbsolute(game_data_root_);
   if (!std::filesystem::exists(abs_game_root)) {
     REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
     return false;
@@ -303,7 +304,7 @@ bool Runtime::SetupVfs() {
 
   // Mount update_data_root as update:\ if provided
   if (!update_data_root_.empty()) {
-    auto abs_update_root = std::filesystem::absolute(update_data_root_);
+    auto abs_update_root = rex::filesystem::ToAbsolute(update_data_root_);
     if (std::filesystem::exists(abs_update_root)) {
       auto update_mount = "\\Device\\Harddisk0\\PartitionUpdate";
       auto update_device =

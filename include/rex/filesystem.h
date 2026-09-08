@@ -12,6 +12,7 @@
 #pragma once
 
 #include <filesystem>
+#include <system_error>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -139,6 +140,43 @@ void AndroidShutdown();
 bool IsAndroidContentUri(const std::string_view source);
 int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode);
 #endif  // REX_PLATFORM_ANDROID
+
+
+// std::filesystem::absolute is current_path() / p for anything it considers
+// relative, and it only considers a leading '/' absolute. devkitPro paths carry
+// a device prefix instead ("sdmc:/switch/skate3/game"), which has no leading
+// slash, so absolute() prepends the working directory and produces
+// "sdmc:/switch/sdmc:/switch/skate3/game" - which then fails to stat with
+// EINVAL. A path that already names a device is absolute; return it unchanged.
+//
+// Written to be platform-neutral rather than switched on REX_PLATFORM_SWITCH:
+// a leading "name:" is not a valid relative path on any platform we build for,
+// and Windows drive letters ("C:/") want exactly the same treatment.
+inline std::filesystem::path ToAbsolute(const std::filesystem::path& path) {
+  const std::string text = path.string();
+  const size_t colon = text.find(':');
+  if (colon != std::string::npos && colon > 0) {
+    const size_t separator = text.find_first_of("/\\");
+    if (separator == std::string::npos || colon < separator) {
+      return path;
+    }
+  }
+  return std::filesystem::absolute(path);
+}
+
+inline std::filesystem::path ToAbsolute(const std::filesystem::path& path,
+                                        std::error_code& ec) {
+  const std::string text = path.string();
+  const size_t colon = text.find(':');
+  if (colon != std::string::npos && colon > 0) {
+    const size_t separator = text.find_first_of("/\\");
+    if (separator == std::string::npos || colon < separator) {
+      ec.clear();
+      return path;
+    }
+  }
+  return std::filesystem::absolute(path, ec);
+}
 
 }  // namespace filesystem
 }  // namespace rex
