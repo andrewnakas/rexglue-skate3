@@ -558,7 +558,31 @@ u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
           caller = uint32_t(c->lr);
         }
       }
-      REXKRNL_DEBUG("NtSetEvent(handle={:08X}) from guest lr={:08X} (#{})", handle, caller, i);
+      // lr alone is useless here: every signal in the title goes through one
+      // thin SetEvent wrapper, so it is always the same address. Walk two
+      // frames of the guest back chain to reach the code that actually wants
+      // the event set. Same layout the crash reports use - the caller's frame
+      // is at [r1], and its return address 8 bytes below that.
+      uint32_t up1 = 0, up2 = 0;
+      if (auto* ts = rex::runtime::ThreadState::Get()) {
+        if (const auto* c = ts->context()) {
+          auto* mem = REX_KERNEL_MEMORY();
+          uint32_t frame = uint32_t(c->r1.u64 & 0xFFFFFFFFull);
+          uint32_t* slot = nullptr;
+          for (int depth = 0; depth < 2 && frame && (frame & 3) == 0; ++depth) {
+            slot = mem->TranslateVirtual<uint32_t*>(frame);
+            if (!slot) break;
+            const uint32_t next = __builtin_bswap32(*slot);
+            if (next <= frame || (next & 3) != 0) break;
+            uint32_t* link = mem->TranslateVirtual<uint32_t*>(next - 8);
+            const uint32_t value = link ? __builtin_bswap32(*link) : 0;
+            (depth == 0 ? up1 : up2) = value;
+            frame = next;
+          }
+        }
+      }
+      REXKRNL_DEBUG("NtSetEvent(handle={:08X}) callers {:08X} <- {:08X} (#{})", handle, up1, up2,
+                    i);
     }
   }
   return xeNtSetEvent(handle, previous_state_ptr);
