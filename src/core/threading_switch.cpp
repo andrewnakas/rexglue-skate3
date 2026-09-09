@@ -70,7 +70,7 @@ static_assert(REX_PLATFORM_SWITCH, "This file is Horizon-only");
 REXCVAR_DEFINE_STRING(
     switch_thread_placement_map, "", "Threading",
     "Per-thread core and priority on Switch, as "
-    "\"prefix=core:<0-2|any>[,prio:<28-59>];prefix=...\" matched against the "
+    "\"prefix=core:<0-2|0+1|any>[,prio:<28-59>];prefix=...\" matched against the "
     "thread name (first matching prefix wins; empty disables the feature). "
     "Priority runs from 28 (most urgent) to 59, and 59 is special: it is the "
     "only level on cores 0-2 where threads of equal priority are time-sliced. "
@@ -112,6 +112,7 @@ struct Placement {
   bool matched = false;
   int core = -1;       // -1: leave the core mask alone
   bool any_core = false;
+  u32 core_mask = 0;   // 0: not a "core:a+b" entry
   int priority = -1;   // -1: leave the priority alone
 };
 
@@ -157,6 +158,28 @@ Placement LookUpPlacement(std::string_view name) {
       if (key == "core") {
         if (value == "any") {
           out.any_core = true;
+        } else if (value.find('+') != std::string_view::npos) {
+          // A set of cores, "core:0+1". Between pinning to one core and
+          // floating across all three there is a real middle: keep a thread off
+          // the core doing the frame's serial work without nailing it down.
+          // The emulated command processor is a whole frame's work on one
+          // thread, and every floating thread that lands on its core is taken
+          // straight out of the frame.
+          u32 mask = 0;
+          std::string_view rest_cores = value;
+          while (!rest_cores.empty()) {
+            const size_t plus = rest_cores.find('+');
+            const std::string_view one = rest_cores.substr(0, plus);
+            rest_cores = plus == std::string_view::npos ? std::string_view()
+                                                        : rest_cores.substr(plus + 1);
+            int parsed = 0;
+            if (ParseInt(one, parsed) && parsed >= 0 && parsed < kUsableCoreCount) {
+              mask |= 1u << parsed;
+            }
+          }
+          if (mask != 0) {
+            out.core_mask = mask;
+          }
         } else {
           int parsed = 0;
           if (ParseInt(value, parsed) && parsed >= 0 && parsed < kUsableCoreCount) {
@@ -191,6 +214,10 @@ void ApplyPlacementForThread(Handle handle, std::string_view name) {
   }
   if (p.any_core) {
     svcSetThreadCoreMask(handle, -1, kAllCoresMask);
+  } else if (p.core_mask != 0) {
+    // No ideal core: the mask is the whole instruction, and naming a preferred
+    // core inside it would undo half the point.
+    svcSetThreadCoreMask(handle, -1, p.core_mask & kAllCoresMask);
   } else if (p.core >= 0) {
     // Both the ideal core and the mask: the mask alone lets the scheduler
     // migrate, and pinning is the whole point for the few threads that ask.
@@ -201,7 +228,8 @@ void ApplyPlacementForThread(Handle handle, std::string_view name) {
   }
   // At warn, because the shipped log level is warn and a run that cannot show
   // where its threads went cannot explain its own frame rate.
-  REXLOG_WARN("[thread] placed '{}' core={} prio={}", name, p.any_core ? -1 : p.core, p.priority);
+  REXLOG_WARN("[thread] placed '{}' core={} mask=0x{:x} prio={}", name,
+              p.any_core ? -1 : p.core, p.any_core ? kAllCoresMask : p.core_mask, p.priority);
 }
 
 void ApplyPlacementForCurrentThreadName(std::string_view name) {

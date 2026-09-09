@@ -442,7 +442,12 @@ void CommandProcessor::ReportCpSummary() {
   // Dead time as a share of the window is the number that matters: it is the
   // fraction of the command processor's life spent parked on a fence.
   const double wait_ms = double(g_cp_summary.wait_us) / 1000.0;
-  REXLOG_INFO(
+  // Warn, not info. This one line separates "the command processor is
+  // saturated" from "it is parked waiting for the guest", which is the first
+  // fork in every frame-rate investigation - and at info it is invisible in a
+  // shipped run. A thirteen minute Switch capture came back with the question
+  // unanswerable for exactly that reason.
+  REXLOG_WARN(
       "[cp-sum] {:.0f}s: abandons={} ({:.1f}/min) waits={} wait={:.0f}ms ({:.1f}% of window) "
       "batches={} ({:.0f}/s)",
       secs, g_cp_summary.abandons, double(g_cp_summary.abandons) * 60.0 / secs,
