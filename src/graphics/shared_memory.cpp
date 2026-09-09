@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -21,6 +22,13 @@
 #include <rex/memory.h>
 
 namespace rex::graphics {
+
+extern "C" {
+std::atomic<uint64_t> rex_diag_shmem_upload_pages{0};
+std::atomic<uint64_t> rex_diag_shmem_upload_calls{0};
+std::atomic<uint32_t> rex_diag_shmem_page_size{0};
+}
+
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
@@ -573,6 +581,21 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  // How much guest memory this port re-sends to the GPU every frame. Page
+  // fault write watches cannot work on Horizon - Protect() is a no-op there -
+  // so whatever stands in for them decides whether a frame uploads a few
+  // kilobytes of genuinely dirty vertex data or re-sends the whole mirror. At
+  // a gigabyte a second that is the difference between sixty frames and one.
+  {
+    uint64_t pages = 0;
+    for (const auto& range : upload_ranges_) {
+      pages += range.second;
+    }
+    rex_diag_shmem_upload_pages.fetch_add(pages, std::memory_order_relaxed);
+    rex_diag_shmem_upload_calls.fetch_add(1, std::memory_order_relaxed);
+    rex_diag_shmem_page_size.store(uint32_t(1) << page_size_log2_, std::memory_order_relaxed);
+  }
+
   return UploadRanges(upload_ranges_);
 }
 
@@ -685,6 +708,21 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
 
   if (upload_ranges_.empty()) {
     return true;
+  }
+
+  // How much guest memory this port re-sends to the GPU every frame. Page
+  // fault write watches cannot work on Horizon - Protect() is a no-op there -
+  // so whatever stands in for them decides whether a frame uploads a few
+  // kilobytes of genuinely dirty vertex data or re-sends the whole mirror. At
+  // a gigabyte a second that is the difference between sixty frames and one.
+  {
+    uint64_t pages = 0;
+    for (const auto& range : upload_ranges_) {
+      pages += range.second;
+    }
+    rex_diag_shmem_upload_pages.fetch_add(pages, std::memory_order_relaxed);
+    rex_diag_shmem_upload_calls.fetch_add(1, std::memory_order_relaxed);
+    rex_diag_shmem_page_size.store(uint32_t(1) << page_size_log2_, std::memory_order_relaxed);
   }
 
   return UploadRanges(upload_ranges_);

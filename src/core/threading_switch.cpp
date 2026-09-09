@@ -79,6 +79,16 @@ REXCVAR_DEFINE_STRING(
     "blocks. Without a map the three cores are shared by whatever order the "
     "threads happened to start in.");
 
+REXCVAR_DEFINE_BOOL(
+    switch_yield_with_migration, true, "Threading",
+    "Yield with core migration (svcSleepThread(-1)) rather than without "
+    "(svcSleepThread(0)). Without migration a yield only offers the core to "
+    "threads already queued on it, so a guest thread spinning on core 0 cannot "
+    "hand its slice to the worker it is waiting for on core 2 - which is the "
+    "shape of every job-manager wait in this title. With migration the kernel "
+    "may pull a runnable thread across, which is what a three core machine "
+    "needs.");
+
 namespace {
 
 // The system keeps core 3 for itself; an application is given 0, 1 and 2.
@@ -95,14 +105,21 @@ bool ParseInt(std::string_view s, int& out) {
   return !s.empty() && std::from_chars(s.data(), s.data() + s.size(), out).ec == std::errc();
 }
 
-// Applied to the CALLING thread only, from the self-naming paths: a thread
-// names itself just before it enters its start routine, which is the one moment
-// its role is known while its own core and priority can still be set without
-// racing it.
-void ApplyPlacementForCurrentThreadName(std::string_view name) {
+// What the map asks for, for a thread with this name. Parsing is separated from
+// applying because two callers need the answer: the placement below, and
+// set_priority, which must not let a caller undo the map minutes later.
+struct Placement {
+  bool matched = false;
+  int core = -1;       // -1: leave the core mask alone
+  bool any_core = false;
+  int priority = -1;   // -1: leave the priority alone
+};
+
+Placement LookUpPlacement(std::string_view name) {
+  Placement out;
   const std::string& map = REXCVAR_GET(switch_thread_placement_map);
   if (map.empty() || name.empty()) {
-    return;
+    return out;
   }
 
   std::string_view rest(map);
@@ -123,9 +140,7 @@ void ApplyPlacementForCurrentThreadName(std::string_view name) {
       continue;
     }
 
-    int core = -1;       // -1: leave the core mask alone
-    bool any_core = false;
-    int priority = -1;   // -1: leave the priority alone
+    out.matched = true;
 
     std::string_view fields = entry.substr(eq + 1);
     while (!fields.empty()) {
@@ -141,37 +156,56 @@ void ApplyPlacementForCurrentThreadName(std::string_view name) {
       const std::string_view value = field.substr(colon + 1);
       if (key == "core") {
         if (value == "any") {
-          any_core = true;
+          out.any_core = true;
         } else {
           int parsed = 0;
           if (ParseInt(value, parsed) && parsed >= 0 && parsed < kUsableCoreCount) {
-            core = parsed;
+            out.core = parsed;
           }
         }
       } else if (key == "prio") {
         int parsed = 0;
         if (ParseInt(value, parsed) && parsed >= kHighestAllowedPriority &&
             parsed <= kPreemptivePriority) {
-          priority = parsed;
+          out.priority = parsed;
         }
       }
     }
 
-    const Handle self = CUR_THREAD_HANDLE;
-    if (any_core) {
-      svcSetThreadCoreMask(self, -1, kAllCoresMask);
-    } else if (core >= 0) {
-      // Both the ideal core and the mask: the mask alone lets the scheduler
-      // migrate, and migration between clusters is what the map exists to stop.
-      svcSetThreadCoreMask(self, core, 1u << core);
-    }
-    if (priority >= 0) {
-      svcSetThreadPriority(self, priority);
-    }
-    REXLOG_INFO("[thread] placed '{}' core={} prio={}", name,
-                any_core ? -1 : core, priority);
-    return;  // first matching prefix wins
+    return out;  // first matching prefix wins
   }
+  return out;
+}
+
+// Apply the map to a thread by handle. svcSetThreadCoreMask and
+// svcSetThreadPriority both take a handle and work on any thread of this
+// process, so a thread named by its parent - which is most of them: the audio
+// pump, the pipeline compilers, every guest thread the title does not name
+// itself - can be placed too. Only threads that named themselves were being
+// placed before, which left the rest at priority 59 on the process default
+// core, all on top of each other.
+void ApplyPlacementForThread(Handle handle, std::string_view name) {
+  const Placement p = LookUpPlacement(name);
+  if (!p.matched) {
+    return;
+  }
+  if (p.any_core) {
+    svcSetThreadCoreMask(handle, -1, kAllCoresMask);
+  } else if (p.core >= 0) {
+    // Both the ideal core and the mask: the mask alone lets the scheduler
+    // migrate, and pinning is the whole point for the few threads that ask.
+    svcSetThreadCoreMask(handle, p.core, 1u << p.core);
+  }
+  if (p.priority >= 0) {
+    svcSetThreadPriority(handle, p.priority);
+  }
+  // At warn, because the shipped log level is warn and a run that cannot show
+  // where its threads went cannot explain its own frame rate.
+  REXLOG_WARN("[thread] placed '{}' core={} prio={}", name, p.any_core ? -1 : p.core, p.priority);
+}
+
+void ApplyPlacementForCurrentThreadName(std::string_view name) {
+  ApplyPlacementForThread(CUR_THREAD_HANDLE, name);
 }
 
 }  // namespace
@@ -204,10 +238,16 @@ uint32_t current_thread_system_id() {
 }
 
 void MaybeYield() {
-  // Zero means "yield to another thread on this core, without migrating".
+  // Zero means "yield to another thread on this core, without migrating"; -1
+  // lets the kernel pull a runnable thread over from another core's queue.
+  //
   // This is not advisory on Horizon the way sched_yield can be: outside the
   // preemptive priority it is the only thing that lets a sibling run at all.
-  svcSleepThread(0);
+  // With three cores and a title whose threads wait on each other across them,
+  // the non-migrating form is nearly useless: a guest thread spinning on core 0
+  // yields, finds nothing else queued on core 0, and carries straight on while
+  // the worker it is waiting for is still queued behind someone on core 2.
+  svcSleepThread(REXCVAR_GET(switch_yield_with_migration) ? -1 : 0);
   __sync_synchronize();
 }
 
@@ -290,6 +330,18 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
   return true;
 }
 
+
+// Timer delivery counters. A timer that stops arriving looks the same from the
+// outside whether the expiry was never dispatched or was dispatched and missed,
+// and those have different fixes. Counted with C linkage so the one file that
+// prints them needs no shared header.
+extern "C" {
+std::atomic<uint64_t> rex_diag_timer_setonce{0};
+std::atomic<uint64_t> rex_diag_timer_setonce_armed{0};
+std::atomic<uint64_t> rex_diag_timer_completion{0};
+std::atomic<uint64_t> rex_diag_timer_signal{0};
+std::atomic<uint64_t> rex_diag_timer_cancel{0};
+}
 
 class PosixConditionBase {
  public:
@@ -702,6 +754,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
   virtual ~PosixCondition() { Cancel(); }
 
   bool Signal() override {
+    ++rex_diag_timer_signal;
     std::lock_guard<std::mutex> lock(mutex_);
     signal_ = true;
     cond_.notify_all();
@@ -710,7 +763,9 @@ class PosixCondition<Timer> : public PosixConditionBase {
   }
 
   void SetOnce(std::chrono::steady_clock::time_point due_time, std::function<void()> opt_callback) {
+    ++rex_diag_timer_setonce;
     Cancel();
+    ++rex_diag_timer_setonce_armed;
 
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -731,6 +786,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
   }
 
   void Cancel() {
+    ++rex_diag_timer_cancel;
     if (auto wait_item = wait_item_.lock()) {
       wait_item->Disarm();
     }
@@ -744,6 +800,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
  private:
   static void CompletionRoutine(void* userdata) {
     assert_not_null(userdata);
+    ++rex_diag_timer_completion;
     auto timer = reinterpret_cast<PosixCondition<Timer>*>(userdata);
     timer->Signal();
     // As the callback may reset the timer, store local.
@@ -861,13 +918,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
       std::lock_guard<std::mutex> lock(name_mutex_);
       rex::string::util_copy_truncating(name_, name, rex::countof(name_));
     }
-    // Horizon has no way to name another thread, and no way to place one
-    // either: svcSetThreadCoreMask and svcSetThreadPriority take a handle, but
-    // the placement decision belongs to the thread that knows its own role.
-    // Naming from elsewhere records the name and nothing more.
-    if (IsCurrentThread()) {
-      ApplyPlacementForCurrentThreadName(name);
-    }
+    // Horizon has no kernel-visible thread name, but it can certainly place
+    // another thread: svcSetThreadCoreMask and svcSetThreadPriority take a
+    // handle and accept any thread of this process. Naming is the only moment a
+    // thread's role is known, whoever does the naming, so place it here either
+    // way. Most threads are named by their parent - the audio pump, the
+    // pipeline compilers, every guest thread the title leaves unnamed - and
+    // skipping those left them all at priority 59 on the process default core.
+    ApplyPlacementForThread(native_thread_handle(), name);
   }
 
   uint32_t system_id() const {
@@ -916,6 +974,22 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_priority(int new_priority) {
     WaitStarted();
+    // A thread the map names keeps what the map gave it. Two callers raise a
+    // priority just after creation - the XMA decoder and the audio worker both
+    // ask for "above normal" from the parent thread - and that arrives after
+    // the placement, silently undoing it. Which of the two lands last was a
+    // race, so the thread's actual priority varied from run to run.
+    {
+      std::string current;
+      {
+        std::lock_guard<std::mutex> lock(name_mutex_);
+        current = name_;
+      }
+      const Placement p = LookUpPlacement(current);
+      if (p.matched && p.priority >= 0) {
+        return;
+      }
+    }
     svcSetThreadPriority(native_thread_handle(), MapGuestPriority(new_priority));
   }
 

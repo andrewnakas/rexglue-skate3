@@ -72,6 +72,25 @@ std::vector<std::string> ApplyArgumentFileOverrides(std::vector<std::string> arg
     return std::string(key.substr(0, key.find('=')));
   };
 
+  // A key repeated inside the file itself keeps only its last occurrence. The
+  // parser accepts one value per option and rejects the whole command line if
+  // it sees two, and it rejects it *silently* - every argument is dropped and
+  // the game runs on defaults, which surfaces much later as an unrelated
+  // failure (a 2 GB texture-cache allocation, a user root of
+  // sdmc:/switch/skate3/skate3). This file is edited by hand between runs, so
+  // a duplicated line is an ordinary thing to do and must not cost a boot.
+  for (auto it = overrides.begin(); it != overrides.end();) {
+    const std::string key = key_of(*it);
+    const bool shadowed = std::any_of(std::next(it), overrides.end(),
+                                      [&](const std::string& later) { return key_of(later) == key; });
+    if (shadowed) {
+      std::fprintf(stderr, "[args] %s is set more than once; keeping the last one\n", key.c_str());
+      it = overrides.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
   for (const std::string& override_arg : overrides) {
     const std::string key = key_of(override_arg);
     std::erase_if(args, [&](const std::string& shipped) { return key_of(shipped) == key; });
@@ -174,17 +193,36 @@ std::vector<std::string> BuildSwitchArguments() {
       // Core 3 belongs to the system; an application gets 0, 1 and 2. Priority
       // 59 is the only level on those cores where equal-priority threads are
       // time-sliced, so everything carrying guest work or spinning sits there.
+      //
+      // Only three threads are pinned, and each for a reason: the guest's main
+      // and render threads are the frame, and the command processor must not be
+      // migrated away from the ring it is draining. EVERYTHING ELSE FLOATS.
+      // Pinning the job workers to a core - which an earlier profile did - puts
+      // them behind eight other runnable threads while the two threads waiting
+      // on them spin on empty cores, and that alone took the front end from 30
+      // fps to 1. A floating thread can be pulled to whichever core yields.
+      //
+      // Names are matched as prefixes against the thread's own name, truncated
+      // to 15 characters, so every prefix here must fit in 15.
       "--switch_thread_placement_map="
       "Main XThread=core:0,prio:59;"
       "render_thread=core:1,prio:59;"
       "GPU Commands=core:2,prio:59;"
-      "XMA Decoder=core:2,prio:59;"
-      "Vulkan Pipelines=core:2,prio:59;"
-      "load_thread=core:2,prio:59;"
-      "rwfilesys=core:2,prio:59;"
-      "presence_thread=core:2,prio:59;"
+      "XMA Decoder=core:any,prio:52;"
+      "Job Manager=core:any,prio:59;"
+      "timer_thread=core:any,prio:59;"
+      "load_thread=core:any,prio:59;"
+      "rwfilesys=core:any,prio:59;"
+      "presence_thread=core:any,prio:59;"
+      "decompress_thre=core:any,prio:59;"
+      "dlc_enumerator=core:any,prio:59;"
+      "sk8_memcard=core:any,prio:59;"
+      "XThread=core:any,prio:59;"
+      "Vulkan Pipeline=core:any,prio:59;"
       "decode_worker=core:any,prio:59;"
       "cam_sampler=core:any,prio:59;"
+      "rex::thread::T=core:any,prio:55;"
+      "Audio Pump=core:any,prio:46;"
       "RwAudioCore=core:any,prio:46;"
       "Audio Worker=core:any,prio:45;"
       "GPU VSync=core:any,prio:50;"

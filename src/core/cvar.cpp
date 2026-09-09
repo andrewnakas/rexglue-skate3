@@ -614,7 +614,17 @@ std::vector<std::string> Init(int argc, char** argv) {
   } catch (const CLI::ParseError& e) {
     // TODO(tomc): dumb workaround for the stupid chicken and its egg.
     //             dont call rex logging funcs here for now.
+    //
+    // Say plainly what this costs. The parse is abandoned where it failed, so
+    // NONE of the settings take effect and the program continues on defaults -
+    // which then fails somewhere else entirely, minutes later, looking like a
+    // bug in whatever it hit. On a console, where this command line is the only
+    // way to configure anything, that has cost a full test cycle.
     fprintf(stderr, "cvar: CLI11  parse error: %s\n", e.what());
+    fprintf(stderr,
+            "cvar: NO command line settings were applied - every one of the %d argument(s) was "
+            "discarded and defaults are in force. Fix the argument above and run again.\n",
+            argc > 0 ? argc - 1 : 0);
   }
 
   return app.remaining();
