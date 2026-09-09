@@ -490,6 +490,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
 }
 
 void GraphicsSystem::MarkVblank() {
+  // Driven from here because it is the one thing already ticking at a steady
+  // rate that the guest can observe. See KernelState::UpdateGuestThreadTimestamps.
+  if (auto* ks = system::kernel_state()) {
+    ks->UpdateGuestThreadTimestamps();
+  }
+
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
 

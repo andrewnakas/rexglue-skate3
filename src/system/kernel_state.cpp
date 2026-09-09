@@ -405,6 +405,30 @@ void KernelState::RemoveTitleTerminateNotification(uint32_t routine) {
   }
 }
 
+void KernelState::UpdateGuestThreadTimestamps() {
+  // Skate 3's graphics driver spins in a wait helper whose only escape other
+  // than the completion flag is "this time base has advanced by 5000". The
+  // field is X_KTHREAD+0x58, declared as unk_58 and never written by anything
+  // here, so it read zero on every sample, the elapsed count was always zero,
+  // and the timeout could not fire. The fast path out of that loop depends on
+  // the driver's completion flag; when that does not arrive the title has no
+  // second way out and spins for ever - tens of millions of iterations, which
+  // is exactly what the guest call trace recorded.
+  //
+  // Milliseconds, because the 5000 the guest compares against reads as a five
+  // second driver timeout rather than a tick count at some unknown rate.
+  const uint32_t now_ms = uint32_t(rex::chrono::Clock::QueryGuestUptimeMillis());
+  for (const auto& thread : object_table_.GetObjectsByType<XThread>()) {
+    if (!thread || !thread->guest_object()) {
+      continue;
+    }
+    auto* guest = memory_->TranslateVirtual<uint8_t*>(thread->guest_object());
+    if (guest) {
+      rex::memory::store_and_swap<uint32_t>(guest + 0x58, now_ms);
+    }
+  }
+}
+
 void KernelState::RegisterModule(XModule* module) {}
 
 void KernelState::UnregisterModule(XModule* module) {}
