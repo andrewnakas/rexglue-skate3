@@ -1813,7 +1813,14 @@ class NrDeviceVulkan : public nrhi::Device {
         s_window_count = 0;
       }
       if (++s_window_count <= 8) {
-        REXLOG_INFO(
+        // Warn. This fires only on frames that already cost more than 4 ms of
+        // CPU in the backend, it throttles itself to eight per five seconds,
+        // and it is the only line that attributes that CPU - including a drain
+        // backlog that "decays the frame rate over minutes and is invisible in
+        // the per-frame timings", as the note below says. A diagnostic that
+        // only speaks on bad frames should not also need a log level that
+        // changes the timing of the frames it is describing.
+        REXLOG_WARN(
             "nrhi-vulkan: SLOW frame {}us: pass_open={}us/{} flush={}us/{} copies={}us/{} "
             "table_miss={}us/{} set0_miss={}us/{} view_destroy={}us/{} view_create={}us/{} "
             "const={}us/{} pso={}us/{} drain={}us/{} retired_backlog={} "
