@@ -414,6 +414,12 @@ struct CpSummary {
   uint64_t waits = 0;
   uint64_t wait_us = 0;
   uint64_t batches = 0;
+  // Time actually spent executing the guest's command stream. "wait" says how
+  // long this thread was idle; without its opposite, a thread that is never
+  // idle is indistinguishable from a thread that is idle in a way this counter
+  // does not watch. On the Switch port the wait is zero and the frame is still
+  // spent here, so the question "doing what" needs busy time to answer.
+  uint64_t exec_us = 0;
   std::chrono::steady_clock::time_point last_report{};
 };
 CpSummary g_cp_summary;
@@ -442,6 +448,7 @@ void CommandProcessor::ReportCpSummary() {
   // Dead time as a share of the window is the number that matters: it is the
   // fraction of the command processor's life spent parked on a fence.
   const double wait_ms = double(g_cp_summary.wait_us) / 1000.0;
+  const double exec_ms = double(g_cp_summary.exec_us) / 1000.0;
   // Warn, not info. This one line separates "the command processor is
   // saturated" from "it is parked waiting for the guest", which is the first
   // fork in every frame-rate investigation - and at info it is invisible in a
@@ -449,10 +456,11 @@ void CommandProcessor::ReportCpSummary() {
   // unanswerable for exactly that reason.
   REXLOG_WARN(
       "[cp-sum] {:.0f}s: abandons={} ({:.1f}/min) waits={} wait={:.0f}ms ({:.1f}% of window) "
-      "batches={} ({:.0f}/s)",
+      "batches={} ({:.0f}/s) exec={:.0f}ms ({:.1f}% of window, {:.1f}ms/batch)",
       secs, g_cp_summary.abandons, double(g_cp_summary.abandons) * 60.0 / secs,
       g_cp_summary.waits, wait_ms, wait_ms / (secs * 10.0), g_cp_summary.batches,
-      double(g_cp_summary.batches) / secs);
+      double(g_cp_summary.batches) / secs, exec_ms, exec_ms / (secs * 10.0),
+      g_cp_summary.batches ? exec_ms / double(g_cp_summary.batches) : 0.0);
   g_cp_summary = CpSummary{};
   g_cp_summary.last_report = now;
 }
@@ -518,7 +526,11 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
+    const auto exec_begin = std::chrono::steady_clock::now();
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    g_cp_summary.exec_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - exec_begin)
+                                         .count());
     ++g_cp_summary.batches;
     ReportCpSummary();
 
