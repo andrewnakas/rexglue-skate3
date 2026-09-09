@@ -4093,6 +4093,21 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+// What the emulated path actually still executes while the native renderer is
+// replacing the frame. Suppression is supposed to make this nearly free, and on
+// the Switch port the command processor is spending 96% of a core here - so the
+// question is which of these survives the gate, and there was no way to ask.
+extern "C" {
+std::atomic<uint64_t> rex_diag_cp_draws{0};
+std::atomic<uint64_t> rex_diag_cp_draws_suppressed{0};
+std::atomic<uint64_t> rex_diag_cp_draws_memexport{0};
+std::atomic<uint64_t> rex_diag_cp_draws_depthonly{0};
+std::atomic<uint64_t> rex_diag_cp_draw_us{0};
+std::atomic<uint64_t> rex_diag_cp_copies{0};
+std::atomic<uint64_t> rex_diag_cp_copies_suppressed{0};
+std::atomic<uint64_t> rex_diag_cp_copy_us{0};
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -4153,6 +4168,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       // lightpage composition left never-composed pages sampling garbage -
       // the light/dark checkerboard ground. (Mirrors the D3D12 gate: draw
       // and resolve suppression must agree.)
+      rex_diag_cp_copies_suppressed.fetch_add(1, std::memory_order_relaxed);
       if (REXCVAR_GET(native_render_force_resolve_readback_max_length) > 0) {
         // App-armed window diagnostics (Skate 3 photo flows): while the
         // window is armed, show which resolves the suppression filter drops
@@ -4274,6 +4290,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
   bool draw_samplers_reused = false;
+  rex_diag_cp_draws.fetch_add(1, std::memory_order_relaxed);
+  const auto rex_draw_t0 = std::chrono::steady_clock::now();
+  struct RexDrawTimer {
+    std::chrono::steady_clock::time_point t0;
+    ~RexDrawTimer() {
+      rex_diag_cp_draw_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count()),
+          std::memory_order_relaxed);
+    }
+  } rex_draw_timer{rex_draw_t0};
+  if (memexport_writes_possible) {
+    rex_diag_cp_draws_memexport.fetch_add(1, std::memory_order_relaxed);
+  }
 
   // Native guest-output renderer active: the emulated frame is never shown,
   // so skip the draw entirely (pipeline setup, texture cache, render target
@@ -4293,6 +4324,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!memexport_writes_possible && ShouldSuppressEmulatedDraws()) {
     const uint32_t suppress_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
     if (ShouldSuppressPassAtPitch(suppress_pitch)) {
+      rex_diag_cp_draws_suppressed.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
     // Depth/stencil-only draws (no pixel shader) inside the EXEMPT passes:
@@ -4301,6 +4333,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // This stream is the dominant remaining emulated GPU cost at 3x on
     // Vulkan (2-12 ms/frame - the bimodal-FPS slow state).
     if (pixel_shader == nullptr && ShouldSuppressExemptDepthOnlyDraws()) {
+      rex_diag_cp_draws_depthonly.fetch_add(1, std::memory_order_relaxed);
+      rex_diag_cp_draws_suppressed.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
     // Census of the passes still EXECUTING under suppression (each distinct
@@ -5242,6 +5276,18 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
 }
 
 bool VulkanCommandProcessor::IssueCopy() {
+  rex_diag_cp_copies.fetch_add(1, std::memory_order_relaxed);
+  const auto rex_copy_t0 = std::chrono::steady_clock::now();
+  struct RexCopyTimer {
+    std::chrono::steady_clock::time_point t0;
+    ~RexCopyTimer() {
+      rex_diag_cp_copy_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count()),
+          std::memory_order_relaxed);
+    }
+  } rex_copy_timer{rex_copy_t0};
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES

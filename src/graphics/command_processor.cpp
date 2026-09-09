@@ -424,6 +424,19 @@ struct CpSummary {
 };
 CpSummary g_cp_summary;
 
+// Defined in the Vulkan command processor: what the emulated path still
+// executes while the native renderer is replacing the frame.
+extern "C" {
+extern std::atomic<uint64_t> rex_diag_cp_draws;
+extern std::atomic<uint64_t> rex_diag_cp_draws_suppressed;
+extern std::atomic<uint64_t> rex_diag_cp_draws_memexport;
+extern std::atomic<uint64_t> rex_diag_cp_draws_depthonly;
+extern std::atomic<uint64_t> rex_diag_cp_draw_us;
+extern std::atomic<uint64_t> rex_diag_cp_copies;
+extern std::atomic<uint64_t> rex_diag_cp_copies_suppressed;
+extern std::atomic<uint64_t> rex_diag_cp_copy_us;
+}
+
 }  // namespace
 
 void CommandProcessor::AccumulateWaitRegMem(uint64_t wait_us, bool abandoned) {
@@ -461,6 +474,25 @@ void CommandProcessor::ReportCpSummary() {
       g_cp_summary.waits, wait_ms, wait_ms / (secs * 10.0), g_cp_summary.batches,
       double(g_cp_summary.batches) / secs, exec_ms, exec_ms / (secs * 10.0),
       g_cp_summary.batches ? exec_ms / double(g_cp_summary.batches) : 0.0);
+  {
+    // Draws and resolves the emulated path still ran, against the ones the
+    // native renderer's suppression skipped, and what the survivors cost. If
+    // exec is the frame and these are near zero, the cost is PM4 handling
+    // rather than drawing, which is a different fix entirely.
+    const uint64_t d = rex_diag_cp_draws.exchange(0, std::memory_order_relaxed);
+    const uint64_t ds = rex_diag_cp_draws_suppressed.exchange(0, std::memory_order_relaxed);
+    const uint64_t dm = rex_diag_cp_draws_memexport.exchange(0, std::memory_order_relaxed);
+    const uint64_t dd = rex_diag_cp_draws_depthonly.exchange(0, std::memory_order_relaxed);
+    const uint64_t du = rex_diag_cp_draw_us.exchange(0, std::memory_order_relaxed);
+    const uint64_t c = rex_diag_cp_copies.exchange(0, std::memory_order_relaxed);
+    const uint64_t cs = rex_diag_cp_copies_suppressed.exchange(0, std::memory_order_relaxed);
+    const uint64_t cu = rex_diag_cp_copy_us.exchange(0, std::memory_order_relaxed);
+    REXLOG_WARN(
+        "[cp-draw] draws={} ({}/s) suppressed={} ({:.0f}%) memexport={} depthonly={} "
+        "draw={:.0f}ms ({:.1f}% of window) | resolves={} suppressed={} resolve={:.0f}ms",
+        d, double(d) / secs, ds, d ? 100.0 * double(ds) / double(d) : 0.0, dm, dd,
+        double(du) / 1000.0, double(du) / (secs * 10000.0), c, cs, double(cu) / 1000.0);
+  }
   g_cp_summary = CpSummary{};
   g_cp_summary.last_report = now;
 }
