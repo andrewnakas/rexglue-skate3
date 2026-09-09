@@ -543,11 +543,24 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
 }
 
 u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
-  // Which handle, and from which thread. A stalled title is a thread waiting on
-  // an event nobody sets, and the wait side is already reported by the thread
-  // dump - this is the other half of that pairing, and neither event calls nor
-  // waits were logged at all before.
-  REXKRNL_DEBUG("NtSetEvent(handle={:08X})", handle);
+  // Handle plus the guest return address of the caller. The title is not
+  // deadlocked - it signals events about fifty times a second while making no
+  // visible progress - so the useful question is not "which event" but "which
+  // guest code keeps doing this". lr resolves against the generated sources the
+  // same way the thread dumps do.
+  {
+    static std::atomic<uint64_t> n{0};
+    const uint64_t i = n.fetch_add(1, std::memory_order_relaxed);
+    if (i < 40 || (i % 1000) == 0) {
+      uint32_t caller = 0;
+      if (auto* ts = rex::runtime::ThreadState::Get()) {
+        if (const auto* c = ts->context()) {
+          caller = uint32_t(c->lr);
+        }
+      }
+      REXKRNL_DEBUG("NtSetEvent(handle={:08X}) from guest lr={:08X} (#{})", handle, caller, i);
+    }
+  }
   return xeNtSetEvent(handle, previous_state_ptr);
 }
 
