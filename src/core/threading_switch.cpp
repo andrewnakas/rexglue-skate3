@@ -228,8 +228,14 @@ void ApplyPlacementForThread(Handle handle, std::string_view name) {
   }
   // At warn, because the shipped log level is warn and a run that cannot show
   // where its threads went cannot explain its own frame rate.
+  // Report the mask that was actually applied, including for a single-core
+  // pin - it read as 0x0 before, which looks like "no cores at all".
+  const u32 applied_mask = p.any_core ? kAllCoresMask
+                           : p.core_mask ? (p.core_mask & kAllCoresMask)
+                           : p.core >= 0 ? (1u << p.core)
+                                         : 0u;
   REXLOG_WARN("[thread] placed '{}' core={} mask=0x{:x} prio={}", name,
-              p.any_core ? -1 : p.core, p.any_core ? kAllCoresMask : p.core_mask, p.priority);
+              p.any_core ? -1 : p.core, applied_mask, p.priority);
 }
 
 void ApplyPlacementForCurrentThreadName(std::string_view name) {

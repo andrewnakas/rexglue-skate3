@@ -424,6 +424,13 @@ struct CpSummary {
 };
 CpSummary g_cp_summary;
 
+// Per-opcode cost of the guest's command stream. Draws and resolves together
+// account for five per cent of this thread while it is ninety-nine per cent
+// busy, so the work is in the packet handlers themselves and the only way to
+// find out which is to time all of them and let the biggest speak up.
+std::atomic<uint64_t> g_op_us[128] = {};
+std::atomic<uint64_t> g_op_count[128] = {};
+
 // Defined in the Vulkan command processor: what the emulated path still
 // executes while the native renderer is replacing the frame.
 extern "C" {
@@ -492,6 +499,31 @@ void CommandProcessor::ReportCpSummary() {
         "draw={:.0f}ms ({:.1f}% of window) | resolves={} suppressed={} resolve={:.0f}ms",
         d, double(d) / secs, ds, d ? 100.0 * double(ds) / double(d) : 0.0, dm, dd,
         double(du) / 1000.0, double(du) / (secs * 10000.0), c, cs, double(cu) / 1000.0);
+  }
+  {
+    // The five most expensive opcodes this window, by time. Names would need a
+    // table that does not exist here; the opcode number is enough to look up.
+    struct Op { uint32_t op; uint64_t us; uint64_t n; };
+    Op top[5] = {};
+    uint64_t total_op_us = 0;
+    for (uint32_t i = 0; i < 128; ++i) {
+      const uint64_t us = g_op_us[i].exchange(0, std::memory_order_relaxed);
+      const uint64_t n = g_op_count[i].exchange(0, std::memory_order_relaxed);
+      total_op_us += us;
+      if (us > top[4].us) {
+        top[4] = Op{i, us, n};
+        for (int j = 4; j > 0 && top[j].us > top[j - 1].us; --j) {
+          std::swap(top[j], top[j - 1]);
+        }
+      }
+    }
+    std::string line;
+    for (const Op& o : top) {
+      if (o.us == 0) break;
+      line += fmt::format("op{:02X}={:.0f}ms/{} ", o.op, double(o.us) / 1000.0, o.n);
+    }
+    REXLOG_WARN("[cp-op] packets={:.0f}ms ({:.1f}% of window) | top: {}",
+                double(total_op_us) / 1000.0, double(total_op_us) / (secs * 10000.0), line);
   }
   g_cp_summary = CpSummary{};
   g_cp_summary.last_report = now;
@@ -1168,6 +1200,19 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   }
 
   bool result = false;
+  // Timed by opcode. RAII so every early return inside the switch is counted.
+  struct OpTimer {
+    uint32_t op;
+    std::chrono::steady_clock::time_point t0;
+    ~OpTimer() {
+      g_op_us[op & 0x7F].fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count()),
+          std::memory_order_relaxed);
+      g_op_count[op & 0x7F].fetch_add(1, std::memory_order_relaxed);
+    }
+  } op_timer{opcode, std::chrono::steady_clock::now()};
   switch (opcode) {
     case PM4_ME_INIT:
       result = ExecutePacketType3_ME_INIT(reader, packet, count);
