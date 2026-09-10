@@ -167,6 +167,10 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
   // content_root/xuid/title_id/type_name/*
   auto package_root = ResolvePackageRoot(xuid, content_type, title_id);
   auto file_infos = rex::filesystem::ListFiles(package_root);
+  // Where it looked and what it found. A title that reports missing content
+  // gives no clue whether the folder was wrong, the title id was wrong, or the
+  // packages inside were rejected, and those are three different mistakes.
+  REXLOG_WARN("[content] list {} -> {} entr(y/ies)", package_root.string(), file_infos.size());
   for (const auto& file_info : file_infos) {
     if (file_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
       // Directories only.
@@ -176,8 +180,12 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     XCONTENT_AGGREGATE_DATA content_data;
     if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
                                          content_type, content_data))) {
+      REXLOG_WARN("[content]   '{}' from its header, device={}",
+                  rex::path_to_utf8(file_info.name), uint32_t(content_data.device_id));
       result.emplace_back(std::move(content_data));
     } else {
+      REXLOG_WARN("[content]   '{}' synthesised (no header in the Headers dir), device={}",
+                  rex::path_to_utf8(file_info.name), device_id);
       content_data.device_id = device_id;
       content_data.content_type = content_type;
       content_data.set_display_name(rex::path_to_utf16(file_info.name));

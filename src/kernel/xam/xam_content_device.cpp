@@ -90,6 +90,12 @@ u32 XamContentGetDeviceState_entry(u32 device_id, mapped_void overlapped_ptr) {
   // presents as a black screen after Start, with the render thread spinning in
   // its ring poll and no new draws ever submitted.
   if (device_info == nullptr) {
+    // This is the answer that makes a title say the storage device was
+    // removed. Only two device ids exist here (HDD=1, ODD=2); anything else
+    // reports as unplugged, so a content entry carrying a different id takes
+    // the title straight back to the press-start screen.
+    REXKRNL_WARN("[content] device state asked for unknown device id {} -> NOT CONNECTED",
+                 device_id);
     if (overlapped_ptr) {
       REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(
           []() {}, overlapped_ptr.guest_address(), X_ERROR_FUNCTION_FAILED,

@@ -223,6 +223,19 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
       *disposition_ptr = static_cast<uint32_t>(disposition);
     }
 
+    // Say what happened, at warn. A title that cannot open its downloadable
+    // content does not report which package or why - Skate 3 says only that
+    // "the storage device containing the downloadable content was removed" and
+    // returns to the press-start screen, which is the same sentence for a
+    // missing folder, a header it could not parse, and a device id it did not
+    // recognise. Those need different fixes.
+    REXKRNL_WARN(
+        "[content] open '{}' title={:08X} type={:08X} device={} flags={:X} -> disposition={} "
+        "result={:08X}",
+        root_name, uint32_t(content_data.title_id),
+        uint32_t(XContentType(content_data.content_type)), uint32_t(content_data.device_id), flags,
+        uint32_t(disposition), uint32_t(result));
+
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);
     return result;
@@ -264,6 +277,11 @@ u32 XamContentOpenFile_entry(u32 user_index, mapped_string root_name, mapped_str
                              mapped_u32 disposition_ptr, mapped_u32 license_mask_ptr,
                              mapped_void overlapped_ptr) {
   // TODO(gibbed): arguments assumed based on XamContentCreate.
+  // Unimplemented, and it returns "no such file" - so if a title reaches for
+  // its content this way it is told the content is not there, which is one of
+  // the shapes the missing-DLC complaint can take. Worth knowing whether it is
+  // ever called before implementing anything.
+  REXKRNL_WARN("[content] XamContentOpenFile is unimplemented - returning not-found");
   return X_ERROR_FILE_NOT_FOUND;
 }
 
