@@ -2615,9 +2615,46 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+// Phase timing for the swap. XE_SWAP measured ninety-six milliseconds a call
+// while the native renderer recorded its commands in three and a half, so most
+// of the swap is something else - and "something else" here is several quite
+// different things: waiting for the previous submission, resolving the guest's
+// front buffer through the texture cache, submitting, and presenting.
+extern "C" {
+std::atomic<uint64_t> rex_diag_swap_calls{0};
+std::atomic<uint64_t> rex_diag_swap_begin_us{0};
+std::atomic<uint64_t> rex_diag_swap_tex_us{0};
+std::atomic<uint64_t> rex_diag_swap_native_us{0};
+std::atomic<uint64_t> rex_diag_swap_end_us{0};
+std::atomic<uint64_t> rex_diag_swap_refresh_us{0};
+std::atomic<uint64_t> rex_diag_swap_total_us{0};
+}
+
+// Free function, not a lambda: one of the call sites is inside the presenter's
+// own callback, which captures nothing.
+static void rex_mark(std::atomic<uint64_t>& sink,
+                     std::chrono::steady_clock::time_point from) {
+  sink.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - from)
+                              .count()),
+                 std::memory_order_relaxed);
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  const auto rex_swap_t0 = std::chrono::steady_clock::now();
+  struct RexSwapTimer {
+    std::chrono::steady_clock::time_point t0;
+    ~RexSwapTimer() {
+      rex_diag_swap_total_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count()),
+          std::memory_order_relaxed);
+      rex_diag_swap_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+  } rex_swap_timer{rex_swap_t0};
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2632,7 +2669,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   LogGpuClockTelemetry();
 
   // In case the swap command is the only one in the frame.
-  if (!BeginSubmission(true)) {
+  const auto rex_begin_t0 = std::chrono::steady_clock::now();
+  const bool rex_begin_ok = BeginSubmission(true);
+  rex_mark(rex_diag_swap_begin_us, rex_begin_t0);
+  if (!rex_begin_ok) {
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
   }
@@ -2719,9 +2759,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
   xenos::TextureFormat frontbuffer_format;
   bool swap_source_needs_rb_swap = false;
+  const auto rex_tex_t0 = std::chrono::steady_clock::now();
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
+  rex_mark(rex_diag_swap_tex_us, rex_tex_t0);
   if (swap_texture_view == VK_NULL_HANDLE) {
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
@@ -2820,6 +2862,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   const bool native_wide_output = ApplyNativeGuestOutputWideAspect(
       guest_output_width, guest_output_height, display_width, display_height);
 
+  const auto rex_refresh_t0 = std::chrono::steady_clock::now();
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
@@ -2878,7 +2921,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           // Attribute the native pass's GPU time to its own profile bucket
           // (it otherwise smears into the last emulated draw's bucket).
           BeginGpuTimestampedRegion(rex::perf::DrawBucket::kNativeScene);
-          if (TryRenderNativeGuestOutput(native_context)) {
+          const auto rex_native_t0 = std::chrono::steady_clock::now();
+          const bool rex_native_ok = TryRenderNativeGuestOutput(native_context);
+          rex_mark(rex_diag_swap_native_us, rex_native_t0);
+          if (rex_native_ok) {
             NativeRhiEndFrame(native_rhi_device_);
             // Need to submit all the commands before giving the image back
             // to the presenter (it submits its own for displaying it), and
@@ -3409,6 +3455,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         EndSubmission(true);
         return true;
       });
+  rex_mark(rex_diag_swap_refresh_us, rex_refresh_t0);
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.

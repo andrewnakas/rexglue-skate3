@@ -442,6 +442,12 @@ extern std::atomic<uint64_t> rex_diag_cp_draw_us;
 extern std::atomic<uint64_t> rex_diag_cp_copies;
 extern std::atomic<uint64_t> rex_diag_cp_copies_suppressed;
 extern std::atomic<uint64_t> rex_diag_cp_copy_us;
+extern std::atomic<uint64_t> rex_diag_swap_calls;
+extern std::atomic<uint64_t> rex_diag_swap_begin_us;
+extern std::atomic<uint64_t> rex_diag_swap_tex_us;
+extern std::atomic<uint64_t> rex_diag_swap_native_us;
+extern std::atomic<uint64_t> rex_diag_swap_refresh_us;
+extern std::atomic<uint64_t> rex_diag_swap_total_us;
 }
 
 }  // namespace
@@ -524,6 +530,26 @@ void CommandProcessor::ReportCpSummary() {
     }
     REXLOG_WARN("[cp-op] packets={:.0f}ms ({:.1f}% of window) | top: {}",
                 double(total_op_us) / 1000.0, double(total_op_us) / (secs * 10000.0), line);
+  }
+  {
+    // The swap, broken into its parts. Everything the frame waits on is in
+    // here somewhere, and until now "XE_SWAP costs 96 ms" was as far as it
+    // could be narrowed.
+    const uint64_t n = rex_diag_swap_calls.exchange(0, std::memory_order_relaxed);
+    const auto per = [n](std::atomic<uint64_t>& a) {
+      const uint64_t v = a.exchange(0, std::memory_order_relaxed);
+      return n ? double(v) / double(n) / 1000.0 : 0.0;
+    };
+    const double begin_ms = per(rex_diag_swap_begin_us);
+    const double tex_ms = per(rex_diag_swap_tex_us);
+    const double native_ms = per(rex_diag_swap_native_us);
+    const double refresh_ms = per(rex_diag_swap_refresh_us);
+    const double total_ms = per(rex_diag_swap_total_us);
+    REXLOG_WARN(
+        "[cp-swap] {} swaps, {:.1f}ms each: begin={:.1f} swaptex={:.1f} refresh={:.1f} "
+        "(native={:.1f}, present={:.1f}) other={:.1f}",
+        n, total_ms, begin_ms, tex_ms, refresh_ms, native_ms,
+        refresh_ms - native_ms, total_ms - begin_ms - tex_ms - refresh_ms);
   }
   g_cp_summary = CpSummary{};
   g_cp_summary.last_report = now;
