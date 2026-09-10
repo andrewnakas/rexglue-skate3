@@ -64,6 +64,7 @@
 // Defined by the presenter; shared so one spurious MoltenVK device loss is
 // budgeted the same way on both sides of the GPU.
 REXCVAR_DECLARE(int32_t, vulkan_device_lost_soft_retries);
+REXCVAR_DECLARE(double, native_render_output_scale);
 
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
@@ -2803,6 +2804,31 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             ? frontbuffer_height_scaled
             : (frontbuffer_height ? frontbuffer_height : frontbuffer_height_unscaled);
   }
+  // Render the frame smaller and let the presenter scale it up. It already
+  // takes the guest output size and the display size as separate arguments and
+  // scales between them, so the whole chain follows this one number: the
+  // native renderer sizes its targets, viewport and scissor from the guest
+  // output, and the emulated blit samples rather than copies.
+  //
+  // This is the last big lever when the GPU is executing the frame rather than
+  // the CPU building it, which is where this port ended up: present measured
+  // fifty milliseconds against three and a half to record the commands, and
+  // raising the GPU clock moved it in proportion.
+  {
+    const double out_scale = REXCVAR_GET(native_render_output_scale);
+    if (out_scale > 0.0 && out_scale < 0.999 && guest_output_width && guest_output_height) {
+      // Even dimensions, and never smaller than something a sampler can work
+      // with - a zero here would take the swapchain down.
+      const auto scale_dim = [out_scale](uint32_t v) {
+        uint32_t out = uint32_t(double(v) * out_scale + 0.5);
+        out &= ~1u;
+        return std::max(64u, out);
+      };
+      guest_output_width = scale_dim(guest_output_width);
+      guest_output_height = scale_dim(guest_output_height);
+    }
+  }
+
   bool swap_source_scaled = frontbuffer_width_unscaled && frontbuffer_height_unscaled &&
                             (frontbuffer_width_scaled != frontbuffer_width_unscaled ||
                              frontbuffer_height_scaled != frontbuffer_height_unscaled);

@@ -16,6 +16,17 @@ REXCVAR_DEFINE_BOOL(native_render_suppress_emulated_draws, true, "GPU",
                     "normally.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_DOUBLE(
+    native_render_output_scale, 1.0, "GPU",
+    "Render the guest output at this fraction of its normal size and let the "
+    "presenter scale it back up for display. 1.0 is native. 0.7 is about half "
+    "the pixels, 0.5 a quarter. This is the lever that matters when the GPU is "
+    "executing the frame rather than the CPU building it; it costs sharpness "
+    "and nothing else, and it scales the native renderer's targets, viewport "
+    "and scissor along with it.")
+    .range(0.25, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(native_render_suppress_mode, 2, "GPU",
                      "Which emulated passes to suppress while the native guest-output "
                      "renderer is active. 0 = framebuffer-sized passes only (surface "
