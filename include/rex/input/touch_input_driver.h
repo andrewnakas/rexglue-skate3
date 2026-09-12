@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 
 #include <rex/input/input_driver.h>
 
@@ -39,7 +40,34 @@ enum class TouchControlId : uint32_t {
   kDPadDown,
   kDPadLeft,
   kDPadRight,
+  // Opens the recomp settings. NOT a guest button: it presses nothing and the
+  // game never sees it.
+  //
+  // The settings were reachable only by the RB + Start chord, which on a
+  // touchscreen means hitting two on-screen buttons at opposite corners at the
+  // same instant. It works, and nobody discovers it. A tester's first question
+  // about the settings menu was where several of its features had gone; the
+  // answer for a phone player was that the menu itself was most of the way to
+  // hidden.
+  kMenu,
   kCount,
+};
+
+// What a control is drawn AS. The four direction glyphs, the Start bars and
+// the Back chevron used to be Unicode in the label - and the ImGui default
+// font has none of those code points, so six of the sixteen controls came out
+// as literal question marks on every phone. Visible in the first screenshot
+// anyone sent. Shapes are drawn, so there is no font to be missing.
+enum class TouchGlyph : uint32_t {
+  kNone,      // sticks: the well and thumb pad
+  kLabel,     // draw `label` as text (A/B/X/Y/LB/RB/LT/RT - all plain ASCII)
+  kUp,
+  kDown,
+  kLeft,
+  kRight,
+  kStart,     // two horizontal bars
+  kBack,      // a left-pointing chevron
+  kMenu,      // a gear
 };
 
 struct TouchControl {
@@ -53,12 +81,51 @@ struct TouchControl {
   const char* label;
   // Sticks report an axis; everything else is a button.
   bool is_stick;
+  TouchGlyph glyph = TouchGlyph::kLabel;
 };
 
 // The layout, in draw order. Sized for a phone held in landscape: sticks under
 // the thumbs, face buttons within reach above the right stick, shoulders and
 // triggers along the top edge where the index fingers rest.
+//
+// The shipped arrangement is a starting point, not a verdict: it was drawn for
+// one phone and the first thing testers asked for was to move things. Whatever
+// the player has saved is overlaid here, so the hit test and the renderer
+// still read one table and still cannot disagree about where a control is.
 const TouchControl* TouchLayout(size_t* count_out);
+
+// ---- Player layout -------------------------------------------------------
+//
+// Positions and sizes only. Which controls exist, what they do and the order
+// they draw in stay in code, because none of those are a matter of taste and
+// a file that could change them is a file that can break the pad.
+
+// Where the layout is stored. Set once at startup from the user data root;
+// until then nothing is loaded and nothing is saved.
+void SetTouchLayoutPath(const char* path);
+
+// Replace one control's placement. Fractions, in the same units as the table.
+// Out-of-range values are clamped so a control cannot be put off-screen.
+void SetTouchControlPlacement(TouchControlId id, float centre_x, float centre_y,
+                              float radius);
+
+// Back to the shipped arrangement, in memory and on disk.
+void ResetTouchLayout();
+
+// Write the current layout out. Called when the editor is dismissed.
+bool SaveTouchLayout();
+
+// ---- Layout editing ------------------------------------------------------
+//
+// While this is on, the driver presses nothing: a finger moves the control it
+// lands on instead. The guest sees no input at all, which is the point - you
+// cannot rearrange a pad while the pad is playing the game.
+void SetTouchLayoutEditing(bool editing);
+bool TouchLayoutEditing();
+
+// Which control the editor is holding, or kCount for none. The overlay reads
+// it to highlight what is being moved.
+TouchControlId TouchLayoutHeldControl();
 
 // What the overlay needs to render: which controls are held, and how far each
 // stick has been pushed (-1..1, y up).
@@ -68,6 +135,11 @@ struct TouchVisualState {
   float right_x = 0.0f, right_y = 0.0f;
   // False while a real controller is attached - the overlay hides itself.
   bool active = false;
+  // The layout editor is open: the overlay draws the controls as movable and
+  // the pad reports nothing.
+  bool editing = false;
+  // While editing, the control a finger is currently dragging.
+  TouchControlId held = TouchControlId::kCount;
 };
 
 TouchVisualState GetTouchVisualState();
@@ -79,6 +151,11 @@ bool TouchControlsActive();
 // Tells the touch driver whether a physical controller is present. Called by
 // the gamepad driver as controllers come and go.
 void SetPhysicalControllerConnected(bool connected);
+
+// What the on-screen menu button does. Fired on release, from the SDL event
+// thread, so the handler must hop to the UI thread itself - the app's own
+// chord callbacks already do.
+void SetMenuButtonCallback(std::function<void()> callback);
 
 class TouchInputDriver final : public InputDriver {
  public:

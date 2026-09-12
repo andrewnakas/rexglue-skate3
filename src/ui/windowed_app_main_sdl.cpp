@@ -928,6 +928,20 @@ std::vector<std::string> BuildAndroidArguments() {
         "skate3_guest_fps_cap_auto",
         "skate3_ultrawide",
         "skate3_ultrawide_target_aspect",
+        // The audio and interface rows belong here too, and their absence was
+        // the same bug wearing different clothes. Audio Buffer Size in
+        // particular looked simply broken: the menu wrote the player's choice
+        // to settings.toml, the "--audio_device_sample_frames=512" above put it
+        // straight back at the next launch, and the row showed 512 again with
+        // no explanation. Reported from an Odin2 as the setting being
+        // unchangeable, which from the outside is exactly what it was.
+        "audio_device_sample_frames",
+        "audio_mute",
+        "user_language",
+        "skate3_field_of_view",
+        "skate3_native_render_scene_shadows",
+        "skate3_native_render_scene_shadow_tile",
+        "skate3_native_render_scene_shadow_static_casters",
     };
     std::string settings;
     {

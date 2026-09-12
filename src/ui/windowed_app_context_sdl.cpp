@@ -6,6 +6,34 @@
 
 #include <cstdlib>
 
+
+namespace {
+
+// One line per suspend and resume, at WARN so it survives the shipped log
+// level and lands in a diagnostic report.
+//
+// A returning-from-the-task-switcher freeze is reported as the game being
+// paused with the menus still working, and no log has ever been able to say
+// which half stopped. Stamping the guest swap count on both sides of a suspend
+// settles it: the same number on the way out and the way back means the guest
+// never resumed, a rising one means it did and the problem is the picture.
+void LogLifecycle(const char* what) {
+  static uint64_t last_swaps = 0;
+  static uint32_t suspends = 0;
+  static uint32_t resumes = 0;
+  const uint64_t swaps = rex::graphics::GuestSwapCount();
+  if (what[0] == 's') {
+    ++suspends;
+  } else {
+    ++resumes;
+  }
+  REXLOG_WARN("[lifecycle] {}: guest swaps {} (+{} since the last event), {} suspends / {} resumes",
+              what, swaps, swaps - last_swaps, suspends, resumes);
+  last_swaps = swaps;
+}
+
+}  // namespace
+
 namespace rex {
 namespace ui {
 
@@ -50,6 +78,7 @@ int SDLWindowedAppContext::RunMainLoop() {
   // being queued and arriving too late to matter, not going missing.
   SDL_AddEventWatch(
       [](void* userdata, SDL_Event* event) -> bool {
+
         auto* context = static_cast<SDLWindowedAppContext*>(userdata);
         switch (event->type) {
           case SDL_EVENT_WILL_ENTER_BACKGROUND:
@@ -66,6 +95,7 @@ int SDLWindowedAppContext::RunMainLoop() {
             // has to happen here in the watch rather than in DispatchEvent -
             // by the time a queued event is dispatched the app is already
             // suspended.
+            LogLifecycle("suspending");
             SDLWindow::SetAllSurfacesPresentable(false, "entering the background");
             // iOS revokes GPU access here; the command processor must stop
             // treating the resulting submit failures as a dead device.
@@ -98,16 +128,32 @@ int SDLWindowedAppContext::RunMainLoop() {
           // being idempotent, costs nothing.
           case SDL_EVENT_WILL_ENTER_FOREGROUND:
           case SDL_EVENT_DID_ENTER_FOREGROUND:
+            LogLifecycle(event->type == SDL_EVENT_DID_ENTER_FOREGROUND ? "resuming (did)"
+                                                                       : "resuming (will)");
             SDLWindow::SetAllSurfacesPresentable(true, "returning to the foreground");
             rex::graphics::SetAppForeground(true);
 #if REX_PLATFORM_ANDROID
-            // Only on DID: SDL resumes its thread after the activity's
-            // surfaceChanged has stored the recreated ANativeWindow, so by the
-            // time this event is seen the new pointer is in the window
-            // property and a fresh VkSurfaceKHR can be built from it.
-            if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
-              SDLWindow::ReattachAllSurfaces("returning to the foreground");
-            }
+            // BOTH, for the same reason the gate above handles both.
+            //
+            // This used to run on DID only, because SDL resumes its thread
+            // after the activity's surfaceChanged has stored the recreated
+            // ANativeWindow and DID is the first point the new pointer is
+            // certainly there. That reasoning is right about the ordering and
+            // wrong about the risk: DID is the event the comment fifteen lines
+            // up records as unreliable - ten suspends against five resumes,
+            // measured on device - and a resume that arrives only as WILL left
+            // the presenter unbound for good. Presentation was allowed again,
+            // nothing was ever presented, and the app sat there looking frozen
+            // while its menus still answered, which is exactly how an Odin2
+            // described returning from the task switcher.
+            //
+            // ReattachAllSurfaces is idempotent and does nothing without an
+            // ANativeWindow to attach to, so running it on WILL costs a no-op
+            // in the case where the pointer is not back yet - and DID, when it
+            // comes, runs it again and succeeds.
+            SDLWindow::ReattachAllSurfaces(event->type == SDL_EVENT_DID_ENTER_FOREGROUND
+                                               ? "returning to the foreground"
+                                               : "returning to the foreground (early)");
 #endif
             break;
           default:

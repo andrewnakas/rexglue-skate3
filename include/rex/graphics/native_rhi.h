@@ -559,6 +559,25 @@ class Device {
   // than assuming from the platform.
   virtual bool SupportsSampledTextureFormat(Format format) = 0;
 
+  // Whether the device can draw INTO this format, which is a different
+  // question from sampling it and has a different answer. Vulkan guarantees
+  // colour-attachment support for a short list of formats, and R16G16_UNORM -
+  // which both shadow maps use - is not on it. Nothing was asking, so a device
+  // that lacks it produced a shadow pass that wrote nothing and surfaces that
+  // came out uniformly lit, with no error anywhere.
+  virtual bool SupportsRenderTargetFormat(Format format) = 0;
+
+  // Largest square 2D image the device will accept, in texels, already
+  // narrowed to what can also be used as a framebuffer attachment.
+  //
+  // Worth its own entry point because the number is not a constant and the
+  // code that needed it was guessing. The three-tile static sun-shadow map is
+  // built three times wider than its per-tile setting, so the top setting asks
+  // for 24576 texels of width against the 16384 an Adreno 740 allows; the
+  // clamp that existed was written for D3D12's cap and was skipped entirely on
+  // Vulkan, where the oversized image is undefined rather than refused.
+  virtual uint32_t MaxTextureDimension2D() const = 0;
+
   // The command processor's monotonic submission counters: the basis of all
   // lifetime/readback gating.
   virtual uint64_t CurrentSubmission() const = 0;

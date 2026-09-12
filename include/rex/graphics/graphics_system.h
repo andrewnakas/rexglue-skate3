@@ -52,6 +52,19 @@ class CommandProcessor;
 // a broken device and it resolves the moment the app is foreground again, so
 // the GPU layer needs to know which it is rather than counting failures.
 void SetAppForeground(bool foreground);
+
+// Counts guest swaps. Bumped once per VdSwap, i.e. once per frame the GUEST
+// actually finished - which is a different question from whether the host is
+// painting, and telling the two apart is the whole point.
+//
+// Returning from the Android task switcher was reported as the game being
+// "frozen... as if the emulation is paused with no way to resume", with the
+// settings menu still opening. Those two facts together say the host is alive
+// and the guest is not, but nothing in any log said so, and the difference
+// decides whether the bug is in the surface handling or somewhere the guest
+// waits. Reading this before and after a suspend answers it in one line.
+void NoteGuestSwap();
+uint64_t GuestSwapCount();
 bool IsAppForeground();
 
 class GraphicsSystem : public system::IGraphicsSystem {

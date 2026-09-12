@@ -183,12 +183,17 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 37> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 39> kOptionalSimpleSettingsCvars = {
+    // Which map pack is staged. Written by the level picker rather than by a
+    // row here, but it has to survive the relaunch that applies it, and this
+    // list is what gets written to the settings file.
+    "skate3_content_pack",
     "skate3_diagnostics",
     "skate3_native_render_scene_tex_store_mb",
     "menu_scale",
     "touch_controls",
     "touch_stick_size",
+    "touch_opacity",
     "skate3_native_render_scene",
     "skate3_native_render_scene_msaa",
     "skate3_native_render_scene_shadows",
@@ -229,6 +234,11 @@ constexpr std::array<const char*, 6> kMenuScaleLabels = {"Small", "Normal", "Lar
 constexpr std::array<double, 6> kMenuScales = {0.8, 1.0, 1.2, 1.4, 1.7, 2.0};
 
 // On-screen thumbstick size, as a multiple of the original.
+// On-screen control opacity, as a multiple of the drawn alpha.
+constexpr std::array<const char*, 5> kTouchOpacityLabels = {
+    "Invisible", "Faint", "Normal", "Clear", "Solid"};
+constexpr std::array<double, 5> kTouchOpacities = {0.0, 0.6, 1.0, 1.4, 1.8};
+
 constexpr std::array<const char*, 5> kTouchStickLabels = {"Small", "Normal", "Large",
                                                           "Larger", "Huge"};
 constexpr std::array<double, 5> kTouchStickSizes = {0.85, 1.0, 1.25, 1.5, 1.8};
@@ -244,11 +254,47 @@ constexpr std::array<const char*, 6> kShadowQualityLabels = {
     "Off", "Auto", "512 (console)", "1024", "1536", "2048"};
 constexpr std::array<int32_t, 6> kShadowQualityTiles = {0, 0, 512, 1024, 1536, 2048};
 
-// Enhanced (static sun) shadow map resolution per cascade tile.
-constexpr std::array<const char*, 4> kStaticShadowResLabels = {"1024", "2048",
-                                                               "4096", "8192"};
+// Enhanced (static sun) shadow map resolution per cascade tile. The labels
+// that went with these are gone: the sizes are still what gets written to the
+// cvar and what the preset table indexes, but nobody picks one by number any
+// more - see kShadowLevels below.
 constexpr std::array<int32_t, 4> kStaticShadowResSizes = {1024, 2048, 4096,
                                                           8192};
+
+// The one shadow setting a player sees, as matched pairs of the two maps.
+//
+// Dynamic tile first (0 = auto, the game's 512 at the render scale), then the
+// static sun map's per-cascade size. They are paired rather than exposed
+// separately because they scale together in both cost and appearance: a large
+// static map behind a 512 dynamic atlas puts a crisp building shadow next to a
+// blocky skater shadow, which reads as a bug rather than as a setting.
+//
+// Memory is the static map, and it is not small - three cascades side by side
+// at 4 bytes a texel is 50 MB at 2048 and 200 MB at 4096, which is why the
+// steps stop where they do on anything but the top setting.
+struct ShadowLevel {
+  const char* label;
+  int32_t dynamic_tile;  // skate3_native_render_scene_shadow_tile (0 = auto)
+  int32_t static_size;   // skate3_native_render_scene_shadow_static_size
+};
+//
+// ORDER MATTERS: the static sizes must ascend, because the steps a device
+// cannot build are trimmed off the END of this list. Auto therefore sits at
+// index 1, next to Off, rather than at the bottom of the ramp where it reads
+// more naturally - putting it last would make it the first thing dropped on
+// exactly the devices that need it most.
+constexpr std::array<ShadowLevel, 6> kShadowLevels = {{
+    {"Off", 0, 1024},
+    {"Auto", 0, 2048},
+    {"Low (console)", 512, 1024},
+    {"Medium", 1024, 2048},
+    {"High", 2048, 4096},
+    {"Very High", 2048, 8192},
+}};
+constexpr std::array<const char*, 6> kShadowLevelLabels = {
+    "Off", "Auto", "Low (console)", "Medium", "High", "Very High"};
+// Auto's index, for the "no exact match" fallbacks.
+constexpr int kShadowLevelAuto = 1;
 
 // Draw distance: one multiplier applied to both the world detail cull and
 // the character LOD switch ranges (paired hot cvars in the app layer).
@@ -713,6 +759,73 @@ int StaticShadowResIndexFromCvar() {
   }
   return StaticShadowResIndexFrom(
       rex::cvar::Query<int32_t>("skate3_native_render_scene_shadow_static_size"));
+}
+
+// How many of the steps this device can actually build.
+//
+// The renderer publishes the largest per-cascade size it can allocate once it
+// has asked the device (0 before then, and before then nothing is trimmed -
+// the renderer's own clamp still catches an impossible request, it just does
+// it silently). Offering a step that degrades behind the player's back is what
+// made "Enhanced Shadow Resolution 8192" read as the shadows disappearing.
+int ShadowLevelCount() {
+  const int count = static_cast<int>(kShadowLevels.size());
+  if (!HasCvar("skate3_native_render_scene_shadow_static_size_max")) {
+    return count;
+  }
+  const int32_t ceiling =
+      rex::cvar::Query<int32_t>("skate3_native_render_scene_shadow_static_size_max");
+  if (ceiling <= 0) {
+    return count;
+  }
+  // Drop entries off the end while they ask for more than the device can
+  // build. Never below Off + Auto: those two are buildable everywhere, and a
+  // list with nothing in it would be worse than one that overreaches.
+  int usable = count;
+  while (usable > kShadowLevelAuto + 1 &&
+         kShadowLevels[usable - 1].static_size > ceiling) {
+    --usable;
+  }
+  return usable;
+}
+
+// Which step a (shadows, tile, static size) triple corresponds to. Exact pair
+// first, then the nearest by static size, so a config assembled by hand from
+// android_args.txt still shows as something rather than snapping to Off.
+int ShadowLevelIndexFrom(bool enabled, int32_t tile, int32_t static_size) {
+  if (!enabled) {
+    return 0;
+  }
+  for (int i = 1; i < static_cast<int>(kShadowLevels.size()); ++i) {
+    if (kShadowLevels[i].dynamic_tile == tile &&
+        kShadowLevels[i].static_size == static_size) {
+      return i;
+    }
+  }
+  if (tile <= 0) {
+    return kShadowLevelAuto;
+  }
+  // Nearest step at or below the dynamic tile size asked for. Skips Off and
+  // Auto, which are not points on the ramp.
+  int best = kShadowLevelAuto + 1;
+  for (int i = kShadowLevelAuto + 1; i < static_cast<int>(kShadowLevels.size()); ++i) {
+    if (kShadowLevels[i].dynamic_tile <= tile) {
+      best = i;
+    }
+  }
+  return best;
+}
+
+int ShadowLevelIndexFromCvar() {
+  if (!HasShadowQualityCvars()) {
+    return kShadowLevelAuto;
+  }
+  return ShadowLevelIndexFrom(
+      rex::cvar::Query<bool>("skate3_native_render_scene_shadows"),
+      rex::cvar::Query<int32_t>("skate3_native_render_scene_shadow_tile"),
+      HasStaticShadowCvars()
+          ? rex::cvar::Query<int32_t>("skate3_native_render_scene_shadow_static_size")
+          : 4096);
 }
 
 bool HasDrawDistanceCvars() {
@@ -1347,6 +1460,14 @@ void SimpleSettingsDialog::Show() {
   SetDrawActive(true);
   ReloadProfiles();
   LoadSettingsFromCvars();
+  // Taken ONCE per open, and only when nothing is already outstanding: a
+  // player who changed the render scale, closed the menu without restarting
+  // and came back should still be able to press Apply & Restart, and should
+  // revert to what the session actually booted with rather than to the
+  // half-applied state they left.
+  if (!restart_pending_) {
+    SnapshotRestartValues();
+  }
   zone_ = FocusZone::kRail;
   rail_sel_ = category_;
   row_index_ = 0;
@@ -1393,6 +1514,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   msaa_index_ = MsaaIndexFromCvar();
   shadow_quality_index_ = ShadowQualityIndexFromCvar();
   static_shadow_res_index_ = StaticShadowResIndexFromCvar();
+  shadow_level_index_ = ShadowLevelIndexFromCvar();
   monitor_index_ = MonitorIndexFromCvar();
   audio_buffer_index_ = AudioBufferIndexFromCvar();
   language_index_ = LanguageIndexFromCvar();
@@ -1425,6 +1547,10 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
   diagnostics_ = HasCvar("skate3_diagnostics") && rex::cvar::Query<bool>("skate3_diagnostics");
+  touch_opacity_index_ =
+      HasCvar("touch_opacity")
+          ? NearestValueIndex(kTouchOpacities, rex::cvar::Query<double>("touch_opacity"))
+          : 2;
   touch_controls_ = !HasCvar("touch_controls") || rex::cvar::Query<bool>("touch_controls");
   touch_stick_index_ =
       HasCvar("touch_stick_size")
@@ -1468,9 +1594,7 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
          frame_cap_index_ != FrameCapIndexFromCvar() ||
          (HasCvar("skate3_ultrawide") && aspect_ratio_index_ != AspectRatioIndexFromCvar()) ||
          (HasMsaaCvar() && msaa_index_ != MsaaIndexFromCvar()) ||
-         (HasShadowQualityCvars() && shadow_quality_index_ != ShadowQualityIndexFromCvar()) ||
-         (HasStaticShadowCvars() &&
-          static_shadow_res_index_ != StaticShadowResIndexFromCvar()) ||
+         (HasShadowQualityCvars() && shadow_level_index_ != ShadowLevelIndexFromCvar()) ||
          (HasCvar("monitor") && monitor_index_ != MonitorIndexFromCvar()) ||
          (HasCvar("audio_device_sample_frames") &&
           audio_buffer_index_ != AudioBufferIndexFromCvar()) ||
@@ -1510,6 +1634,11 @@ void SimpleSettingsDialog::Hide() {
   SaveVideo();
   video_dirty_ = false;
   video_dirty_age_ = 0.0f;
+  // restart_pending_ deliberately survives this. Closing the menu is not the
+  // same as applying a setting the game only reads at startup, and treating it
+  // as such is what made the prompt unreachable: the save above puts the
+  // staged values into the cvars, so without a flag of its own there is
+  // nothing left to say a restart is still owed.
   visible_ = false;
   editing_text_ = false;
   SetDrawActive(false);
@@ -1622,21 +1751,25 @@ void SimpleSettingsDialog::SaveVideo() {
                              std::to_string(kMsaaSamples[msaa_index_]));
   }
   if (HasShadowQualityCvars()) {
-    shadow_quality_index_ =
-        std::clamp(shadow_quality_index_, 0, static_cast<int>(kShadowQualityTiles.size()) - 1);
-    SetBoolCvar("skate3_native_render_scene_shadows", shadow_quality_index_ != 0);
-    if (shadow_quality_index_ != 0) {
+    // One step in, two cvars out. Clamped to what this device can build, so a
+    // setting carried over from a bigger machine's settings.toml lands on
+    // something real instead of being silently degraded by the renderer.
+    shadow_level_index_ =
+        std::clamp(shadow_level_index_, 0, ShadowLevelCount() - 1);
+    const ShadowLevel& level = kShadowLevels[shadow_level_index_];
+    SetBoolCvar("skate3_native_render_scene_shadows", shadow_level_index_ != 0);
+    if (shadow_level_index_ != 0) {
       rex::cvar::SetFlagByName("skate3_native_render_scene_shadow_tile",
-                               std::to_string(kShadowQualityTiles[shadow_quality_index_]));
+                               std::to_string(level.dynamic_tile));
+      if (HasStaticShadowCvars()) {
+        rex::cvar::SetFlagByName("skate3_native_render_scene_shadow_static_size",
+                                 std::to_string(level.static_size));
+      }
     }
-  }
-  if (HasStaticShadowCvars()) {
-    static_shadow_res_index_ = std::clamp(
-        static_shadow_res_index_, 0,
-        static_cast<int>(kStaticShadowResSizes.size()) - 1);
-    rex::cvar::SetFlagByName(
-        "skate3_native_render_scene_shadow_static_size",
-        std::to_string(kStaticShadowResSizes[static_shadow_res_index_]));
+    // Kept in step for the preset detector, which still reads them.
+    shadow_quality_index_ =
+        ShadowQualityIndexFrom(shadow_level_index_ != 0, level.dynamic_tile);
+    static_shadow_res_index_ = StaticShadowResIndexFrom(level.static_size);
   }
   if (HasCvar("monitor")) {
     monitor_index_ = std::clamp(monitor_index_, 0, static_cast<int>(kMonitorLabels.size()) - 1);
@@ -1658,6 +1791,50 @@ void SimpleSettingsDialog::SaveVideo() {
   SetBoolCvar("mnk_mode", mnk_mode_);
   SetBoolCvar("mnk_capture_mouse", mnk_capture_mouse_);
   SaveSimpleSettingsConfig(config_path_);
+  // Raised AFTER the write, comparing against what the menu opened with.
+  //
+  // Everything written above is now live in the cvars, so the staged-vs-live
+  // test can no longer tell that anything happened - which is why this exists.
+  // Only the rows the game reads once at startup count: changing V-Sync or the
+  // frame cap takes effect immediately and needs no restart, and claiming
+  // otherwise would leave the prompt up forever.
+  if (opening_.valid) {
+    restart_pending_ = restart_pending_ ||
+        resolution_scale_index_ != opening_.resolution_scale_index ||
+        msaa_index_ != opening_.msaa_index ||
+        shadow_level_index_ != opening_.shadow_level_index ||
+        aspect_ratio_index_ != opening_.aspect_ratio_index ||
+        language_index_ != opening_.language_index ||
+        audio_buffer_index_ != opening_.audio_buffer_index;
+  }
+}
+
+void SimpleSettingsDialog::SnapshotRestartValues() {
+  opening_.valid = true;
+  opening_.resolution_scale_index = resolution_scale_index_;
+  opening_.msaa_index = msaa_index_;
+  opening_.shadow_level_index = shadow_level_index_;
+  opening_.aspect_ratio_index = aspect_ratio_index_;
+  opening_.language_index = language_index_;
+  opening_.audio_buffer_index = audio_buffer_index_;
+}
+
+void SimpleSettingsDialog::RevertRestartValues() {
+  if (opening_.valid) {
+    resolution_scale_index_ = opening_.resolution_scale_index;
+    msaa_index_ = opening_.msaa_index;
+    shadow_level_index_ = opening_.shadow_level_index;
+    aspect_ratio_index_ = opening_.aspect_ratio_index;
+    language_index_ = opening_.language_index;
+    audio_buffer_index_ = opening_.audio_buffer_index;
+  }
+  // Clear FIRST: SaveVideo re-derives the flag from the snapshot, and the
+  // staged values now match it, so this write puts the cvars and the file
+  // back to where the menu opened and leaves nothing pending.
+  restart_pending_ = false;
+  video_dirty_ = false;
+  video_dirty_age_ = 0.0f;
+  SaveVideo();
 }
 
 int SimpleSettingsDialog::DetectGraphicsPreset() const {
@@ -1668,8 +1845,13 @@ int SimpleSettingsDialog::DetectGraphicsPreset() const {
     // without, say, the MSAA cvar, a preset should still be recognised rather
     // than silently reading as Custom forever.
     if (HasMsaaCvar() && msaa_index_ != p.msaa) continue;
-    if (HasShadowQualityCvars() && shadow_quality_index_ != p.shadow_quality) continue;
-    if (HasStaticShadowCvars() && static_shadow_res_index_ != p.static_shadow_res) continue;
+    if (HasShadowQualityCvars() &&
+        shadow_level_index_ != ShadowLevelIndexFrom(
+                                   p.shadow_quality != 0,
+                                   kShadowQualityTiles[p.shadow_quality],
+                                   kStaticShadowResSizes[p.static_shadow_res])) {
+      continue;
+    }
     if (resolution_scale_index_ != p.resolution_scale) continue;
     if (HasCvar("skate3_draw_distance_scale") && draw_distance_index_ != p.draw_distance) continue;
     if (HasCvar("skate3_native_render_scene_ssao") && ssao_ != p.ssao) continue;
@@ -1793,6 +1975,11 @@ void SimpleSettingsDialog::ApplyGraphicsPreset(int preset) {
   msaa_index_ = p.msaa;
   shadow_quality_index_ = p.shadow_quality;
   static_shadow_res_index_ = p.static_shadow_res;
+  // The merged Shadows row is what SaveVideo writes from, so a preset has to
+  // land on a step rather than on the two indices it used to set directly.
+  shadow_level_index_ = ShadowLevelIndexFrom(
+      p.shadow_quality != 0, kShadowQualityTiles[p.shadow_quality],
+      kStaticShadowResSizes[p.static_shadow_res]);
 
   // Hot settings: applied here, because their own rows apply on change rather
   // than through SaveVideo(). Each is guarded the same way its row is, so a
@@ -1841,8 +2028,15 @@ void SimpleSettingsDialog::SaveProfile() {
   ReloadProfiles();
 }
 
+void SimpleSettingsDialog::SaveSettingsNow() {
+  SaveSimpleSettingsConfig(config_path_);
+}
+
 void SimpleSettingsDialog::ApplyAndRestart() {
   SaveVideo();
+  // The restart is what satisfies it; a relaunch reloads from the file anyway,
+  // but clearing here keeps the prompt honest if the restart is declined.
+  restart_pending_ = false;
   if (restart_game_) {
     restart_game_();
   }
@@ -2041,40 +2235,55 @@ void SimpleSettingsDialog::PushMsaaRow(std::vector<RowSpec>& rows) {
   }
 }
 
+// ONE shadow row, not two.
+//
+// There used to be a "Shadow Quality" row for the dynamic cascade atlas and an
+// "Enhanced Shadow Resolution" row for the static sun map, and an Odin2 tester
+// asked the obvious question: "Why are there two shadow quality/resolution
+// sliders? I understand the technical intent behind it, but this is confusing
+// to users." They were right. The two are different maps and the distinction is
+// real, but it is the renderer's distinction, not something to make a player
+// hold in their head - and the pairing that looks right is not free to discover
+// by hand, because the wrong pair costs either sharpness or a lot of memory.
+//
+// So one row of matched pairs. Both cvars stay exactly as they were and can
+// still be set individually from android_args.txt when tuning.
 void SimpleSettingsDialog::PushShadowQualityRow(std::vector<RowSpec>& rows) {
-  if (HasShadowQualityCvars()) {
-    RowSpec row;
-    row.kind = RowSpec::kEnum;
-    row.label = "Shadow Quality";
-    row.desc =
-        "Dynamic character/prop shadow resolution in the native renderer. "
-        "Auto follows the Render Scale setting; 512 matches the original "
-        "game's shadow maps.";
-    for (size_t i = 0; i < kShadowQualityLabels.size(); ++i) {
-      if (i == 1) {
-        // Auto = the game's 512 tiles at the render resolution scale;
-        // the renderer sizes the atlas from its scaled output (see the
-        // shadow_tile cvar), so the label follows the Render Scale
-        // row's STAGED selection: both apply on restart, and changing
-        // the scale updates what Auto reads as immediately.
-        const int scale_index = std::clamp(
-            resolution_scale_index_, 0,
-            static_cast<int>(kResolutionScales.size()) - 1);
-        const uint32_t auto_tile = std::min(
-            512u * uint32_t(kResolutionScales[scale_index]), 4096u);
-        row.options.push_back("Auto (" + std::to_string(auto_tile) + ")");
-      } else {
-        row.options.push_back(kShadowQualityLabels[i]);
-      }
-    }
-    row.index = &shadow_quality_index_;
-    row.reset = [this] {
-      shadow_quality_index_ = ShadowQualityIndexFrom(
-          CvarDefaultBool("skate3_native_render_scene_shadows", true),
-          int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_tile", 0.0)));
-    };
-    rows.push_back(std::move(row));
+  if (!HasShadowQualityCvars()) {
+    return;
   }
+  RowSpec row;
+  row.kind = RowSpec::kEnum;
+  row.label = "Shadows";
+  const int levels = ShadowLevelCount();
+  for (int i = 0; i < levels; ++i) {
+    row.options.push_back(kShadowLevelLabels[i]);
+  }
+  // The top steps are dropped on a device that cannot build them, and the row
+  // says so rather than leaving a shorter list unexplained. The renderer
+  // publishes what it can actually allocate once it has asked the device;
+  // before it has, the list is untrimmed and the renderer's own clamp still
+  // catches an impossible request.
+  row.desc =
+      levels < static_cast<int>(kShadowLevelLabels.size())
+          ? "Shadow detail. Each step sets both shadow maps together: the "
+            "dynamic one that the skater and props cast into, and the larger "
+            "sun-aligned map that buildings and trees cast into. The highest "
+            "settings are missing because this device cannot build a shadow "
+            "map that large."
+          : "Shadow detail. Each step sets both shadow maps together: the "
+            "dynamic one that the skater and props cast into, and the larger "
+            "sun-aligned map that buildings and trees cast into. Higher is "
+            "sharper and costs video memory.";
+  row.index = &shadow_level_index_;
+  row.reset = [this] {
+    shadow_level_index_ = ShadowLevelIndexFrom(
+        CvarDefaultBool("skate3_native_render_scene_shadows", true),
+        int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_tile", 0.0)),
+        int32_t(CvarDefaultDouble("skate3_native_render_scene_shadow_static_size",
+                                  4096.0)));
+  };
+  rows.push_back(std::move(row));
 }
 
 void SimpleSettingsDialog::PushSsaoRow(std::vector<RowSpec>& rows) {
@@ -2304,6 +2513,68 @@ void SimpleSettingsDialog::PushTouchStickSizeRow(std::vector<RowSpec>& rows) {
   rows.push_back(std::move(row));
 }
 
+// Opacity and the layout editor.
+//
+// The shipped arrangement was drawn for one phone in one hand, and the first
+// thing testers asked for after playing on their own was to move things - an
+// alternative build with movable controls was linked in the shadows issue as
+// the reason to prefer it. The positions were a constant in the input driver,
+// so nobody could.
+void SimpleSettingsDialog::PushTouchLayoutRows(std::vector<RowSpec>& rows) {
+  if (HasCvar("touch_opacity")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Control Opacity";
+    row.desc =
+        "How visible the on-screen controls are. They are deliberately faint - "
+        "they sit over the game the whole time - but that can be too faint "
+        "against bright ground on some screens. Applies immediately.";
+    for (const char* label : kTouchOpacityLabels) {
+      row.options.push_back(label);
+    }
+    row.index = &touch_opacity_index_;
+    row.on_enum_change = [this](int value) {
+      value = std::clamp(value, 0, static_cast<int>(kTouchOpacities.size()) - 1);
+      rex::cvar::SetFlagByName("touch_opacity", std::to_string(kTouchOpacities[value]));
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      touch_opacity_index_ =
+          NearestValueIndex(kTouchOpacities, CvarDefaultDouble("touch_opacity", 1.0));
+      rex::cvar::SetFlagByName("touch_opacity",
+                               std::to_string(kTouchOpacities[touch_opacity_index_]));
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+  if (edit_touch_layout_) {
+    RowSpec row;
+    row.kind = RowSpec::kAction;
+    row.label = "Move the On-screen Controls";
+    row.desc =
+        "Closes this menu and lets you drag each control where you want it. "
+        "Two fingers on one control resizes it. Open the settings again to "
+        "finish; the arrangement is remembered.";
+    row.action = [this] {
+      // Hide() rather than leaving the menu up: the controls being arranged
+      // are underneath it, and half of them would be unreachable.
+      Hide();
+      if (edit_touch_layout_) {
+        edit_touch_layout_(true);
+      }
+    };
+    rows.push_back(std::move(row));
+  }
+  if (reset_touch_layout_) {
+    RowSpec row;
+    row.kind = RowSpec::kAction;
+    row.label = "Reset Control Positions";
+    row.desc = "Put every on-screen control back where it started.";
+    row.action = [this] { reset_touch_layout_(); };
+    rows.push_back(std::move(row));
+  }
+}
+
 void SimpleSettingsDialog::PushDiagnosticsRow(std::vector<RowSpec>& rows) {
   if (HasCvar("skate3_diagnostics")) {
     RowSpec row;
@@ -2336,7 +2607,7 @@ void SimpleSettingsDialog::PushDiagnosticsRow(std::vector<RowSpec>& rows) {
 
 void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
   rows.clear();
-  const bool pending = HasSettingsChanges();
+  const bool pending = HasPendingRestart();
 
   // Section bars only SEPARATE groups - a category's first group
   // starts directly with its rows, so a leading header is dropped.
@@ -2540,25 +2811,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      if (HasStaticShadowCvars()) {
-        RowSpec row;
-        row.kind = RowSpec::kEnum;
-        row.label = "Enhanced Shadow Resolution";
-        row.desc =
-            "Resolution per cascade of the enhanced shadow map. Higher is "
-            "sharper at distance but uses more video memory (roughly 50 MB "
-            "at 2048, 200 MB at 4096, 800 MB at 8192).";
-        for (const char* label : kStaticShadowResLabels) {
-          row.options.push_back(label);
-        }
-        row.index = &static_shadow_res_index_;
-        row.reset = [this] {
-          static_shadow_res_index_ = StaticShadowResIndexFrom(int32_t(
-              CvarDefaultDouble("skate3_native_render_scene_shadow_static_size",
-                                4096.0)));
-        };
-        rows.push_back(std::move(row));
-      }
+      // "Enhanced Shadow Resolution" used to be its own row here. It is the
+      // second half of the Shadows row above now - see PushShadowQualityRow.
       if (HasCvar("skate3_native_render_scene_shadow_pcss")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
@@ -2797,17 +3051,38 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         rows.push_back(std::move(row));
       }
 
+      // The three biggest levers, and only those.
+      //
+      // This page used to repeat the whole Video page underneath the readouts -
+      // preset, render scale, texture memory, frame cap, MSAA, shadows, ambient
+      // occlusion, bloom, volumetrics and draw distance, every one of them also
+      // one tab away. An Odin2 tester asked why, and the honest answer was that
+      // it had grown rather than been decided. The reason to have ANY settings
+      // next to a live frame time is to turn a knob and watch the number move,
+      // and three knobs cover almost all of that: the preset for a whole step
+      // up or down, the render scale for the single largest GPU cost, and the
+      // frame cap for what the numbers are being judged against. The rest are
+      // on Video, where they are not competing with a readout for attention.
       header("Quality");
       PushQualityPresetRow(rows);
       PushRenderScaleRow(rows);
-      PushTextureMemoryRow(rows);
       PushFrameCapRow(rows);
-      PushMsaaRow(rows);
-      PushShadowQualityRow(rows);
-      PushSsaoRow(rows);
-      PushBloomRow(rows);
-      PushVolumetricsRow(rows);
-      PushDrawDistanceRow(rows);
+      {
+        RowSpec row;
+        row.kind = RowSpec::kAction;
+        row.label = "More Video Settings\u2026";
+        row.desc =
+            "Shadows, antialiasing, ambient occlusion, draw distance and the "
+            "rest, on the Video page.";
+        row.action = [this] {
+          category_ = 0;
+          rail_sel_ = 0;
+          zone_ = FocusZone::kContent;
+          row_index_ = 0;
+          content_scroll_ = 0.0f;
+        };
+        rows.push_back(std::move(row));
+      }
 
       if (HasCvar("show_fps_counter")) {
         header("Overlay");
@@ -2820,6 +3095,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       // players have, and it was not reachable from the menu at all before.
       PushTouchControlsRow(rows);
       PushTouchStickSizeRow(rows);
+      PushTouchLayoutRows(rows);
       header("Mouse & Keyboard");
       if (kDesktopWindowing) {
         RowSpec row;
@@ -3221,9 +3497,10 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         RowSpec row;
         row.kind = RowSpec::kAction;
         row.label = "Revert Changes";
-        row.desc = "Discard the pending changes and go back to the current settings.";
+        row.desc = "Put the settings back to what they were when this menu was "
+                   "opened, including any that have already been saved.";
         row.enabled = pending;
-        row.action = [this] { LoadSettingsFromCvars(); };
+        row.action = [this] { RevertRestartValues(); };
         rows.push_back(std::move(row));
       }
       {
@@ -3677,7 +3954,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     clamp_focus_to_selectable();
   }
 
-  const bool pending = HasSettingsChanges();
+  const bool pending = HasPendingRestart();
 
   // ---- Layout ----
   // Positional metrics are snapped to whole pixels (see Snap).

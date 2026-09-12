@@ -417,12 +417,24 @@ void SDLWindow::DetachAllSurfaces(const char* reason) {
 }
 
 void SDLWindow::ReattachAllSurfaces(const char* reason) {
+  // Idempotent, because it is now called from both foreground events - see the
+  // watch in windowed_app_context_sdl.cpp. A window that already has its
+  // surface back is left alone: OnSurfaceChanged(true) tears the presenter's
+  // surface down before building a new one, so calling it on a healthy window
+  // would drop and rebuild a swapchain for nothing every time the app resumes.
+  int reattached = 0;
   for (auto& [window_id, window] : WindowMap()) {
+    if (window->HasSurface()) {
+      continue;
+    }
     window->OnSurfaceChanged(true);
     // Nothing else will ask: the paints requested while detached were dropped.
     window->RequestPaint();
+    ++reattached;
   }
-  REXLOG_INFO("surface reattached to every window: {}", reason);
+  if (reattached > 0) {
+    REXLOG_INFO("surface reattached to {} window(s): {}", reattached, reason);
+  }
 }
 #endif
 

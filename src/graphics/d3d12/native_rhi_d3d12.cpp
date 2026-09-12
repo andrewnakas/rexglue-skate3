@@ -934,6 +934,28 @@ class NrDeviceD3D12 : public nrhi::Device {
     return (support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0;
   }
 
+  bool SupportsRenderTargetFormat(Format format) override {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
+    support.Format = ToDxgi(format);
+    if (support.Format == DXGI_FORMAT_UNKNOWN) {
+      return false;
+    }
+    if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                            sizeof(support)))) {
+      return false;
+    }
+    constexpr UINT kNeeded =
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
+    return (support.Support1 & kNeeded) == kNeeded;
+  }
+
+  uint32_t MaxTextureDimension2D() const override {
+    // Fixed by the feature level rather than the adapter: every device this
+    // backend will run on is 11_0 or better, and D3D12_REQ_TEXTURE2D_U_OR_V_
+    // DIMENSION is 16384 for all of them.
+    return D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+  }
+
   uint32_t GetSupportedSampleCount(Format format, uint32_t desired) override {
     DXGI_FORMAT dxgi = ToDxgi(format);
     uint32_t count = desired;

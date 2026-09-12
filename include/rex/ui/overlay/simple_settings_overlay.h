@@ -66,6 +66,11 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   using CloseSettingsCallback = std::function<void()>;
   using CloseGameCallback = std::function<void()>;
   using RestartGameCallback = std::function<void()>;
+  // Turn the on-screen control layout editor on or off, and put the layout
+  // back to the shipped arrangement. Supplied by the app: the overlay knows
+  // what the rows should say, the app knows where the touch driver is.
+  using EditTouchLayoutCallback = std::function<void(bool editing)>;
+  using ResetTouchLayoutCallback = std::function<void()>;
   using PollGamepadCallback = std::function<SimpleSettingsGamepad()>;
   using PollPerfStatsCallback = std::function<SimpleSettingsPerfStats()>;
 
@@ -93,6 +98,16 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // -> closed. The Escape keybind routes here so Escape backs out level by
   // level instead of instantly closing.
   void NavigateBack();
+  void SetTouchLayoutCallbacks(EditTouchLayoutCallback edit,
+                               ResetTouchLayoutCallback reset) {
+    edit_touch_layout_ = std::move(edit);
+    reset_touch_layout_ = std::move(reset);
+  }
+  // Flush the settings file now, without waiting for the edit debounce or for
+  // the menu to close. For callers outside the menu that change a persisted
+  // cvar and then restart - the level picker naming a content pack, say -
+  // where the choice would otherwise be lost with the process.
+  void SaveSettingsNow();
   bool visible() const { return visible_; }
 
  protected:
@@ -106,6 +121,14 @@ class SimpleSettingsDialog final : public ImGuiDialog {
 
   void LoadSettingsFromCvars();
   bool HasSettingsChanges() const;
+  // Whether anything is waiting on a restart: a staged difference, or an
+  // already-saved restart-class change. What the Apply/Revert rows and the X
+  // shortcut are gated on.
+  bool HasPendingRestart() const { return HasSettingsChanges() || restart_pending_; }
+  // Records the live restart-class values, for Revert to go back to.
+  void SnapshotRestartValues();
+  // Puts them back and clears the pending flag.
+  void RevertRestartValues();
   void ReloadProfiles();
   void SaveVideo();
   // Writes a whole quality bundle at once: applies the hot cvars immediately
@@ -137,6 +160,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void PushMenuScaleRow(std::vector<RowSpec>& rows);
   void PushTouchControlsRow(std::vector<RowSpec>& rows);
   void PushTouchStickSizeRow(std::vector<RowSpec>& rows);
+  void PushTouchLayoutRows(std::vector<RowSpec>& rows);
   void PushFpsCounterRow(std::vector<RowSpec>& rows);
   // One controller-chord row. `allow_guide` offers the Guide button, which
   // only the level picker can use.
@@ -169,6 +193,10 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   int frame_cap_index_ = 0;
   int aspect_ratio_index_ = 0;
   int msaa_index_ = 2;
+  // The one shadow step the menu shows. shadow_quality_index_ and
+  // static_shadow_res_index_ are still what SaveVideo writes to the two cvars;
+  // this is what the row edits, and SaveVideo derives them from it.
+  int shadow_level_index_ = 2;
   int shadow_quality_index_ = 2;
   int static_shadow_res_index_ = 2;
   int monitor_index_ = 0;
@@ -196,6 +224,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool diagnostics_ = false;
   bool touch_controls_ = true;
   int touch_stick_index_ = 2;
+  int touch_opacity_index_ = 2;
   int menu_scale_index_ = 1;
   // Apply confirmation. The apply action does not "apply" in any recoverable
   // sense - on iOS it QUITS the app - and it is reachable from one gamepad
@@ -255,6 +284,35 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // or a force-quit with the menu open cannot lose them. Hide() flushes too.
   bool video_dirty_ = false;
   float video_dirty_age_ = 0.0f;
+  // A setting that only takes effect at startup has been changed and the game
+  // has not been restarted since.
+  //
+  // Separate from "the staged values differ from the live ones", which is what
+  // the Apply & Restart row used to be gated on, and the reason it was almost
+  // never usable. The debounce above writes the staged values to the cvars
+  // 0.4 s after an edit settles, at which point staged and live agree again
+  // and the row greys out - an Odin2 tester timed the window at about 250 ms
+  // and described Apply & Restart and Revert as "generally greyed
+  // out/inaccessible", which is exactly right. Hide() saves too, so reopening
+  // the menu could never show anything pending either.
+  //
+  // This is sticky instead: set when a restart-class setting is written,
+  // cleared only by actually restarting or by reverting.
+  bool restart_pending_ = false;
+  EditTouchLayoutCallback edit_touch_layout_;
+  ResetTouchLayoutCallback reset_touch_layout_;
+  // The live values as they were when the menu opened, so Revert has something
+  // to go back TO. Reverting used to reload from the cvars, which the debounce
+  // has already overwritten with the very edit being reverted.
+  struct RestartSnapshot {
+    bool valid = false;
+    int resolution_scale_index = 0;
+    int msaa_index = 0;
+    int shadow_level_index = 0;
+    int aspect_ratio_index = 0;
+    int language_index = 0;
+    int audio_buffer_index = 0;
+  } opening_;
   // Swallow the first frame's cursor delta after Show: the pre-open cursor
   // position (or a cursor-mode warp) otherwise reads as mouse motion and
   // steals focus from the rail to whatever row it lands on.

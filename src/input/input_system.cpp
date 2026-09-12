@@ -56,7 +56,16 @@ REXCVAR_DEFINE_STRING(menu_chord, "rb+start", "Input",
                       "Controller chord that toggles the settings menu. Buttons joined by '+': "
                       "a, b, x, y, lb, rb, l3, r3, back, start, dpad_up, dpad_down, dpad_left, "
                       "dpad_right. Empty disables the chord.");
-REXCVAR_DEFINE_STRING(picker_chord, "guide", "Input",
+// LB + Select. It was "guide", the middle Xbox button, which could never fire:
+// guide_button defaults to false, so the button never reaches the input system
+// at all, and nothing anywhere turned both on together. An Odin2 report put it
+// plainly - "the Level Picker shortcut doesn't seem to do anything. It's not
+// clear what this is supposed to do" - and it had never done anything for
+// anyone. A phone has no Guide button to press either way.
+//
+// LB + Back because the two chords that exist already own RB + Start and
+// Back + Start, and no game action uses this pair.
+REXCVAR_DEFINE_STRING(picker_chord, "lb+back", "Input",
                       "Controller button or chord that opens the in-game level picker. Same token set as menu_chord, plus 'guide' for the middle Xbox button (which needs guide_button=true to reach us at all). Empty disables it.");
 // Start + Select (Back). Deliberately a chord no game action uses, and one
 // that is reachable on a pad with no Guide button and no shoulder buttons

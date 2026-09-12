@@ -1567,6 +1567,30 @@ class NrDeviceVulkan : public nrhi::Device {
     return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
   }
 
+  bool SupportsRenderTargetFormat(Format format) override {
+    const VkFormat vk_format = ToVkFormat(format);
+    if (vk_format == VK_FORMAT_UNDEFINED) {
+      return false;
+    }
+    VkFormatProperties props = {};
+    vulkan_device_->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device_->physical_device(), vk_format, &props);
+    // Sampled as well as drawn into: every caller here renders a target and
+    // then reads it back in a later pass, so a format that can only do one of
+    // the two is no use and reporting it as usable would only move the
+    // failure somewhere less obvious.
+    constexpr VkFormatFeatureFlags kNeeded =
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    return (props.optimalTilingFeatures & kNeeded) == kNeeded;
+  }
+
+  uint32_t MaxTextureDimension2D() const override {
+    const ui::vulkan::VulkanDevice::Properties& props = vulkan_device_->properties();
+    // Both, because an image this size is no use if it cannot also be
+    // attached to a framebuffer, and the two limits are allowed to differ.
+    return std::min(props.maxImageDimension2D, props.maxFramebufferWidth);
+  }
+
   uint64_t CurrentSubmission() const override { return cp_->GetCurrentSubmission(); }
   uint64_t CompletedSubmission() const override { return cp_->GetCompletedSubmission(); }
 

@@ -364,11 +364,16 @@ void GraphicsSystem::Shutdown() {
 
 namespace {
 std::atomic<bool> g_app_foreground{true};
+std::atomic<uint64_t> g_guest_swaps{0};
 }  // namespace
 
 void SetAppForeground(bool foreground) {
   g_app_foreground.store(foreground, std::memory_order_relaxed);
 }
+
+void NoteGuestSwap() { g_guest_swaps.fetch_add(1, std::memory_order_relaxed); }
+
+uint64_t GuestSwapCount() { return g_guest_swaps.load(std::memory_order_relaxed); }
 
 bool IsAppForeground() { return g_app_foreground.load(std::memory_order_relaxed); }
 

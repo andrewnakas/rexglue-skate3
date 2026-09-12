@@ -1348,6 +1348,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     PROFILE_SCOPE_COUNTER(kCpuSwapUs);
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   }
+  // One relaxed increment per guest frame, always on: the suspend/resume log
+  // reads it to say whether the GUEST is advancing, which is the question a
+  // "frozen on return from the task switcher" report cannot otherwise answer.
+  rex::graphics::NoteGuestSwap();
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   CpuProfileOnFrameEnd();
