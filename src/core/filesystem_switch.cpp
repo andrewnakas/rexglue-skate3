@@ -36,6 +36,7 @@ static_assert(REX_PLATFORM_SWITCH, "This file is Horizon-only");
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -395,11 +396,64 @@ bool GetInfo(const std::filesystem::path& path, FileInfo* out_info) {
   return true;
 }
 
+namespace {
+// Rolled up rather than logged per call: this runs thousands of times and the
+// logging would cost more than the thing being measured.
+void ReportListFiles(std::chrono::steady_clock::time_point t0, size_t n) {
+  static std::atomic<uint64_t> s_calls{0};
+  static std::atomic<uint64_t> s_entries{0};
+  static std::atomic<uint64_t> s_ns{0};
+  static std::atomic<int64_t> s_next_log{0};
+
+  const auto now = std::chrono::steady_clock::now();
+  s_calls.fetch_add(1, std::memory_order_relaxed);
+  s_entries.fetch_add(n, std::memory_order_relaxed);
+  s_ns.fetch_add(
+      uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t0).count()),
+      std::memory_order_relaxed);
+
+  const int64_t now_s =
+      std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+  int64_t due = s_next_log.load(std::memory_order_relaxed);
+  if (now_s < due ||
+      !s_next_log.compare_exchange_strong(due, now_s + 5, std::memory_order_relaxed)) {
+    return;
+  }
+  const uint64_t c = s_calls.exchange(0, std::memory_order_relaxed);
+  const uint64_t e = s_entries.exchange(0, std::memory_order_relaxed);
+  const uint64_t t = s_ns.exchange(0, std::memory_order_relaxed);
+  if (c == 0) {
+    return;
+  }
+  // Warn, like every other instrument that has to reach a Switch log: raising
+  // this console to info turns on the guest driver's own printing and changes
+  // the timing being measured.
+  REXLOG_WARN(
+      "[listfiles] 5s: calls={} entries={} total={:.1f}ms avg={:.2f}ms "
+      "(~{} allocations and ~{} stat() syscalls)",
+      c, e, double(t) * 1e-6, c ? double(t) * 1e-6 / double(c) : 0.0, e * 3, e);
+}
+}  // namespace
+
+// Directory listings are not cheap on an SD card, and this one is called from
+// the path-resolve FALLBACK in HostPathDevice::ResolvePath - once per missing
+// path component, per failed resolve - so a title that probes for files it
+// does not have pays for it again and again. Per entry it costs a stat()
+// SYSCALL and three allocations (the name, the path copy, and the path/name
+// join stat() is given). A directory of 200 files is 200 syscalls and ~600
+// allocations for ONE call.
+//
+// That makes it a candidate for both halves of this port's frame collapses:
+// the allocation spike (other= goes 400 -> 2613 a frame in a collapse) and the
+// 100-800 ms frames themselves, which allocations alone do not explain but
+// hundreds of SD-card syscalls would. Measured, not assumed.
 std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
+  const auto t0 = std::chrono::steady_clock::now();
   std::vector<FileInfo> result;
 
   DIR* dir = opendir(path.c_str());
   if (!dir) {
+    ReportListFiles(t0, 0);
     return result;
   }
   while (auto ent = readdir(dir)) {
@@ -431,6 +485,7 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
     result.push_back(std::move(info));
   }
   closedir(dir);
+  ReportListFiles(t0, result.size());
   return result;
 }
 
