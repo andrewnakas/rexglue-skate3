@@ -98,6 +98,10 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // closing, which is the reading that never loses the user's place.
   void TogglePerformance();
   void Hide();
+  // Leaving the menu by Back/B. Closes, unless a restart is owed and the
+  // player has not been told yet - then it raises the notice instead, and
+  // closing happens from there.
+  void RequestClose();
   // One "back" step (Escape / pad B): text edit -> row focus -> category rail
   // -> closed. The Escape keybind routes here so Escape backs out level by
   // level instead of instantly closing.
@@ -240,6 +244,14 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // button with no travel, so it asks first.
   bool confirm_apply_ = false;
   int confirm_button_ = 0;  // 0 = keep playing, 1 = apply
+  // Whether the confirmation above was raised by leaving the menu rather than
+  // by the Apply row. Same card, but declining means "close anyway" instead of
+  // "stay here", because closing is what the player already asked for.
+  bool confirm_exit_ = false;
+  // Set once the player has been told a restart is owed, so backing out again
+  // does not ask the same question every time. Cleared when a new
+  // restart-requiring change is staged, and whenever nothing is owed any more.
+  bool restart_notice_shown_ = false;
   bool audio_mute_ = false;
   bool rumble_ = true;
   float mnk_sensitivity_ = 1.0f;

@@ -1619,6 +1619,25 @@ void SimpleSettingsDialog::Toggle() {
   Show();
 }
 
+void SimpleSettingsDialog::RequestClose() {
+  // A setting that only takes effect at startup is invisible until then, so
+  // walking out of the menu with one outstanding means the change looks like
+  // it did nothing. The Apply row and the X shortcut both say so, but neither
+  // is in the way of someone who has made their change and pressed B - which
+  // is most people, and was reported as exactly that: settings that seemed not
+  // to apply.
+  //
+  // Asked once per outstanding restart rather than on every exit: being told
+  // twice about the same thing is its own annoyance.
+  if (HasPendingRestart() && !restart_notice_shown_) {
+    confirm_apply_ = true;
+    confirm_exit_ = true;
+    confirm_button_ = 0;
+    return;
+  }
+  Hide();
+}
+
 void SimpleSettingsDialog::Hide() {
   if (!visible_) {
     return;
@@ -1804,13 +1823,21 @@ void SimpleSettingsDialog::SaveVideo() {
   // frame cap takes effect immediately and needs no restart, and claiming
   // otherwise would leave the prompt up forever.
   if (opening_.valid) {
-    restart_pending_ = restart_pending_ ||
+    const bool needs_restart =
         resolution_scale_index_ != opening_.resolution_scale_index ||
         msaa_index_ != opening_.msaa_index ||
         shadow_level_index_ != opening_.shadow_level_index ||
         aspect_ratio_index_ != opening_.aspect_ratio_index ||
         language_index_ != opening_.language_index ||
         audio_buffer_index_ != opening_.audio_buffer_index;
+    // Going from nothing owed to something owed makes the notice worth showing
+    // again, even if it was waved away earlier in the session. Changing a
+    // second startup setting while one is already outstanding does not: the
+    // player has already been told a restart is coming.
+    if (needs_restart && !restart_pending_) {
+      restart_notice_shown_ = false;
+    }
+    restart_pending_ = restart_pending_ || needs_restart;
   }
 }
 
@@ -1837,6 +1864,7 @@ void SimpleSettingsDialog::RevertRestartValues() {
   // staged values now match it, so this write puts the cvars and the file
   // back to where the menu opened and leaves nothing pending.
   restart_pending_ = false;
+  restart_notice_shown_ = false;
   video_dirty_ = false;
   video_dirty_age_ = 0.0f;
   SaveVideo();
@@ -2042,6 +2070,7 @@ void SimpleSettingsDialog::ApplyAndRestart() {
   // The restart is what satisfies it; a relaunch reloads from the file anyway,
   // but clearing here keeps the prompt honest if the restart is declined.
   restart_pending_ = false;
+  restart_notice_shown_ = false;
   if (restart_game_) {
     restart_game_();
   }
@@ -3545,6 +3574,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.enabled = pending;
         row.action = [this] {
           confirm_apply_ = true;
+          confirm_exit_ = false;
           confirm_button_ = 0;
         };
         rows.push_back(std::move(row));
@@ -3956,7 +3986,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       row_index_ = selectable[0];
     }
     if (in.back) {
-      Hide();
+      RequestClose();
     }
   } else {
     if (in.move_y != 0 && !selectable.empty()) {
@@ -3981,7 +4011,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       // No rail to fall back to in compact, so Back closes the menu - the same
       // thing it does from the rail on a desktop.
       if (REXCVAR_GET(menu_compact)) {
-        Hide();
+        RequestClose();
       } else {
         zone_ = FocusZone::kRail;
       }
@@ -4000,6 +4030,7 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
   // restarting, which is exactly what it did.
   if (in.apply_restart && HasPendingRestart()) {
     confirm_apply_ = true;
+    confirm_exit_ = false;
     confirm_button_ = 0;
   }
   if (!visible_) {
@@ -4829,16 +4860,34 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
     const float body_sz = font_px(21.0f * s);
     const float btn_sz = font_px(24.0f * s);
 
-    const char* heading = ios_quits ? "Apply and close the game?" : "Apply and restart?";
-    const char* body =
-        ios_quits
-            ? "These settings only take effect when the game starts, so Skate 3 has "
-              "to close. Your progress and settings are saved - open it again to "
-              "carry on."
-            : "These settings only take effect when the game starts, so it will "
-              "restart now. Your progress and settings are saved.";
+    // Two questions, one card. Raised from the Apply row or X, it asks whether
+    // to go ahead. Raised by walking out with a restart owed, it is a notice
+    // first - the player has not asked for anything, they are being told that
+    // what they changed has not happened yet - so declining leaves the menu
+    // rather than staying in it.
+    const char* heading =
+        confirm_exit_ ? "Some settings need a restart"
+                      : (ios_quits ? "Apply and close the game?" : "Apply and restart?");
+    const char* body;
+    if (confirm_exit_) {
+      body = ios_quits
+                 ? "Your changes are saved, but some of them are only read when the "
+                   "game starts, so they will not show until it is opened again. "
+                   "Close it now to apply them, or carry on and they will be waiting "
+                   "next time."
+                 : "Your changes are saved, but some of them are only read when the "
+                   "game starts, so they will not show until it restarts. Restart now "
+                   "to apply them, or carry on and they will be waiting next time.";
+    } else {
+      body = ios_quits
+                 ? "These settings only take effect when the game starts, so Skate 3 has "
+                   "to close. Your progress and settings are saved - open it again to "
+                   "carry on."
+                 : "These settings only take effect when the game starts, so it will "
+                   "restart now. Your progress and settings are saved.";
+    }
     const char* yes_label = kApplyActionName;
-    const char* no_label = "Keep Playing";
+    const char* no_label = confirm_exit_ ? "Later" : "Keep Playing";
 
     const float text_w = card_w - 2.0f * pad;
     const ImVec2 body_extent =
@@ -4902,11 +4951,26 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         (raw_clicked && !no_hover && !yes_hover &&
          !mouse_in(card_x, card_y, card_x + card_w, card_y + card_h));
 
-    if (cancelled) {
+    if (cancelled || (activated && !(raw_clicked ? yes_hover : confirm_button_ == 1))) {
+      // Declining, dismissing, or pressing B again. On an exit notice every one
+      // of those means the same thing - the player asked to leave, and being
+      // told about the restart does not change that - so the menu closes and
+      // does not ask again until something new is staged. Trapping them in a
+      // menu they have now tried to leave twice would be its own bug.
+      const bool leaving = confirm_exit_;
       confirm_apply_ = false;
+      confirm_exit_ = false;
+      if (leaving) {
+        restart_notice_shown_ = true;
+        Hide();
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        return;  // the menu is closed; its rows are gone
+      }
     } else if (activated) {
       const bool yes = raw_clicked ? yes_hover : confirm_button_ == 1;
       confirm_apply_ = false;
+      confirm_exit_ = false;
       if (yes) {
         ApplyAndRestart();
         ImGui::End();
