@@ -183,11 +183,14 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 39> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 40> kOptionalSimpleSettingsCvars = {
     // Which map pack is staged. Written by the level picker rather than by a
     // row here, but it has to survive the relaunch that applies it, and this
     // list is what gets written to the settings file.
     "skate3_content_pack",
+    // And whether the startup chooser runs anyway. Without this persisted,
+    // turning the chooser off would last exactly one session.
+    "skate3_content_pack_menu",
     "skate3_diagnostics",
     "skate3_native_render_scene_tex_store_mb",
     "menu_scale",
@@ -1526,6 +1529,8 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   mnk_capture_mouse_ = rex::cvar::Query<bool>("mnk_capture_mouse");
   renderer_native_ =
       HasCvar("skate3_native_render_scene") && rex::cvar::Query<bool>("skate3_native_render_scene");
+  content_pack_menu_ = HasCvar("skate3_content_pack_menu") &&
+                       rex::cvar::Query<bool>("skate3_content_pack_menu");
   ssao_ = HasCvar("skate3_native_render_scene_ssao") &&
           rex::cvar::Query<bool>("skate3_native_render_scene_ssao");
   static_shadows_ =
@@ -2551,10 +2556,15 @@ void SimpleSettingsDialog::PushTouchLayoutRows(std::vector<RowSpec>& rows) {
     RowSpec row;
     row.kind = RowSpec::kAction;
     row.label = "Move the On-screen Controls";
+    // Both halves of the old text were wrong by the time anyone read them.
+    // It said to pinch, which does not fit on a control four percent of the
+    // screen across - most of them - and it said to reopen this menu to
+    // finish, which cannot be done: editing takes the pad away, so no button
+    // and no chord reaches the settings while it is on.
     row.desc =
         "Closes this menu and lets you drag each control where you want it. "
-        "Two fingers on one control resizes it. Open the settings again to "
-        "finish; the arrangement is remembered.";
+        "Tap a control to select it, then use Smaller and Bigger. Press Done "
+        "when you are finished, or tap the gear; the arrangement is remembered.";
     row.action = [this] {
       // Hide() rather than leaving the menu up: the controls being arranged
       // are underneath it, and half of them would be unreachable.
@@ -2562,6 +2572,27 @@ void SimpleSettingsDialog::PushTouchLayoutRows(std::vector<RowSpec>& rows) {
       if (edit_touch_layout_) {
         edit_touch_layout_(true);
       }
+    };
+    rows.push_back(std::move(row));
+  }
+  if (HasCvar("skate3_content_pack_menu")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Ask Which Map Pack at Startup";
+    row.desc =
+        "With more than one map pack installed, choose which to load each time the game "
+        "starts. Off loads the last one picked. Only ever appears when two or more packs "
+        "are installed.";
+    row.options = {"Off", "On"};
+    row.flag = &content_pack_menu_;
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("skate3_content_pack_menu", value != 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      content_pack_menu_ = CvarDefaultBool("skate3_content_pack_menu", true);
+      SetBoolCvar("skate3_content_pack_menu", content_pack_menu_);
+      SaveSimpleSettingsConfig(config_path_);
     };
     rows.push_back(std::move(row));
   }

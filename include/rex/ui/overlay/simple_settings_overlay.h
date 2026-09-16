@@ -220,6 +220,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   char gamertag_buf_[32] = {};
   // Live setting values (hot cvars, applied and saved on change).
   bool renderer_native_ = true;
+  bool content_pack_menu_ = true;
   bool ssao_ = true;
   bool static_shadows_ = true;
   bool shadow_pcss_ = true;

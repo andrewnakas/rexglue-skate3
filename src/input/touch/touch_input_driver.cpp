@@ -102,6 +102,11 @@ struct Finger {
   // off the edge of a stick silently stops steering.
   int control = -1;
   float x = 0.0f, y = 0.0f;
+  // Where it landed, kept so a tap can be told from a drag. While the layout
+  // is being edited the control travels with the finger, so "still on the
+  // control" is true however far it was dragged and cannot answer that on its
+  // own.
+  float down_x = 0.0f, down_y = 0.0f;
 };
 
 constexpr size_t kMaxFingers = 10;
@@ -182,6 +187,10 @@ const char* ControlKey(TouchControlId id) {
 // Kept inside the screen, and above a size a thumb can land on. A layout that
 // puts a button where it cannot be pressed is worse than the default one, and
 // the editor is driven by a thumb that can easily slide off the edge.
+// How far a finger may travel and still count as a tap rather than a drag.
+// Two percent of the screen height: comfortably inside the slop of a thumb
+// held still, and far below any deliberate move.
+constexpr float kTapRadius = 0.02f;
 constexpr float kMinRadius = 0.025f;
 constexpr float kMaxRadius = 0.260f;
 
@@ -299,7 +308,7 @@ void FireMenuCallback() {
 // pressing it. Two fingers on the same control resize it by the change in the
 // distance between them, which is the gesture everyone tries first.
 bool HandleFingerEventEditing(const SDL_Event& e, float aspect) {
-  std::lock_guard<std::mutex> lock(g_mutex);
+  std::unique_lock<std::mutex> lock(g_mutex);
   switch (e.type) {
     case SDL_EVENT_FINGER_DOWN: {
       // The panel's own area belongs to the panel. Without this, a control
@@ -316,6 +325,8 @@ bool HandleFingerEventEditing(const SDL_Event& e, float aspect) {
         f.down = true;
         f.x = e.tfinger.x;
         f.y = e.tfinger.y;
+        f.down_x = e.tfinger.x;
+        f.down_y = e.tfinger.y;
         f.control = control;
         break;
       }
@@ -379,13 +390,41 @@ bool HandleFingerEventEditing(const SDL_Event& e, float aspect) {
     }
     case SDL_EVENT_FINGER_UP:
     case SDL_EVENT_FINGER_CANCELED: {
+      // Tapping the gear leaves the editor, exactly as it enters the settings
+      // everywhere else - and it is the only exit that does not go through the
+      // editor's own panel.
+      //
+      // That matters more than it looks. This mode takes the pad away
+      // completely (Sample returns nothing while editing), so Start, Back and
+      // every chord are dead, and until now the gear was dead too - it was
+      // just another thing to drag. The panel's Done button was the single way
+      // back to the game on a phone with no controller, and a player whose
+      // panel does not appear has nothing left but to kill the app. One
+      // reported exactly that.
+      //
+      // A tap, not a drag: the control follows the finger here, so "released
+      // while still on it" is true however far it travelled. The distance from
+      // where the finger landed is the thing that separates the two, measured
+      // in the same aspect-corrected space as the hit test.
+      bool fire_menu = false;
       for (Finger& f : g_fingers) {
         if (f.down && f.id == e.tfinger.fingerID) {
+          if (e.type == SDL_EVENT_FINGER_UP && f.control >= 0 && IsMenuControl(f.control)) {
+            const float dx = (e.tfinger.x - f.down_x) * aspect;
+            const float dy = e.tfinger.y - f.down_y;
+            fire_menu = dx * dx + dy * dy <= kTapRadius * kTapRadius;
+          }
           f = {};
           break;
         }
       }
       g_held_control.store(uint32_t(TouchControlId::kCount));
+      if (fire_menu) {
+        // Not under the lock: the callback opens the settings, which turns
+        // editing off, which takes this same mutex.
+        lock.unlock();
+        FireMenuCallback();
+      }
       return true;
     }
     default:
