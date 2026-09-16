@@ -513,6 +513,49 @@ void SDLInputDriver::NotifyTouchOfControllersLocked() {
 #endif
 }
 
+// Re-derive "is a pad attached" from SDL itself rather than from the events we
+// happened to receive.
+//
+// This driver's view of what is connected is built entirely from
+// SDL_EVENT_GAMEPAD_ADDED / _REMOVED, and those are not reliable here. The
+// adoption block in OnWindowAvailable exists because ADDED events were being
+// consumed by whatever pumped the queue earlier in startup; REMOVED has the
+// same exposure, and on Android a Bluetooth pad that disappears may not
+// produce one at all. When that happens the driver keeps a stale controller
+// entry forever, and because the on-screen controls hide themselves whenever a
+// pad is attached, the result is a phone with no pad and no touch controls -
+// no way to play at all. Reported on the dev phone the moment a controller was
+// switched off.
+//
+// Cheap enough to do on a timer: one array allocation, and only a few times a
+// second rather than per frame.
+void SDLInputDriver::ReconcileAttachedControllers() {
+#if REX_PLATFORM_MOBILE
+  if (!SDL_Gamepad_initialized_) {
+    return;
+  }
+  const uint64_t now = SDL_GetTicks();
+  uint64_t last = last_reconcile_ms_.load(std::memory_order_relaxed);
+  if (now - last < kReconcileIntervalMs) {
+    return;
+  }
+  if (!last_reconcile_ms_.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+    return;  // another thread is doing it
+  }
+  int pad_count = 0;
+  SDL_JoystickID* pads = SDL_GetGamepads(&pad_count);
+  if (pads != nullptr) {
+    SDL_free(pads);
+  }
+  const bool any = pad_count > 0;
+  static std::atomic<int> s_last_reported{-1};
+  if (s_last_reported.exchange(any ? 1 : 0) != (any ? 1 : 0)) {
+    REXLOG_WARN("SDL: {} gamepad(s) attached (from SDL, not from its events)", pad_count);
+  }
+  rex::input::touch::SetPhysicalControllerConnected(any);
+#endif
+}
+
 void SDLInputDriver::StopRumbleLocked(ControllerState& state) {
   if (state.sdl) {
     SDL_RumbleGamepad(state.sdl, 0, 0, 0);
@@ -756,6 +799,9 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
+  // Also the moment to re-check what is actually attached: this is called from
+  // every guest poll, and the throttle inside keeps it to a few times a second.
+  ReconcileAttachedControllers();
   // Pump SDL events to ensure controller state is up to date.
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);

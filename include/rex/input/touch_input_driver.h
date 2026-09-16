@@ -127,6 +127,23 @@ bool TouchLayoutEditing();
 // it to highlight what is being moved.
 TouchControlId TouchLayoutHeldControl();
 
+// Which control the editor's panel is acting on: the last one touched, kept
+// after the finger lifts. Resizing by pinch is impossible on the small
+// buttons - a d-pad key is about four percent of the screen and two fingers
+// will not fit on it - so the panel resizes whatever was last selected
+// instead, and the selection has to outlive the touch that made it.
+TouchControlId TouchLayoutSelectedControl();
+
+// Grow or shrink the selected control by a fraction of its radius. No-op when
+// nothing is selected.
+void NudgeTouchControlSize(float factor);
+
+// A screen region, in normalised coordinates, that the editor's own panel
+// occupies. Fingers landing inside it are left alone rather than starting a
+// drag, so the panel's buttons work even where a control has been moved
+// underneath them. Set every frame while editing; an empty rect clears it.
+void SetTouchLayoutReservedRect(float x0, float y0, float x1, float y1);
+
 // What the overlay needs to render: which controls are held, and how far each
 // stick has been pushed (-1..1, y up).
 struct TouchVisualState {

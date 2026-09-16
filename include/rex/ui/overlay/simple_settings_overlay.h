@@ -71,6 +71,10 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   // what the rows should say, the app knows where the touch driver is.
   using EditTouchLayoutCallback = std::function<void(bool editing)>;
   using ResetTouchLayoutCallback = std::function<void()>;
+  // Opens the map-pack / level picker. A row here rather than a dialog that
+  // shows itself alongside the settings: it is a full-screen list, and with a
+  // list to show it covered the graphics page every time the menu opened.
+  using OpenLevelPickerCallback = std::function<void()>;
   using PollGamepadCallback = std::function<SimpleSettingsGamepad()>;
   using PollPerfStatsCallback = std::function<SimpleSettingsPerfStats()>;
 
@@ -102,6 +106,9 @@ class SimpleSettingsDialog final : public ImGuiDialog {
                                ResetTouchLayoutCallback reset) {
     edit_touch_layout_ = std::move(edit);
     reset_touch_layout_ = std::move(reset);
+  }
+  void SetOpenLevelPickerCallback(OpenLevelPickerCallback open) {
+    open_level_picker_ = std::move(open);
   }
   // Flush the settings file now, without waiting for the edit debounce or for
   // the menu to close. For callers outside the menu that change a persisted
@@ -161,6 +168,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void PushTouchControlsRow(std::vector<RowSpec>& rows);
   void PushTouchStickSizeRow(std::vector<RowSpec>& rows);
   void PushTouchLayoutRows(std::vector<RowSpec>& rows);
+  void PushLevelPickerRow(std::vector<RowSpec>& rows);
   void PushFpsCounterRow(std::vector<RowSpec>& rows);
   // One controller-chord row. `allow_guide` offers the Guide button, which
   // only the level picker can use.
@@ -301,6 +309,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool restart_pending_ = false;
   EditTouchLayoutCallback edit_touch_layout_;
   ResetTouchLayoutCallback reset_touch_layout_;
+  OpenLevelPickerCallback open_level_picker_;
   // The live values as they were when the menu opened, so Revert has something
   // to go back TO. Reverting used to reload from the cvars, which the debounce
   // has already overwritten with the very edit being reverted.

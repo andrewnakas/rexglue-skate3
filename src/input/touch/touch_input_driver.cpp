@@ -135,6 +135,23 @@ std::string g_layout_path;
 std::atomic<bool> g_layout_dirty{true};
 std::atomic<bool> g_layout_editing{false};
 std::atomic<uint32_t> g_held_control{uint32_t(TouchControlId::kCount)};
+// Survives the finger lifting, unlike g_held_control: the editor's panel acts
+// on it, and a selection that vanished on release would make the size buttons
+// unusable.
+std::atomic<uint32_t> g_selected_control{uint32_t(TouchControlId::kCount)};
+// The editor panel's own area, left to the UI rather than treated as canvas.
+std::atomic<float> g_reserved_x0{0.0f}, g_reserved_y0{0.0f};
+std::atomic<float> g_reserved_x1{0.0f}, g_reserved_y1{0.0f};
+
+bool InReservedRect(float x, float y) {
+  const float x0 = g_reserved_x0.load(std::memory_order_relaxed);
+  const float x1 = g_reserved_x1.load(std::memory_order_relaxed);
+  if (x1 <= x0) {
+    return false;
+  }
+  return x >= x0 && x <= x1 && y >= g_reserved_y0.load(std::memory_order_relaxed) &&
+         y <= g_reserved_y1.load(std::memory_order_relaxed);
+}
 
 // A control's own name in the file. Index would be shorter and would also make
 // the file meaningless to read and impossible to reorder, and this is a file
@@ -285,6 +302,12 @@ bool HandleFingerEventEditing(const SDL_Event& e, float aspect) {
   std::lock_guard<std::mutex> lock(g_mutex);
   switch (e.type) {
     case SDL_EVENT_FINGER_DOWN: {
+      // The panel's own area belongs to the panel. Without this, a control
+      // dragged under the panel would swallow every press meant for its
+      // buttons - including Done, which is the way out.
+      if (InReservedRect(e.tfinger.x, e.tfinger.y)) {
+        return true;
+      }
       const int control = ControlAt(e.tfinger.x, e.tfinger.y, aspect);
       for (Finger& f : g_fingers) {
         if (f.down) continue;
@@ -296,8 +319,15 @@ bool HandleFingerEventEditing(const SDL_Event& e, float aspect) {
         f.control = control;
         break;
       }
-      g_held_control.store(control >= 0 ? uint32_t(TouchLayout(nullptr)[control].id)
-                                        : uint32_t(TouchControlId::kCount));
+      const uint32_t id = control >= 0 ? uint32_t(TouchLayout(nullptr)[control].id)
+                                       : uint32_t(TouchControlId::kCount);
+      g_held_control.store(id);
+      // Touching a control selects it; touching empty space keeps the last
+      // selection, so the size buttons do not disarm themselves every time a
+      // thumb brushes the background.
+      if (control >= 0) {
+        g_selected_control.store(id);
+      }
       return true;
     }
     case SDL_EVENT_FINGER_MOTION: {
@@ -629,7 +659,14 @@ void SetTouchLayoutEditing(bool editing) {
     }
   }
   g_held_control.store(uint32_t(TouchControlId::kCount));
-  REXLOG_INFO("touch: layout editing {}", editing ? "on" : "off");
+  if (!editing) {
+    g_selected_control.store(uint32_t(TouchControlId::kCount));
+    SetTouchLayoutReservedRect(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  // WARN, not INFO: Android ships at warn, and every line describing what the
+  // touch controls were doing was invisible in the reports that were about the
+  // touch controls.
+  REXLOG_WARN("touch: layout editing {}", editing ? "on" : "off");
   if (!editing) {
     SaveTouchLayout();
   }
@@ -639,6 +676,34 @@ bool TouchLayoutEditing() { return g_layout_editing.load(std::memory_order_relax
 
 TouchControlId TouchLayoutHeldControl() {
   return TouchControlId(g_held_control.load(std::memory_order_relaxed));
+}
+
+TouchControlId TouchLayoutSelectedControl() {
+  return TouchControlId(g_selected_control.load(std::memory_order_relaxed));
+}
+
+void NudgeTouchControlSize(float factor) {
+  const TouchControlId id = TouchLayoutSelectedControl();
+  if (size_t(id) >= size_t(TouchControlId::kCount)) {
+    return;
+  }
+  size_t count = 0;
+  const TouchControl* layout = TouchLayout(&count);
+  for (size_t i = 0; i < count; ++i) {
+    if (layout[i].id != id) {
+      continue;
+    }
+    SetTouchControlPlacement(id, layout[i].centre_x, layout[i].centre_y,
+                             layout[i].radius * factor);
+    return;
+  }
+}
+
+void SetTouchLayoutReservedRect(float x0, float y0, float x1, float y1) {
+  g_reserved_x0.store(x0, std::memory_order_relaxed);
+  g_reserved_y0.store(y0, std::memory_order_relaxed);
+  g_reserved_x1.store(x1, std::memory_order_relaxed);
+  g_reserved_y1.store(y1, std::memory_order_relaxed);
 }
 
 TouchVisualState GetTouchVisualState() { return Sample(); }
@@ -655,7 +720,7 @@ void SetMenuButtonCallback(std::function<void()> callback) {
 void SetPhysicalControllerConnected(bool connected) {
   const bool was = g_physical_controller.exchange(connected, std::memory_order_relaxed);
   if (was != connected) {
-    REXLOG_INFO("touch: physical controller {}; on-screen controls {}",
+    REXLOG_WARN("touch: physical controller {}; on-screen controls {}",
                 connected ? "connected" : "disconnected", connected ? "hidden" : "shown");
     // Drop any fingers still held, so a control cannot latch on across the
     // switch and leave the guest holding a button nobody is touching.

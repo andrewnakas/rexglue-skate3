@@ -2575,6 +2575,29 @@ void SimpleSettingsDialog::PushTouchLayoutRows(std::vector<RowSpec>& rows) {
   }
 }
 
+// The map-pack picker, as a row.
+//
+// It used to be pinned beside this menu whenever a level list existed, which
+// was fine on desktop where the list only exists in a launcher-driven session.
+// The moment this port started publishing the installed map packs as that
+// list, the picker began covering the graphics page every time the settings
+// opened. A row is what it should have been here: you go to it, it does not
+// come to you.
+void SimpleSettingsDialog::PushLevelPickerRow(std::vector<RowSpec>& rows) {
+  if (!open_level_picker_) {
+    return;
+  }
+  RowSpec row;
+  row.kind = RowSpec::kAction;
+  row.label = "Map Packs\u2026";
+  row.desc =
+      "Choose which custom map pack to load. Only one can be loaded at a time, "
+      "so picking a different one restarts the game. Opens with instructions "
+      "if you have none installed.";
+  row.action = [this] { open_level_picker_(); };
+  rows.push_back(std::move(row));
+}
+
 void SimpleSettingsDialog::PushDiagnosticsRow(std::vector<RowSpec>& rows) {
   if (HasCvar("skate3_diagnostics")) {
     RowSpec row;
@@ -3474,6 +3497,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
+      header("Content");
+      PushLevelPickerRow(rows);
       header("Interface");
       PushMenuScaleRow(rows);
       header("Diagnostics");
@@ -3935,7 +3960,14 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       rows[row_index_].reset) {
     rows[row_index_].reset();
   }
-  if (in.apply_restart && HasSettingsChanges()) {
+  // The same gate the X legend and the Apply row use, and it has to BE the
+  // same one. This read HasSettingsChanges() while the legend that advertises
+  // the shortcut read HasPendingRestart(), so for most of the time the chip
+  // said "RESTART REQUIRED TO APPLY" and the footer offered X, the key itself
+  // did nothing: the 0.4 s edit debounce writes the staged values to the cvars,
+  // and from then on staged and live agree. Reported as pressing X and not
+  // restarting, which is exactly what it did.
+  if (in.apply_restart && HasPendingRestart()) {
     confirm_apply_ = true;
     confirm_button_ = 0;
   }

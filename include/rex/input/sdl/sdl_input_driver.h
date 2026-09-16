@@ -78,6 +78,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void ProcessEventLocked(const SDL_Event& event);
   // Keeps the on-screen controls in step with what is plugged in.
   void NotifyTouchOfControllersLocked();
+  // Re-derives controller presence from SDL rather than from its events,
+  // which are not reliable here. See the definition.
+  void ReconcileAttachedControllers();
 
   void StopRumbleLocked(ControllerState& state);
   void OnControllerDeviceAddedLocked(const SDL_Event& event);
@@ -97,6 +100,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
+  // Throttle for ReconcileAttachedControllers; it runs off every guest poll.
+  static constexpr uint64_t kReconcileIntervalMs = 500;
+  std::atomic<uint64_t> last_reconcile_ms_{0};
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
   std::mutex controllers_mutex_;
   std::mutex event_queue_mutex_;
