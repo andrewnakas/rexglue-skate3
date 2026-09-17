@@ -3572,8 +3572,17 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
-      header("Content");
-      PushLevelPickerRow(rows);
+      // The "Map Packs..." row is deliberately NOT pushed here for 0.1.24.
+      //
+      // PushLevelPickerRow and the open_level_picker_ callback behind it are
+      // left wired up on purpose: re-enabling the row is putting this one call
+      // back, and the comment on that function records why it must return as a
+      // ROW rather than a picker pinned beside the menu if it ever does.
+      //
+      // Choosing a pack has not gone away with it. The startup chooser asks
+      // whenever two or more packs are installed (skate3_content_pack_menu,
+      // default on, its own row on the Controls page), which is the path that
+      // does not have to restart the game to act on the answer.
       header("Interface");
       PushMenuScaleRow(rows);
       header("Diagnostics");
