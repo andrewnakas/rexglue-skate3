@@ -23,6 +23,37 @@
 
 namespace rex::filesystem {
 
+#if REX_PLATFORM_SWITCH
+// newlib has no timegm, and mktime cannot stand in for it: mktime interprets
+// the fields as local time, and the answer would shift with whatever time zone
+// the console is set to. The conversion is pure arithmetic, so it is done here
+// rather than through the C library at all.
+//
+// The month is rotated so that March begins the year. That puts the leap day
+// at the end, where it stops being a special case, and lets a 400-year era -
+// which is exactly 146097 days, the period over which the Gregorian calendar
+// repeats - be counted with plain division. 719468 is the number of days from
+// year 0 in that shifted scheme to 1970-01-01, so subtracting it lands on the
+// Unix epoch.
+inline time_t timegm_utc(const struct tm& tm) {
+  int year = tm.tm_year + 1900;
+  const unsigned month = unsigned(tm.tm_mon) + 1;  // 1..12
+  const unsigned day = unsigned(tm.tm_mday);       // 1..31
+
+  year -= month <= 2;  // January and February belong to the previous cycle
+  const int era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned year_of_era = unsigned(year - era * 400);              // 0..399
+  const unsigned day_of_year =
+      (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;         // 0..365
+  const unsigned day_of_era =
+      year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+
+  const int64_t days = int64_t(era) * 146097 + int64_t(day_of_era) - 719468;
+  return time_t(days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
+}
+#endif
+
+
 // Import kernel content types for STFS structures
 using rex::system::XContentType;
 using rex::system::XLanguage;
@@ -41,6 +72,8 @@ inline uint64_t decode_fat_timestamp(const uint32_t date, const uint32_t time) {
 
 #if REX_PLATFORM_WIN32
   time_t timet = _mkgmtime(&tm);
+#elif REX_PLATFORM_SWITCH
+  time_t timet = timegm_utc(tm);
 #else
   time_t timet = timegm(&tm);
 #endif

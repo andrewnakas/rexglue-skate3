@@ -18,6 +18,12 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+# SDL supplies the window, the audio device and the game controllers on every
+# desktop and phone target. The Switch has none of it: devkitPro ships SDL2 and
+# this needs SDL3, and libnx already exposes what SDL would wrap - a single
+# NWindow, audout, hid. Turning it off here removes it from the audio, input,
+# ui and thirdparty builds in one place.
+option(REXGLUE_USE_SDL "Build the SDL window, audio and input backends" ON)
 # Propagate profiling defines globally (compiled out in Release)
 if(REXGLUE_ENABLE_TRACY)
     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
@@ -77,11 +83,23 @@ endif()
 # Enforce Clang18 compiler. AppleClang counts: it is the only toolchain that
 # can target iOS, and its version numbers run ahead of a different scale
 # (AppleClang 16 already carries the LLVM 17/18-era frontend this needs).
-if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
+# The Switch is the exception: devkitPro ships GCC and no Clang can target
+# Horizon today, because -mtp=soft has no Clang equivalent on AArch64 and libnx
+# needs it. The flags that really are Clang-only are guarded individually below.
+if(REX_SWITCH)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR "The Switch build expects devkitA64 GCC (found ${CMAKE_CXX_COMPILER_ID})")
+    endif()
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13.0")
+        message(FATAL_ERROR "The Switch build requires GCC 13 or newer for C++23 (found ${CMAKE_CXX_COMPILER_VERSION})")
+    endif()
+elseif(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
     message(FATAL_ERROR "ReXGlue requires Clang compiler. Please set CMAKE_CXX_COMPILER to clang++")
 endif()
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+if(REX_SWITCH)
+    # checked above
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "16.0")
         message(FATAL_ERROR "ReXGlue requires AppleClang 16 or newer (found ${CMAKE_CXX_COMPILER_VERSION})")
     endif()
@@ -128,7 +146,12 @@ endif()
 # Global compile options
 add_compile_options(
     -fno-strict-aliasing
-    -ffp-model=strict
+    # Guest floating point must not be reassociated or contracted: the physics
+    # diverges. -ffp-model=strict is Clang's spelling; GCC needs the two
+    # underlying switches named individually, and defaults to contracting.
+    $<$<CXX_COMPILER_ID:Clang,AppleClang>:-ffp-model=strict>
+    $<$<CXX_COMPILER_ID:GNU>:-ffp-contract=off>
+    $<$<CXX_COMPILER_ID:GNU>:-frounding-math>
     $<$<CONFIG:DEBUG>:-g>
     $<$<CONFIG:DEBUG>:-O0>
     $<$<CONFIG:RELEASE>:-O3>
@@ -183,6 +206,36 @@ elseif(ANDROID)
     # segments are only 4 KB-aligned will not load there. Harmless on 4 KB
     # devices (the NDK r27 default is still 4 KB).
     add_link_options(-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384)
+elseif(REX_SWITCH)
+    # CMAKE_SYSTEM_NAME is Generic here, so neither UNIX nor ANDROID is set and
+    # this branch has to come before the fatal else below.
+    set(REX_PLATFORM "switch-arm64")
+    # platform.h derives REX_PLATFORM_SWITCH from __SWITCH__, which the
+    # toolchain file defines, so nothing is forced on the command line.
+    #
+    # Tracy needs sockets it cannot get here and would only compete for the
+    # three cores the game already wants; the perf counters stay on, because
+    # tuning this port is the whole exercise.
+    set(REXGLUE_ENABLE_TRACY OFF CACHE BOOL "" FORCE)
+    set(REXGLUE_USE_SDL OFF CACHE BOOL "" FORCE)
+    # Vulkan reaches the GPU through NVK linked statically into the NRO, so
+    # volk must see the Horizon window-system extension when it builds its
+    # static dispatch table.
+    set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_VI_NN)
+    # Vulkan-Hpp's DynamicLoader exists to dlopen a Vulkan loader at runtime,
+    # and it refuses to compile for a platform it cannot do that on. There is
+    # no loader here and nothing to open: the driver is linked into the NRO and
+    # entered through its one exported symbol. Removing the class is exactly
+    # right rather than a workaround.
+    add_compile_definitions(VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL=0)
+    # spdlog reports a log timestamp's UTC offset from tm_gmtoff, which is a
+    # glibc and BSD extension that newlib's struct tm does not carry. The
+    # library's own switch drops the offset rather than the timestamp.
+    add_compile_definitions(SPDLOG_NO_TZ_OFFSET)
+    # imgui's default "open in shell" forks a process to hand a URL to a
+    # browser. There is no shell and no fork here, and nothing in this build
+    # opens a link; without this it pulls execvp and waitpid into the link.
+    add_compile_definitions(IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
@@ -193,11 +246,22 @@ elseif(UNIX AND NOT APPLE)
     endif()
     add_compile_definitions(REX_PLATFORM_LINUX=1)
 else()
-    message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows, Linux and macOS only.")
+    message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows, Linux, macOS, Android, iOS and Nintendo Switch.")
 endif()
 
 # Build config as compile definition (multi-config generators don't know config at configure time)
 add_compile_definitions(REXGLUE_BUILD_CONFIG="$<CONFIG>")
+
+# Whether SDL is in this build, for the code that has to ask. Deliberately set
+# HERE, after the platform chain above may have forced the option off, and
+# always to an explicit 0 or 1 - an undefined macro tests as 0 in #if, so a
+# missing definition would silently remove SDL from every platform that does
+# want it rather than failing the build.
+if(REXGLUE_USE_SDL)
+    add_compile_definitions(REXGLUE_HAS_SDL=1)
+else()
+    add_compile_definitions(REXGLUE_HAS_SDL=0)
+endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_version.cmake)
 rex_resolve_version(REXGLUE_FULL_VERSION

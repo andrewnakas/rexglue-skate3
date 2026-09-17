@@ -62,7 +62,7 @@ std::pair<std::filesystem::path, std::filesystem::path> Shader::Translation::Dum
   // Ensure target path exists.
   std::filesystem::path target_path = base_path;
   if (!target_path.empty()) {
-    target_path = std::filesystem::absolute(target_path);
+    target_path = rex::filesystem::ToAbsolute(target_path);
     std::filesystem::create_directories(target_path);
   }
 
@@ -124,7 +124,7 @@ std::pair<std::filesystem::path, std::filesystem::path> Shader::DumpUcode(
   // Ensure target path exists.
   std::filesystem::path target_path = base_path;
   if (!target_path.empty()) {
-    target_path = std::filesystem::absolute(target_path);
+    target_path = rex::filesystem::ToAbsolute(target_path);
     std::filesystem::create_directories(target_path);
   }
 

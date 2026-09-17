@@ -13,12 +13,17 @@
 
 #include <fmt/format.h>
 
+#include <rex/platform.h>
 #include <rex/assert.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 
 #ifdef _WIN32
 #include <windows.h>
+#elif REX_PLATFORM_SWITCH
+// No dynamic linker on Horizon: an NRO is one statically linked image. Every
+// entry point below reports failure, which is the same answer a desktop gives
+// for a library that is not installed, and every caller already handles it.
 #else
 #include <dlfcn.h>
 #endif
@@ -79,6 +84,10 @@ bool SharedLibrary::Load(const std::string& name) {
     REXSYS_ERROR("Failed to load shared library '{}': {}", full_name, FormatLastError(err));
     return false;
   }
+#elif REX_PLATFORM_SWITCH
+  (void)exe_dir;
+  REXSYS_ERROR("Cannot load shared library '{}': Horizon has no dynamic linker", name);
+  return false;
 #else
   std::string full_name = (exe_dir / ("lib" + name + ".so")).string();
   handle_ = dlopen(full_name.c_str(), RTLD_NOW);
@@ -96,6 +105,10 @@ void* SharedLibrary::GetSymbol(const char* name) {
     return nullptr;
 #ifdef _WIN32
   return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle_), name));
+#elif REX_PLATFORM_SWITCH
+  // Unreachable: handle_ is never non-null, because Load always fails.
+  (void)name;
+  return nullptr;
 #else
   return dlsym(handle_, name);
 #endif
@@ -109,6 +122,8 @@ void SharedLibrary::Close() {
   if (!FreeLibrary(static_cast<HMODULE>(handle_))) {
     REXSYS_ERROR("FreeLibrary failed: {}", FormatLastError(GetLastError()));
   }
+#elif REX_PLATFORM_SWITCH
+  // Unreachable for the same reason.
 #else
   if (dlclose(handle_) != 0) {
     const char* err = dlerror();

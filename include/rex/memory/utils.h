@@ -55,6 +55,30 @@ void AndroidInitialize();
 void AndroidShutdown();
 #endif
 
+#if REX_PLATFORM_SWITCH
+// Reserves the guest's 4.5 GB address window before anything can allocate into
+// it, and tears it down again. Called from InitializeSwitchApp.
+void SwitchInitialize();
+void SwitchShutdown();
+
+// Base of that window. Memory::Initialize maps the guest's aliased views at
+// fixed offsets from here rather than probing for a hole the way the desktop
+// builds do, because on Horizon the reservation is explicit.
+uint8_t* SwitchGuestWindowBase();
+
+// Physical bytes currently committed behind the window, and the number of
+// kernel mappings used to do it. Both are logged: the second is the one that
+// runs into a kernel limit if the slab strategy ever regresses.
+size_t SwitchGuestCommittedBytes();
+size_t SwitchGuestMappingCount();
+
+// Re-checks that this process's own code is still mapped executable, and says
+// so. Guest memory is published into the same region of the address space, so
+// this is how a mapping that damages the running image gets caught at the
+// moment it happens rather than at the next call into it.
+void SwitchVerifyOwnCode(const char* when);
+#endif
+
 // Returns the native page size of the system, in bytes.
 // This should be ~4KiB.
 size_t page_size();

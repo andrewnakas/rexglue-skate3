@@ -23,6 +23,18 @@
 
 #include <rex/filesystem/devices/host_path_entry.h>
 
+#include <rex/cvar.h>
+REXCVAR_DEFINE_STRING(
+    vfs_path_alias, "", "Filesystem",
+    "One 'from=to' substitution applied to a guest path ONLY after it failed "
+    "to resolve, then retried once (case-insensitive). For DLC that registers "
+    "its world under one name and ships its files under another - DM Jumpline "
+    "registers dmjumplinedlc and ships DMJumpline, so the title opens "
+    "dist_dmjumplinedlc_Sim.xml and there is no such file. That matters here "
+    "because this title uses a failed NtCreateFile return as a POINTER rather "
+    "than checking it, so a missing file is an access violation, not a "
+    "degraded map. Empty disables it and costs nothing.");
+
 REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
                     "Not useful to non-developers. Allows code to write to paths "
                     "relative to game://. Used for "
@@ -258,6 +270,27 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
   return was_resolved;
 }
 
+namespace {
+// Guest paths are ASCII; a case-insensitive find is all the alias below needs
+// and it avoids dragging in a UTF-8 casefold for it.
+size_t FindNoCaseAscii(const std::string& haystack, const std::string& needle, size_t from) {
+  if (needle.empty() || needle.size() > haystack.size()) return std::string::npos;
+  const auto lower = [](unsigned char c) -> unsigned char {
+    return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c - 'A' + 'a') : c;
+  };
+  for (size_t i = from; i + needle.size() <= haystack.size(); ++i) {
+    size_t k = 0;
+    while (k < needle.size() &&
+           lower(static_cast<unsigned char>(haystack[i + k])) ==
+               lower(static_cast<unsigned char>(needle[k]))) {
+      ++k;
+    }
+    if (k == needle.size()) return i;
+  }
+  return std::string::npos;
+}
+}  // namespace
+
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
 
@@ -288,6 +321,46 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   const auto& device = *it;
   auto relative_path = normalized_path.substr(device->mount_path().size());
   auto* entry = device->ResolvePath(relative_path);
+
+  // Content-pack world alias, on the miss path only.
+  //
+  // A DLC map can register its world under one name and ship its files under
+  // another - DM Jumpline registers "dmjumplinedlc" and ships everything as
+  // "DMJumpline" - so the title asks for
+  // d:\data\stream\dist_dmjumplinedlc_Sim.xml and no such file exists. That
+  // matters more than a missing file usually would here, because this title
+  // does not check NtCreateFile: it uses the error return as a POINTER, and
+  // the access violation that follows is deterministic. Staging the files
+  // under their shipped name removed 61 failed opens and did not stop it,
+  // which is the tell that the NAME is what is wrong.
+  //
+  // So retry the miss once with the alias applied. Costs nothing when the
+  // cvar is empty or the first resolve succeeded.
+  if (entry == nullptr) {
+    const std::string& alias = REXCVAR_GET(vfs_path_alias);
+    const size_t eq = alias.find('=');
+    if (eq != std::string::npos && eq != 0) {
+      const std::string from = alias.substr(0, eq);
+      const std::string to = alias.substr(eq + 1);
+      std::string aliased = relative_path;
+      bool changed = false;
+      // Case-insensitive, because guest paths arrive in whatever case the
+      // title happens to use.
+      for (size_t at = 0;;) {
+        const size_t hit = FindNoCaseAscii(aliased, from, at);
+        if (hit == std::string::npos) break;
+        aliased.replace(hit, from.size(), to);
+        at = hit + to.size();
+        changed = true;
+      }
+      if (changed) {
+        entry = device->ResolvePath(aliased);
+        if (entry != nullptr) {
+          REXFS_WARN("VFS: '{}' resolved via alias -> '{}'", relative_path, aliased);
+        }
+      }
+    }
+  }
 
   if (entry) {
     if (had_symlink) {

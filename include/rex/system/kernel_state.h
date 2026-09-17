@@ -203,6 +203,12 @@ class KernelState {
   // Access must be guarded by the global critical region.
   util::ObjectTable* object_table() { return &object_table_; }
 
+  // Advances the per-thread time base at X_KTHREAD+0x58. Titles read it
+  // directly out of guest memory as a monotonically increasing value; nothing
+  // in this kernel ever wrote it, so it read as zero forever and any guest
+  // timeout computed from it could never elapse.
+  void UpdateGuestThreadTimestamps();
+
   uint32_t process_type() const;
   void set_process_type(uint32_t value);
   uint32_t process_info_block_address() const {

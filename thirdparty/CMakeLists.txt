@@ -62,10 +62,21 @@ if(REXGLUE_BUILD_TESTS)
     list(APPEND REQUIRED_SUBMODULES catch2)
 endif()
 
+# Checks that each dependency actually has sources, rather than that it has a
+# .git entry. The point is to catch the uninitialised case - an empty directory
+# where a library should be - and an empty directory is what that case really
+# looks like. Testing for .git additionally rejects a perfectly good vendored
+# or worktree-shared copy, which is how this tree is laid out for the Switch
+# build and after any submodule is re-provisioned by hand.
 foreach(submodule ${REQUIRED_SUBMODULES})
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/.git")
+    set(_submodule_dir "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}")
+    set(_submodule_contents "")
+    if(EXISTS "${_submodule_dir}")
+        file(GLOB _submodule_contents "${_submodule_dir}/*")
+    endif()
+    if(NOT _submodule_contents)
         message(FATAL_ERROR
-            "Git submodule '${submodule}' is not initialized.\n"
+            "Dependency '${submodule}' is empty or missing at ${_submodule_dir}.\n"
             "Please run: git submodule update --init --recursive\n"
             "from the repository root directory."
         )
@@ -208,16 +219,29 @@ if(REXGLUE_USE_VULKAN)
     set(VMA_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
     add_subdirectory(vulkan-memory-allocator)
 
-    # volk
-    if(APPLE)
-        set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_METAL_EXT CACHE STRING "" FORCE)
+    # volk. Its whole purpose is to find a Vulkan loader with dlopen and build a
+    # dispatch table from it. Horizon has no dlopen and no loader - the driver
+    # is linked into the NRO and entered through its one exported symbol - and
+    # nothing here includes volk.h, so it is simply not built there.
+    if(NOT REX_SWITCH)
+        if(APPLE)
+            set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_METAL_EXT CACHE STRING "" FORCE)
+        endif()
+        set(VOLK_INSTALL ON CACHE BOOL "" FORCE)
+        set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
+        add_subdirectory(volk)
+        target_link_libraries(volk PUBLIC Vulkan::Headers)
+        target_link_libraries(volk_headers INTERFACE Vulkan::Headers)
+        target_compile_options(volk PRIVATE -w)
+    else()
+        # Three libraries name volk::volk in their link lists, and all they want
+        # from it in practice is the Vulkan headers. Standing in for it here
+        # keeps those lists honest and platform-agnostic, and puts the fact that
+        # volk is absent in exactly one place instead of three.
+        add_library(volk_stub INTERFACE)
+        add_library(volk::volk ALIAS volk_stub)
+        target_link_libraries(volk_stub INTERFACE Vulkan::Headers)
     endif()
-    set(VOLK_INSTALL ON CACHE BOOL "" FORCE)
-    set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
-    add_subdirectory(volk)
-    target_link_libraries(volk PUBLIC Vulkan::Headers)
-    target_link_libraries(volk_headers INTERFACE Vulkan::Headers)
-    target_compile_options(volk PRIVATE -w)
 endif()
 
 #=============================================================================
@@ -272,7 +296,12 @@ target_compile_options(imgui PRIVATE -w)
 
 #=============================================================================
 # SDL3 - Cross-platform media layer
+#
+# Skipped entirely on targets that do not use it. The Switch is the only one so
+# far: devkitPro ships SDL2 and this needs SDL3, and libnx already provides
+# everything SDL would be wrapping - a single NWindow, audout, hid.
 #=============================================================================
+if(REXGLUE_USE_SDL)
 set(SDL_INSTALL ON CACHE BOOL "" FORCE)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
@@ -336,6 +365,7 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
 endif()
 
 add_subdirectory(sdl3)
+endif()  # REXGLUE_USE_SDL
 
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
@@ -669,14 +699,25 @@ add_library(libavcodec STATIC
     ${FFMPEG_DIR}/libavcodec/rdft.c
     ${FFMPEG_DIR}/libavcodec/aactab.c
     ${FFMPEG_DIR}/libavcodec/null_bsf.c
-    ${FFMPEG_DIR}/libavcodec/pthread.c
-    ${FFMPEG_DIR}/libavcodec/pthread_slice.c
-    ${FFMPEG_DIR}/libavcodec/pthread_frame.c
     ${FFMPEG_DIR}/libavcodec/avfft.c
     ${FFMPEG_DIR}/libavcodec/fft_float.c
     ${FFMPEG_DIR}/libavcodec/fft_fixed_32.c
     ${FFMPEG_DIR}/libavcodec/fft_init_table.c
 )
+
+# Frame and slice threading, which needs pthreads. Horizon has none, and the
+# threading would go unused anyway: the guest hands over one XMA frame at a
+# time and the engine decodes it on a thread it already owns. HAVE_THREADS is 0
+# in that platform's config header, which makes these files compile to nothing
+# useful even where they do build - so they are simply left out.
+if(NOT REX_SWITCH)
+    target_sources(libavcodec PRIVATE
+        ${FFMPEG_DIR}/libavcodec/pthread.c
+        ${FFMPEG_DIR}/libavcodec/pthread_slice.c
+        ${FFMPEG_DIR}/libavcodec/pthread_frame.c
+    )
+endif()
+
 
 # Windows-specific source
 if(WIN32)

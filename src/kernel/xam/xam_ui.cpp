@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
@@ -20,6 +21,11 @@
 
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
+REXCVAR_DEFINE_STRING(headless_keyboard_text, "Skater", "Kernel",
+                      "What the on-screen keyboard returns when there is no keyboard to show and "
+                      "the title suggested nothing usable. Names, teams and companies all come "
+                      "through here, and a title that validates the result will refuse an empty "
+                      "one. Letters, digits and spaces only.");
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -501,11 +507,32 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
     auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
-      // Redirect default_text back into the buffer.
-      if (!default_text) {
+      // Hand back the text the title suggested. With no on-screen keyboard
+      // there is nothing else to return - but handing back nothing is not
+      // neutral: titles validate what comes out of here, and Skate 3 rejects an
+      // empty team or company name as "invalid character", with no way to
+      // correct it because the keyboard it would correct it in cannot open.
+      //
+      // So when the suggestion is empty, or is not something a name field will
+      // accept, substitute a plain alphanumeric one. headless_keyboard_text
+      // sets it.
+      std::u16string text =
+          default_text ? std::u16string(default_text.value()) : std::u16string();
+      const bool usable =
+          !text.empty() && std::any_of(text.begin(), text.end(), [](char16_t c) {
+            return (c >= u'0' && c <= u'9') || (c >= u'A' && c <= u'Z') || (c >= u'a' && c <= u'z');
+          }) &&
+          std::all_of(text.begin(), text.end(), [](char16_t c) {
+            return (c >= u'0' && c <= u'9') || (c >= u'A' && c <= u'Z') ||
+                   (c >= u'a' && c <= u'z') || c == u' ';
+          });
+      if (!usable) {
+        text = rex::string::to_utf16(REXCVAR_GET(headless_keyboard_text));
+      }
+      if (text.empty()) {
         std::memset(buffer, 0, buffer_size);
       } else {
-        rex::string::util_copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
+        rex::string::util_copy_and_swap_truncating(buffer, text, buffer_length);
       }
       return X_ERROR_SUCCESS;
     };

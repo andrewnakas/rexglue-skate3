@@ -47,6 +47,9 @@
 #if REX_PLATFORM_WIN32
 #include <rex/ui/surface_win.h>
 #endif
+#if REX_PLATFORM_SWITCH
+#include <rex/ui/surface_switch.h>
+#endif
 
 REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 2, "UI/Vulkan",
                      "How many paint submissions may be outstanding at once. Must stay "
@@ -542,6 +545,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
     type_flags |= Surface::kTypeFlag_AndroidNativeWindow;
   }
 #endif
+#if REX_PLATFORM_SWITCH
+  if (instance_extensions.ext_NN_vi_surface) {
+    type_flags |= Surface::kTypeFlag_NintendoViWindow;
+  }
+#endif
 #if REX_PLATFORM_GNU_LINUX
   if (instance_extensions.ext_KHR_xcb_surface) {
     type_flags |= Surface::kTypeFlag_XcbWindow;
@@ -920,6 +928,19 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     }
     VkResult vulkan_surface_create_result = VK_ERROR_UNKNOWN;
     switch (surface_type) {
+#if REX_PLATFORM_SWITCH
+      case Surface::kTypeIndex_NintendoViWindow: {
+        auto& vi_window_surface = static_cast<const ViWindowSurface&>(new_surface);
+        VkViSurfaceCreateInfoNN surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        // The NWindow itself, which is what libnx hands the compositor.
+        surface_create_info.window = vi_window_surface.window();
+        vulkan_surface_create_result = ifn.vkCreateViSurfaceNN(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+#endif
 #if REX_PLATFORM_ANDROID
       case Surface::kTypeIndex_AndroidNativeWindow: {
         auto& android_native_window_surface =
@@ -1542,7 +1563,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
       }
       offered += name ? std::string(name) : std::to_string(uint32_t(mode));
     }
-    REXLOG_INFO("VulkanPresenter: surface offers present modes: {}", offered);
+    // Warn: whether this surface can present without waiting for the display
+    // decides whether the frame rate is bound by our own work or quantised to
+    // the refresh rate, and those call for completely different fixes. The
+    // vsync cvar does not reach this decision at all - the three
+    // vulkan_allow_present_mode_* cvars do.
+    REXLOG_WARN("VulkanPresenter: surface offers present modes: {}", offered);
   }
   // As presentation is usually controlled by the GPU command processor, it's
   // better to use modes that allow as quick acquisition as possible to avoid
@@ -1579,13 +1605,26 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
     return VK_NULL_HANDLE;
   }
-  REXLOG_INFO(
+  // Warn, and with the mode spelled out. Presentation mode 2 is FIFO, which
+  // means every present waits for the display and the frame rate can only be
+  // the refresh rate divided by a whole number - so a frame that misses 16.7 ms
+  // costs the whole of the next interval, and shaving a millisecond off it can
+  // be worth ten frames a second. Mode 0 is IMMEDIATE, where the frame rate is
+  // whatever we can produce. Reading this number as a bare integer, at info,
+  // in a log nobody keeps at info, is how it stayed unknown.
+  REXLOG_WARN(
       "VulkanPresenter: Created {}x{} swapchain with format {}, color space "
-      "{}, presentation mode {}, minImageCount {} (surface min {} max {})",
+      "{}, presentation mode {} ({}), minImageCount {} (surface min {} max {})",
       swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
-      uint32_t(swapchain_create_info.presentMode), swapchain_create_info.minImageCount,
-      surface_capabilities.minImageCount, surface_capabilities.maxImageCount);
+      uint32_t(swapchain_create_info.presentMode),
+      swapchain_create_info.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR   ? "IMMEDIATE, no wait"
+      : swapchain_create_info.presentMode == VK_PRESENT_MODE_MAILBOX_KHR   ? "MAILBOX"
+      : swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR
+          ? "FIFO_RELAXED"
+          : "FIFO, every present waits for the display",
+      swapchain_create_info.minImageCount, surface_capabilities.minImageCount,
+      surface_capabilities.maxImageCount);
 
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;

@@ -27,9 +27,13 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#if !REX_PLATFORM_SWITCH
+// The raw IP header definitions. libnx's BSD sockets do not ship this header,
+// and nothing below reaches for anything it declares.
 #include <netinet/ip.h>
+#endif
 #include <sys/socket.h>
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_SWITCH
 #ifdef IPPROTO_TCP
 #undef IPPROTO_TCP
 #endif

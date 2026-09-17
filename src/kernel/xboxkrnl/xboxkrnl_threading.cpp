@@ -543,6 +543,48 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
 }
 
 u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
+  // Handle plus the guest return address of the caller. The title is not
+  // deadlocked - it signals events about fifty times a second while making no
+  // visible progress - so the useful question is not "which event" but "which
+  // guest code keeps doing this". lr resolves against the generated sources the
+  // same way the thread dumps do.
+  {
+    static std::atomic<uint64_t> n{0};
+    const uint64_t i = n.fetch_add(1, std::memory_order_relaxed);
+    if (i < 40 || (i % 1000) == 0) {
+      uint32_t caller = 0;
+      if (auto* ts = rex::runtime::ThreadState::Get()) {
+        if (const auto* c = ts->context()) {
+          caller = uint32_t(c->lr);
+        }
+      }
+      // lr alone is useless here: every signal in the title goes through one
+      // thin SetEvent wrapper, so it is always the same address. Walk two
+      // frames of the guest back chain to reach the code that actually wants
+      // the event set. Same layout the crash reports use - the caller's frame
+      // is at [r1], and its return address 8 bytes below that.
+      uint32_t up1 = 0, up2 = 0;
+      if (auto* ts = rex::runtime::ThreadState::Get()) {
+        if (const auto* c = ts->context()) {
+          auto* mem = REX_KERNEL_MEMORY();
+          uint32_t frame = uint32_t(c->r1.u64 & 0xFFFFFFFFull);
+          uint32_t* slot = nullptr;
+          for (int depth = 0; depth < 2 && frame && (frame & 3) == 0; ++depth) {
+            slot = mem->TranslateVirtual<uint32_t*>(frame);
+            if (!slot) break;
+            const uint32_t next = __builtin_bswap32(*slot);
+            if (next <= frame || (next & 3) != 0) break;
+            uint32_t* link = mem->TranslateVirtual<uint32_t*>(next - 8);
+            const uint32_t value = link ? __builtin_bswap32(*link) : 0;
+            (depth == 0 ? up1 : up2) = value;
+            frame = next;
+          }
+        }
+      }
+      REXKRNL_DEBUG("NtSetEvent(handle={:08X}) callers {:08X} <- {:08X} (#{})", handle, up1, up2,
+                    i);
+    }
+  }
   return xeNtSetEvent(handle, previous_state_ptr);
 }
 
@@ -851,6 +893,20 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
+  // Only the ones that block for a long time: this is the hottest call in the
+  // title and logging every one buries the file. A handle that shows up here
+  // repeatedly is an event whose signal never arrives.
+  {
+    static thread_local uint64_t last_reported = 0;
+    static std::atomic<uint64_t> seq{0};
+    const uint64_t n = seq.fetch_add(1, std::memory_order_relaxed);
+    if ((n - last_reported) > 20000) {
+      last_reported = n;
+      REXKRNL_DEBUG("NtWaitForSingleObjectEx(handle={:08X}, alertable={}) still waiting",
+                    object_handle, alertable);
+    }
+  }
+
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);

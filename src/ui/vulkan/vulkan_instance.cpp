@@ -37,6 +37,15 @@ extern "C" VKAPI_ATTR void VKAPI_CALL
 vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator);
 #endif
 
+#if REX_PLATFORM_SWITCH
+// NVK is linked into the NRO and exports exactly one symbol, the ICD
+// entry point. Everything else, vkDestroyInstance included, is resolved
+// through it - and instance-level names only once there is an instance to
+// ask about, which is why that one is fetched after creation rather than here.
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vk_icdGetInstanceProcAddr(VkInstance instance, const char* pName);
+#endif
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -82,7 +91,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   Functions& ifn = vulkan_instance->functions_;
 
   bool functions_loaded = true;
-#if REX_PLATFORM_IOS
+#if REX_PLATFORM_SWITCH
+  ifn.vkGetInstanceProcAddr = &::vk_icdGetInstanceProcAddr;
+#elif REX_PLATFORM_IOS
   ifn.vkGetInstanceProcAddr = &::vkGetInstanceProcAddr;
   ifn.vkDestroyInstance = &::vkDestroyInstance;
 #else
@@ -135,18 +146,37 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     REXLOG_ERROR("Failed to get Vulkan loader function pointers");
     return nullptr;
   }
-#endif  // REX_PLATFORM_IOS
+#endif  // REX_PLATFORM_SWITCH / REX_PLATFORM_IOS
 
   // Load global functions.
 
-  functions_loaded &= (ifn.vkCreateInstance = PFN_vkCreateInstance(
-                           ifn.vkGetInstanceProcAddr(nullptr, "vkCreateInstance"))) != nullptr;
-  functions_loaded &= (ifn.vkEnumerateInstanceExtensionProperties =
-                           PFN_vkEnumerateInstanceExtensionProperties(ifn.vkGetInstanceProcAddr(
-                               nullptr, "vkEnumerateInstanceExtensionProperties"))) != nullptr;
-  functions_loaded &=
-      (ifn.vkEnumerateInstanceLayerProperties = PFN_vkEnumerateInstanceLayerProperties(
-           ifn.vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceLayerProperties"))) != nullptr;
+  // Named individually rather than folded into one boolean: when this fails it
+  // is the first thing that runs on a new platform, and "one of three was null"
+  // costs a whole debugging round trip to narrow down.
+  ifn.vkCreateInstance =
+      PFN_vkCreateInstance(ifn.vkGetInstanceProcAddr(nullptr, "vkCreateInstance"));
+  if (!ifn.vkCreateInstance) {
+    REXLOG_ERROR("Vulkan: vkCreateInstance not available from vkGetInstanceProcAddr");
+    functions_loaded = false;
+  }
+  ifn.vkEnumerateInstanceExtensionProperties = PFN_vkEnumerateInstanceExtensionProperties(
+      ifn.vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceExtensionProperties"));
+  if (!ifn.vkEnumerateInstanceExtensionProperties) {
+    REXLOG_ERROR("Vulkan: vkEnumerateInstanceExtensionProperties not available");
+    functions_loaded = false;
+  }
+
+  // Layers are a loader concept, not a driver one: they are libraries the
+  // loader inserts between the application and the driver, so a build that
+  // talks to a driver directly has nowhere to put them and no list to read.
+  // The Vulkan ICD interface does not require a driver to answer this at all,
+  // and NVK does not. Treated as optional, with the call site checking for it.
+  ifn.vkEnumerateInstanceLayerProperties = PFN_vkEnumerateInstanceLayerProperties(
+      ifn.vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceLayerProperties"));
+  if (!ifn.vkEnumerateInstanceLayerProperties) {
+    REXLOG_INFO("Vulkan: no layer enumeration (expected when talking to a driver directly)");
+  }
+
   if (!functions_loaded) {
     REXLOG_ERROR(
         "Failed to get Vulkan global function pointers via "
@@ -204,6 +234,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     // #218.
     requested_extensions.emplace("VK_EXT_metal_surface",
                                  &vulkan_instance->extensions_.ext_EXT_metal_surface);
+#endif
+#ifdef VK_USE_PLATFORM_VI_NN
+    // #63.
+    requested_extensions.emplace("VK_NN_vi_surface",
+                                 &vulkan_instance->extensions_.ext_NN_vi_surface);
 #endif
   }
 
@@ -266,7 +301,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 
   std::vector<const char*> enabled_layers;
 
-  if (!requested_layers.empty()) {
+  if (!requested_layers.empty() && !ifn.vkEnumerateInstanceLayerProperties) {
+    // Nothing can be enabled that cannot be enumerated. Only validation asks
+    // for a layer, and asking for it on a driver-only build is a mistake worth
+    // saying out loud rather than failing quietly later.
+    REXLOG_WARN("Vulkan: layers were requested but this build has no layer support; ignoring");
+  } else if (!requested_layers.empty()) {
     std::vector<VkLayerProperties> available_layers;
     // "The list of available layers may change at any time due to actions
     // outside of the Vulkan implementation"
@@ -424,6 +464,14 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     return nullptr;
   }
 
+#if REX_PLATFORM_SWITCH
+  // Only reachable now: with a null instance the ICD returns null for an
+  // instance-level name, so this could not have been fetched alongside
+  // vkGetInstanceProcAddr the way the loader platforms do it.
+  functions_loaded &= (ifn.vkDestroyInstance = PFN_vkDestroyInstance(ifn.vkGetInstanceProcAddr(
+                           vulkan_instance->instance_, "vkDestroyInstance"))) != nullptr;
+#endif
+
   // Load instance functions.
 
 #define XE_UI_VULKAN_FUNCTION(name)                                                            \
@@ -471,6 +519,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 #ifdef VK_USE_PLATFORM_METAL_EXT
   if (vulkan_instance->extensions_.ext_EXT_metal_surface) {
 #include <rex/ui/vulkan/functions/instance_ext_metal_surface.inc>
+  }
+#endif
+#ifdef VK_USE_PLATFORM_VI_NN
+  if (vulkan_instance->extensions_.ext_NN_vi_surface) {
+#include <rex/ui/vulkan/functions/instance_nn_vi_surface.inc>
   }
 #endif
   if (vulkan_instance->extensions_.ext_KHR_surface) {

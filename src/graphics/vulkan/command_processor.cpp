@@ -64,6 +64,7 @@
 // Defined by the presenter; shared so one spurious MoltenVK device loss is
 // budgeted the same way on both sides of the GPU.
 REXCVAR_DECLARE(int32_t, vulkan_device_lost_soft_retries);
+REXCVAR_DECLARE(double, native_render_output_scale);
 
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
@@ -2615,9 +2616,46 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+// Phase timing for the swap. XE_SWAP measured ninety-six milliseconds a call
+// while the native renderer recorded its commands in three and a half, so most
+// of the swap is something else - and "something else" here is several quite
+// different things: waiting for the previous submission, resolving the guest's
+// front buffer through the texture cache, submitting, and presenting.
+extern "C" {
+std::atomic<uint64_t> rex_diag_swap_calls{0};
+std::atomic<uint64_t> rex_diag_swap_begin_us{0};
+std::atomic<uint64_t> rex_diag_swap_tex_us{0};
+std::atomic<uint64_t> rex_diag_swap_native_us{0};
+std::atomic<uint64_t> rex_diag_swap_end_us{0};
+std::atomic<uint64_t> rex_diag_swap_refresh_us{0};
+std::atomic<uint64_t> rex_diag_swap_total_us{0};
+}
+
+// Free function, not a lambda: one of the call sites is inside the presenter's
+// own callback, which captures nothing.
+static void rex_mark(std::atomic<uint64_t>& sink,
+                     std::chrono::steady_clock::time_point from) {
+  sink.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - from)
+                              .count()),
+                 std::memory_order_relaxed);
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  const auto rex_swap_t0 = std::chrono::steady_clock::now();
+  struct RexSwapTimer {
+    std::chrono::steady_clock::time_point t0;
+    ~RexSwapTimer() {
+      rex_diag_swap_total_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count()),
+          std::memory_order_relaxed);
+      rex_diag_swap_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+  } rex_swap_timer{rex_swap_t0};
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2632,7 +2670,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   LogGpuClockTelemetry();
 
   // In case the swap command is the only one in the frame.
-  if (!BeginSubmission(true)) {
+  const auto rex_begin_t0 = std::chrono::steady_clock::now();
+  const bool rex_begin_ok = BeginSubmission(true);
+  rex_mark(rex_diag_swap_begin_us, rex_begin_t0);
+  if (!rex_begin_ok) {
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
   }
@@ -2719,9 +2760,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
   xenos::TextureFormat frontbuffer_format;
   bool swap_source_needs_rb_swap = false;
+  const auto rex_tex_t0 = std::chrono::steady_clock::now();
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
+  rex_mark(rex_diag_swap_tex_us, rex_tex_t0);
   if (swap_texture_view == VK_NULL_HANDLE) {
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
@@ -2761,6 +2804,31 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             ? frontbuffer_height_scaled
             : (frontbuffer_height ? frontbuffer_height : frontbuffer_height_unscaled);
   }
+  // Render the frame smaller and let the presenter scale it up. It already
+  // takes the guest output size and the display size as separate arguments and
+  // scales between them, so the whole chain follows this one number: the
+  // native renderer sizes its targets, viewport and scissor from the guest
+  // output, and the emulated blit samples rather than copies.
+  //
+  // This is the last big lever when the GPU is executing the frame rather than
+  // the CPU building it, which is where this port ended up: present measured
+  // fifty milliseconds against three and a half to record the commands, and
+  // raising the GPU clock moved it in proportion.
+  {
+    const double out_scale = REXCVAR_GET(native_render_output_scale);
+    if (out_scale > 0.0 && out_scale < 0.999 && guest_output_width && guest_output_height) {
+      // Even dimensions, and never smaller than something a sampler can work
+      // with - a zero here would take the swapchain down.
+      const auto scale_dim = [out_scale](uint32_t v) {
+        uint32_t out = uint32_t(double(v) * out_scale + 0.5);
+        out &= ~1u;
+        return std::max(64u, out);
+      };
+      guest_output_width = scale_dim(guest_output_width);
+      guest_output_height = scale_dim(guest_output_height);
+    }
+  }
+
   bool swap_source_scaled = frontbuffer_width_unscaled && frontbuffer_height_unscaled &&
                             (frontbuffer_width_scaled != frontbuffer_width_unscaled ||
                              frontbuffer_height_scaled != frontbuffer_height_unscaled);
@@ -2820,6 +2888,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   const bool native_wide_output = ApplyNativeGuestOutputWideAspect(
       guest_output_width, guest_output_height, display_width, display_height);
 
+  const auto rex_refresh_t0 = std::chrono::steady_clock::now();
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
@@ -2878,7 +2947,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           // Attribute the native pass's GPU time to its own profile bucket
           // (it otherwise smears into the last emulated draw's bucket).
           BeginGpuTimestampedRegion(rex::perf::DrawBucket::kNativeScene);
-          if (TryRenderNativeGuestOutput(native_context)) {
+          const auto rex_native_t0 = std::chrono::steady_clock::now();
+          const bool rex_native_ok = TryRenderNativeGuestOutput(native_context);
+          rex_mark(rex_diag_swap_native_us, rex_native_t0);
+          if (rex_native_ok) {
             NativeRhiEndFrame(native_rhi_device_);
             // Need to submit all the commands before giving the image back
             // to the presenter (it submits its own for displaying it), and
@@ -3409,6 +3481,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         EndSubmission(true);
         return true;
       });
+  rex_mark(rex_diag_swap_refresh_us, rex_refresh_t0);
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
@@ -4093,6 +4166,21 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+// What the emulated path actually still executes while the native renderer is
+// replacing the frame. Suppression is supposed to make this nearly free, and on
+// the Switch port the command processor is spending 96% of a core here - so the
+// question is which of these survives the gate, and there was no way to ask.
+extern "C" {
+std::atomic<uint64_t> rex_diag_cp_draws{0};
+std::atomic<uint64_t> rex_diag_cp_draws_suppressed{0};
+std::atomic<uint64_t> rex_diag_cp_draws_memexport{0};
+std::atomic<uint64_t> rex_diag_cp_draws_depthonly{0};
+std::atomic<uint64_t> rex_diag_cp_draw_us{0};
+std::atomic<uint64_t> rex_diag_cp_copies{0};
+std::atomic<uint64_t> rex_diag_cp_copies_suppressed{0};
+std::atomic<uint64_t> rex_diag_cp_copy_us{0};
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -4153,6 +4241,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       // lightpage composition left never-composed pages sampling garbage -
       // the light/dark checkerboard ground. (Mirrors the D3D12 gate: draw
       // and resolve suppression must agree.)
+      rex_diag_cp_copies_suppressed.fetch_add(1, std::memory_order_relaxed);
       if (REXCVAR_GET(native_render_force_resolve_readback_max_length) > 0) {
         // App-armed window diagnostics (Skate 3 photo flows): while the
         // window is armed, show which resolves the suppression filter drops
@@ -4274,6 +4363,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
   bool draw_samplers_reused = false;
+  rex_diag_cp_draws.fetch_add(1, std::memory_order_relaxed);
+  const auto rex_draw_t0 = std::chrono::steady_clock::now();
+  struct RexDrawTimer {
+    std::chrono::steady_clock::time_point t0;
+    ~RexDrawTimer() {
+      rex_diag_cp_draw_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count()),
+          std::memory_order_relaxed);
+    }
+  } rex_draw_timer{rex_draw_t0};
+  if (memexport_writes_possible) {
+    rex_diag_cp_draws_memexport.fetch_add(1, std::memory_order_relaxed);
+  }
 
   // Native guest-output renderer active: the emulated frame is never shown,
   // so skip the draw entirely (pipeline setup, texture cache, render target
@@ -4293,6 +4397,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!memexport_writes_possible && ShouldSuppressEmulatedDraws()) {
     const uint32_t suppress_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
     if (ShouldSuppressPassAtPitch(suppress_pitch)) {
+      rex_diag_cp_draws_suppressed.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
     // Depth/stencil-only draws (no pixel shader) inside the EXEMPT passes:
@@ -4301,6 +4406,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // This stream is the dominant remaining emulated GPU cost at 3x on
     // Vulkan (2-12 ms/frame - the bimodal-FPS slow state).
     if (pixel_shader == nullptr && ShouldSuppressExemptDepthOnlyDraws()) {
+      rex_diag_cp_draws_depthonly.fetch_add(1, std::memory_order_relaxed);
+      rex_diag_cp_draws_suppressed.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
     // Census of the passes still EXECUTING under suppression (each distinct
@@ -5242,6 +5349,18 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
 }
 
 bool VulkanCommandProcessor::IssueCopy() {
+  rex_diag_cp_copies.fetch_add(1, std::memory_order_relaxed);
+  const auto rex_copy_t0 = std::chrono::steady_clock::now();
+  struct RexCopyTimer {
+    std::chrono::steady_clock::time_point t0;
+    ~RexCopyTimer() {
+      rex_diag_cp_copy_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count()),
+          std::memory_order_relaxed);
+    }
+  } rex_copy_timer{rex_copy_t0};
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES

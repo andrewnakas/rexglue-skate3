@@ -10,6 +10,7 @@
  */
 
 #include <rex/chrono/clock.h>
+#include <rex/filesystem.h>
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
@@ -83,7 +84,22 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   // Initialize clock
   chrono::Clock::set_guest_tick_frequency(50000000);
   chrono::Clock::set_guest_system_time_base(chrono::Clock::QueryHostSystemTime());
-  chrono::Clock::set_guest_time_scalar(1.0);
+  // NOT an unconditional 1.0. RexApp applies guest_time_scalar just before
+  // calling Setup, and where rexruntime is its own shared library that write
+  // lands in the exe's copy of the clock statics and this one initialises the
+  // library's - two copies, both correct. Linked statically
+  // (REXGLUE_RUNTIME_STATIC, which is every console preset) there is one copy,
+  // so this line ran last and silently put the scalar back: the cvar has never
+  // done anything on Switch. It is the one instrument that tells a fixed
+  // simulation step apart from a fixed per-frame cost, so losing it costs a
+  // hardware run every time the question comes up.
+  //
+  // Queried by name rather than linked: the cvar is defined in rexui, which is
+  // not on this module's link line. An unknown name queries as 0.0, and a zero
+  // scalar stops guest time altogether, so anything but a sane positive number
+  // means "not configured" and takes the 1.0 this always used.
+  const double time_scalar = REXCVAR_QUERY(double, guest_time_scalar);
+  chrono::Clock::set_guest_time_scalar(time_scalar > 0.0 ? time_scalar : 1.0);
 
   // Enable threading affinity configuration
   thread::EnableAffinityConfiguration();
@@ -276,7 +292,7 @@ bool Runtime::SetupVfs() {
     return true;
   }
 
-  auto abs_game_root = std::filesystem::absolute(game_data_root_);
+  auto abs_game_root = rex::filesystem::ToAbsolute(game_data_root_);
   if (!std::filesystem::exists(abs_game_root)) {
     REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
     return false;
@@ -303,7 +319,7 @@ bool Runtime::SetupVfs() {
 
   // Mount update_data_root as update:\ if provided
   if (!update_data_root_.empty()) {
-    auto abs_update_root = std::filesystem::absolute(update_data_root_);
+    auto abs_update_root = rex::filesystem::ToAbsolute(update_data_root_);
     if (std::filesystem::exists(abs_update_root)) {
       auto update_mount = "\\Device\\Harddisk0\\PartitionUpdate";
       auto update_device =

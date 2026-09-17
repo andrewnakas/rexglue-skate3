@@ -93,6 +93,42 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND REXGLUE_USE_VULKAN)
     )
 endif()
 
+if(REX_SWITCH AND REXGLUE_USE_VULKAN)
+    # NVK, Mesa's NVIDIA driver ported to Horizon. There is no loader and no
+    # dlopen here: the driver is linked into the NRO and reached through the one
+    # symbol it exports, vk_icdGetInstanceProcAddr (see vulkan_instance.cpp).
+    #
+    # REXGLUE_SWITCH_NVK_ROOT is a devkitPro-shaped prefix holding lib/ and
+    # include/. It defaults to the portlibs directory, where "make install"
+    # puts it, but can point anywhere - which is what a build that cannot write
+    # to /opt uses.
+    if(NOT REXGLUE_SWITCH_NVK_ROOT)
+        set(REXGLUE_SWITCH_NVK_ROOT "${DEVKITPRO}/portlibs/switch")
+    endif()
+    set(_nvk_lib "${REXGLUE_SWITCH_NVK_ROOT}/lib")
+    if(NOT EXISTS "${_nvk_lib}/libnvk.a")
+        message(FATAL_ERROR
+            "No libnvk.a under ${_nvk_lib}. Build NXVK (scripts/nxvk_build_on_linux.sh) and "
+            "install it, or point -DREXGLUE_SWITCH_NVK_ROOT at the package.")
+    endif()
+
+    target_include_directories(rexruntime PUBLIC "${REXGLUE_SWITCH_NVK_ROOT}/include")
+
+    # --whole-archive: the driver's entry point is reached only through the -u
+    # below, so without it the linker would keep almost nothing. The support
+    # archives resolve against each other in both directions, hence the group.
+    target_link_libraries(rexruntime PUBLIC
+        -Wl,-u,vk_icdGetInstanceProcAddr
+        -Wl,--whole-archive "${_nvk_lib}/libnvk.a" -Wl,--no-whole-archive
+        -Wl,--start-group "${_nvk_lib}/libnvk_support.a" -lz -lexpat -Wl,--end-group
+        nx
+    )
+    # NVK ships two Rust archives that each carry their own copy of the Rust
+    # runtime. Mesa's own link absorbs that internally; a downstream consumer
+    # cannot, so it is allowed here and nowhere else.
+    target_link_options(rexruntime PUBLIC "LINKER:--allow-multiple-definition")
+endif()
+
 target_include_directories(rexruntime PUBLIC
     $<BUILD_INTERFACE:${REXGLUE_ROOT}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
@@ -107,11 +143,21 @@ target_link_libraries(rexruntime
         fmt::fmt
         spdlog::spdlog
         tomlplusplus
-        SDL3::SDL3
     PRIVATE
         aes128
         mspack
 )
+
+# SDL comes in through the ui, audio and input libraries, which is where it is
+# actually used; naming it here as well is only a convenience for consumers
+# that link the runtime alone. On a build without SDL the target does not
+# exist, and referencing a target that does not exist is a configure error
+# rather than something the generator can skip.
+if(REXGLUE_USE_SDL)
+    target_link_libraries(rexruntime PUBLIC SDL3::SDL3)
+elseif(REX_SWITCH)
+    target_link_libraries(rexruntime PUBLIC nx)
+endif()
 
 if(REXGLUE_ENABLE_TRACY)
     target_link_libraries(rexruntime PUBLIC TracyClient)

@@ -414,9 +414,41 @@ struct CpSummary {
   uint64_t waits = 0;
   uint64_t wait_us = 0;
   uint64_t batches = 0;
+  // Time actually spent executing the guest's command stream. "wait" says how
+  // long this thread was idle; without its opposite, a thread that is never
+  // idle is indistinguishable from a thread that is idle in a way this counter
+  // does not watch. On the Switch port the wait is zero and the frame is still
+  // spent here, so the question "doing what" needs busy time to answer.
+  uint64_t exec_us = 0;
   std::chrono::steady_clock::time_point last_report{};
 };
 CpSummary g_cp_summary;
+
+// Per-opcode cost of the guest's command stream. Draws and resolves together
+// account for five per cent of this thread while it is ninety-nine per cent
+// busy, so the work is in the packet handlers themselves and the only way to
+// find out which is to time all of them and let the biggest speak up.
+std::atomic<uint64_t> g_op_us[128] = {};
+std::atomic<uint64_t> g_op_count[128] = {};
+
+// Defined in the Vulkan command processor: what the emulated path still
+// executes while the native renderer is replacing the frame.
+extern "C" {
+extern std::atomic<uint64_t> rex_diag_cp_draws;
+extern std::atomic<uint64_t> rex_diag_cp_draws_suppressed;
+extern std::atomic<uint64_t> rex_diag_cp_draws_memexport;
+extern std::atomic<uint64_t> rex_diag_cp_draws_depthonly;
+extern std::atomic<uint64_t> rex_diag_cp_draw_us;
+extern std::atomic<uint64_t> rex_diag_cp_copies;
+extern std::atomic<uint64_t> rex_diag_cp_copies_suppressed;
+extern std::atomic<uint64_t> rex_diag_cp_copy_us;
+extern std::atomic<uint64_t> rex_diag_swap_calls;
+extern std::atomic<uint64_t> rex_diag_swap_begin_us;
+extern std::atomic<uint64_t> rex_diag_swap_tex_us;
+extern std::atomic<uint64_t> rex_diag_swap_native_us;
+extern std::atomic<uint64_t> rex_diag_swap_refresh_us;
+extern std::atomic<uint64_t> rex_diag_swap_total_us;
+}
 
 }  // namespace
 
@@ -442,12 +474,83 @@ void CommandProcessor::ReportCpSummary() {
   // Dead time as a share of the window is the number that matters: it is the
   // fraction of the command processor's life spent parked on a fence.
   const double wait_ms = double(g_cp_summary.wait_us) / 1000.0;
-  REXLOG_INFO(
+  const double exec_ms = double(g_cp_summary.exec_us) / 1000.0;
+  // Warn, not info. This one line separates "the command processor is
+  // saturated" from "it is parked waiting for the guest", which is the first
+  // fork in every frame-rate investigation - and at info it is invisible in a
+  // shipped run. A thirteen minute Switch capture came back with the question
+  // unanswerable for exactly that reason.
+  REXLOG_WARN(
       "[cp-sum] {:.0f}s: abandons={} ({:.1f}/min) waits={} wait={:.0f}ms ({:.1f}% of window) "
-      "batches={} ({:.0f}/s)",
+      "batches={} ({:.0f}/s) exec={:.0f}ms ({:.1f}% of window, {:.1f}ms/batch)",
       secs, g_cp_summary.abandons, double(g_cp_summary.abandons) * 60.0 / secs,
       g_cp_summary.waits, wait_ms, wait_ms / (secs * 10.0), g_cp_summary.batches,
-      double(g_cp_summary.batches) / secs);
+      double(g_cp_summary.batches) / secs, exec_ms, exec_ms / (secs * 10.0),
+      g_cp_summary.batches ? exec_ms / double(g_cp_summary.batches) : 0.0);
+  {
+    // Draws and resolves the emulated path still ran, against the ones the
+    // native renderer's suppression skipped, and what the survivors cost. If
+    // exec is the frame and these are near zero, the cost is PM4 handling
+    // rather than drawing, which is a different fix entirely.
+    const uint64_t d = rex_diag_cp_draws.exchange(0, std::memory_order_relaxed);
+    const uint64_t ds = rex_diag_cp_draws_suppressed.exchange(0, std::memory_order_relaxed);
+    const uint64_t dm = rex_diag_cp_draws_memexport.exchange(0, std::memory_order_relaxed);
+    const uint64_t dd = rex_diag_cp_draws_depthonly.exchange(0, std::memory_order_relaxed);
+    const uint64_t du = rex_diag_cp_draw_us.exchange(0, std::memory_order_relaxed);
+    const uint64_t c = rex_diag_cp_copies.exchange(0, std::memory_order_relaxed);
+    const uint64_t cs = rex_diag_cp_copies_suppressed.exchange(0, std::memory_order_relaxed);
+    const uint64_t cu = rex_diag_cp_copy_us.exchange(0, std::memory_order_relaxed);
+    REXLOG_WARN(
+        "[cp-draw] draws={} ({}/s) suppressed={} ({:.0f}%) memexport={} depthonly={} "
+        "draw={:.0f}ms ({:.1f}% of window) | resolves={} suppressed={} resolve={:.0f}ms",
+        d, double(d) / secs, ds, d ? 100.0 * double(ds) / double(d) : 0.0, dm, dd,
+        double(du) / 1000.0, double(du) / (secs * 10000.0), c, cs, double(cu) / 1000.0);
+  }
+  {
+    // The five most expensive opcodes this window, by time. Names would need a
+    // table that does not exist here; the opcode number is enough to look up.
+    struct Op { uint32_t op; uint64_t us; uint64_t n; };
+    Op top[5] = {};
+    uint64_t total_op_us = 0;
+    for (uint32_t i = 0; i < 128; ++i) {
+      const uint64_t us = g_op_us[i].exchange(0, std::memory_order_relaxed);
+      const uint64_t n = g_op_count[i].exchange(0, std::memory_order_relaxed);
+      total_op_us += us;
+      if (us > top[4].us) {
+        top[4] = Op{i, us, n};
+        for (int j = 4; j > 0 && top[j].us > top[j - 1].us; --j) {
+          std::swap(top[j], top[j - 1]);
+        }
+      }
+    }
+    std::string line;
+    for (const Op& o : top) {
+      if (o.us == 0) break;
+      line += fmt::format("op{:02X}={:.0f}ms/{} ", o.op, double(o.us) / 1000.0, o.n);
+    }
+    REXLOG_WARN("[cp-op] packets={:.0f}ms ({:.1f}% of window) | top: {}",
+                double(total_op_us) / 1000.0, double(total_op_us) / (secs * 10000.0), line);
+  }
+  {
+    // The swap, broken into its parts. Everything the frame waits on is in
+    // here somewhere, and until now "XE_SWAP costs 96 ms" was as far as it
+    // could be narrowed.
+    const uint64_t n = rex_diag_swap_calls.exchange(0, std::memory_order_relaxed);
+    const auto per = [n](std::atomic<uint64_t>& a) {
+      const uint64_t v = a.exchange(0, std::memory_order_relaxed);
+      return n ? double(v) / double(n) / 1000.0 : 0.0;
+    };
+    const double begin_ms = per(rex_diag_swap_begin_us);
+    const double tex_ms = per(rex_diag_swap_tex_us);
+    const double native_ms = per(rex_diag_swap_native_us);
+    const double refresh_ms = per(rex_diag_swap_refresh_us);
+    const double total_ms = per(rex_diag_swap_total_us);
+    REXLOG_WARN(
+        "[cp-swap] {} swaps, {:.1f}ms each: begin={:.1f} swaptex={:.1f} refresh={:.1f} "
+        "(native={:.1f}, present={:.1f}) other={:.1f}",
+        n, total_ms, begin_ms, tex_ms, refresh_ms, native_ms,
+        refresh_ms - native_ms, total_ms - begin_ms - tex_ms - refresh_ms);
+  }
   g_cp_summary = CpSummary{};
   g_cp_summary.last_report = now;
 }
@@ -513,7 +616,11 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
+    const auto exec_begin = std::chrono::steady_clock::now();
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    g_cp_summary.exec_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - exec_begin)
+                                         .count());
     ++g_cp_summary.batches;
     ReportCpSummary();
 
@@ -1119,6 +1226,19 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   }
 
   bool result = false;
+  // Timed by opcode. RAII so every early return inside the switch is counted.
+  struct OpTimer {
+    uint32_t op;
+    std::chrono::steady_clock::time_point t0;
+    ~OpTimer() {
+      g_op_us[op & 0x7F].fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count()),
+          std::memory_order_relaxed);
+      g_op_count[op & 0x7F].fetch_add(1, std::memory_order_relaxed);
+    }
+  } op_timer{opcode, std::chrono::steady_clock::now()};
   switch (opcode) {
     case PM4_ME_INIT:
       result = ExecutePacketType3_ME_INIT(reader, packet, count);

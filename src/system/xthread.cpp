@@ -906,7 +906,12 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
+#if !REX_PLATFORM_SWITCH
+    // Expected on this console: an application is given three cores and the
+    // placement map assigns them by name, so the count-based path here is not
+    // the mechanism in use and the warning would fire for every guest thread.
     REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+#endif
   }
 }
 

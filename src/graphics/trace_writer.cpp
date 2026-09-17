@@ -36,7 +36,7 @@ TraceWriter::~TraceWriter() = default;
 bool TraceWriter::Open(const std::filesystem::path& path, uint32_t title_id) {
   Close();
 
-  auto canonical_path = std::filesystem::absolute(path);
+  auto canonical_path = rex::filesystem::ToAbsolute(path);
   if (canonical_path.has_parent_path()) {
     auto base_path = canonical_path.parent_path();
     std::filesystem::create_directories(base_path);

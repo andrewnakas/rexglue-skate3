@@ -56,6 +56,15 @@ inline constexpr const char* kVulkanLoader = "libvulkan.so.1";
 inline constexpr const char* kRenderDoc = "librenderdoc.so";
 inline constexpr const char* kSpirvToolsSdkPath = "bin/libSPIRV-Tools-shared.so";
 
+#elif REX_PLATFORM_SWITCH
+
+// Nothing is loaded at runtime on Horizon: there is no dynamic linker, and the
+// Vulkan driver is linked into the NRO. These exist so the shared code that
+// names a loader still compiles; DynamicLibrary::Load always fails.
+inline constexpr const char* kVulkanLoader = "";
+inline constexpr const char* kRenderDoc = "";
+inline constexpr const char* kSpirvToolsSdkPath = "";
+
 #elif REX_PLATFORM_MAC
 
 inline constexpr const char* kVulkanLoader = "libvulkan.1.dylib";

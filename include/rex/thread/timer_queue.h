@@ -77,4 +77,20 @@ std::weak_ptr<TimerQueueWaitItem> QueueTimerRecurring(std::move_only_function<vo
                                                       TimerQueueWaitItem::clock::time_point due,
                                                       TimerQueueWaitItem::clock::duration interval);
 
+// A window into the dispatch thread, because a timer that stops arriving is
+// indistinguishable from one that was never set. Two failures have to be told
+// apart: the dispatch thread stuck inside a guest callback, which stops every
+// timer at once, and the introduction ring filling up, which blocks whoever
+// tries to arm the next one.
+struct TimerQueueDiagnostics {
+  uint64_t iterations;   // trips round the dispatch loop
+  uint64_t dispatched;   // callbacks entered
+  uint64_t completed;    // callbacks returned
+  uint64_t queued;       // timers introduced
+  uint64_t claim_waits;  // arms that had to wait for ring space
+  uint64_t pending;      // timers currently in the sorted queue
+  bool in_callback;
+};
+TimerQueueDiagnostics GetTimerQueueDiagnostics();
+
 }  // namespace rex::thread

@@ -36,7 +36,12 @@ REXCVAR_DEFINE_INT32(
     "buffers, ~2); may cause stuttering if too low for the machine.");
 
 // Defined in the SDL driver; gates the same 5-second reporting cadence.
-REXCVAR_DECLARE(bool, audio_stats);
+// Defined here rather than in a backend: this file is the one that reads it and
+// is built on every platform, whereas the backends are mutually exclusive and
+// only one of them ever exists in a given build.
+REXCVAR_DEFINE_BOOL(audio_stats, false, "Audio",
+                    "Log audio timing and dropout counters. Off by default: the bookkeeping "
+                    "costs a little time on the mixing path, which is measurable on a console.");
 
 REXCVAR_DEFINE_BOOL(
     audio_even_dispatch, true, "Audio",

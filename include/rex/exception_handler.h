@@ -531,4 +531,9 @@ class ExceptionHandler {
   static void Uninstall(Handler fn, void* data);
 };
 
+// Installs a std::terminate handler that reports what was thrown before the
+// process dies. Without it an uncaught exception - std::bad_alloc especially -
+// ends the process silently through abort, with no output at all.
+void InstallSwitchTerminateHandler();
+
 }  // namespace rex::arch

@@ -17,6 +17,16 @@
 #ifndef __BIG_ENDIAN
 #define __BIG_ENDIAN BIG_ENDIAN
 #endif
+#elif defined(__SWITCH__)
+// newlib has no <endian.h>; the same BYTE_ORDER and BIG_ENDIAN macros the
+// fallback above wants are in <machine/endian.h>.
+#include <machine/endian.h>
+#ifndef __BYTE_ORDER
+#define __BYTE_ORDER BYTE_ORDER
+#endif
+#ifndef __BIG_ENDIAN
+#define __BIG_ENDIAN BIG_ENDIAN
+#endif
 #else
 #include <endian.h>
 #endif

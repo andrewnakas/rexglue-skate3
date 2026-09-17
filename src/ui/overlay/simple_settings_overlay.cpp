@@ -168,10 +168,25 @@ constexpr std::array<double, 12> kAspectRatioPresets = {
 static_assert(kAspectRatioLabels.size() ==
                   size_t(kAspectRatioFirstPresetIndex) + kAspectRatioPresets.size(),
               "every label past Auto needs an aspect, and vice versa");
-constexpr std::array<double, 6> kFrameCapRates = {60.0, 90.0, 120.0, 144.0, 165.0, 240.0};
-constexpr std::array<const char*, 7> kFrameCapLabels = {"Unlimited", "60 FPS",  "90 FPS",
-                                                        "120 FPS",   "144 FPS", "165 FPS",
-                                                        "240 FPS"};
+// 30 is here for consoles, where it is a rate the hardware can actually hold
+// and an even 30 reads better than an uneven 45 on a fixed 60 Hz panel. It is
+// also the only way to ask a 30 fps-era title whether its simulation is tied
+// to the frame rather than to elapsed time, which needs A/B-ing the cap while
+// the game is running.
+// Labels are [0] = Unlimited followed by one per rate, in rate order; the
+// option list is built as [Auto,] rates..., Unlimited.
+// 20 and 24 are here for consoles that cannot hold 30 in the heavier worlds.
+// They look low, but on a title whose simulation advances one refresh period
+// per rendered frame the alternative is not a higher frame rate - it is the
+// same frame rate played in slow motion, because speed is fps/refresh. A rate
+// the hardware actually holds plays at the right speed.
+constexpr std::array<double, 9> kFrameCapRates = {20.0,  24.0,  30.0, 60.0, 90.0,
+                                                  120.0, 144.0, 165.0, 240.0};
+constexpr std::array<const char*, 10> kFrameCapLabels = {
+    "Unlimited", "20 FPS",  "24 FPS",  "30 FPS",  "60 FPS",
+    "90 FPS",    "120 FPS", "144 FPS", "165 FPS", "240 FPS"};
+static_assert(kFrameCapLabels.size() == kFrameCapRates.size() + 1,
+              "every rate needs a label, plus the Unlimited entry at [0]");
 constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
     "resolution_scale",
     "draw_resolution_scale_x",

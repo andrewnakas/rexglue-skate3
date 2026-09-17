@@ -385,8 +385,11 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       assert_true((args->xmp_client == 0x00000002 && args->controller == 0x00000000) ||
                   (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
-      REXKRNL_DEBUG("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
-                    uint32_t(args->playback_client));
+      // Info, not debug: this is how a title says a video started and stopped,
+      // and "did the intro movie ever finish" is a question worth being able to
+      // answer without turning on a log level that changes the timing.
+      REXKRNL_INFO("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
+                   uint32_t(args->playback_client));
 
       playback_client_ = PlaybackClient(uint32_t(args->playback_client));
       kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, !args->playback_client);

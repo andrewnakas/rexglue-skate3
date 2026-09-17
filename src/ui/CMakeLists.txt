@@ -74,6 +74,15 @@ elseif(APPLE)
         window_sdl.cpp
         windowed_app_context_sdl.cpp
     )
+elseif(REX_SWITCH)
+    # No SDL here, so the window, the surface and the event loop are all libnx:
+    # one NWindow that is never resized by the user, and an applet loop that
+    # also carries the pad update and the dock/undock transition.
+    set(REXUI_PLATFORM_SOURCES
+        surface_switch.cpp
+        window_switch.cpp
+        windowed_app_context_switch.cpp
+    )
 elseif(ANDROID)
     # Must precede the desktop-Linux fallback: Android is UNIX but has neither
     # GTK nor XCB. The surface is an ANativeWindow handed to
@@ -166,6 +175,8 @@ if(WIN32)
         dxgi
         dxguid
     )
+elseif(REX_SWITCH)
+    target_link_libraries(rexui PUBLIC nx)
 elseif(APPLE)
     target_link_libraries(rexui PUBLIC SDL3::SDL3)
 elseif(ANDROID)
