@@ -18,6 +18,13 @@
 #include <rex/memory.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/cvar.h>
+
+// Defined in the filesystem, used here because this is where a path and its
+// result are both in hand. See the use site below.
+REXCVAR_DECLARE(int32_t, filesystem_log_opens);
+REXCVAR_DECLARE(int32_t, filesystem_log_reads);
+REXCVAR_DECLARE(std::string, filesystem_log_reads_path);
 #include <rex/system/info/file.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>
@@ -173,6 +180,23 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
   }
+  // Every open, successful ones included, at WARN and on a budget.
+  //
+  // A failed open already logs its path; a successful one logs only a handle,
+  // so there is no way to see WHICH files a run actually read. That is exactly
+  // the question when two runs differ and nothing else in the log does - a
+  // title that takes a different branch reads different files, and the only
+  // visible symptom otherwise is that one run works and the other does not.
+  // Turning the global log level up to trace answers it too, but at a volume
+  // that changes the timing of what is being measured.
+  //
+  // WARN because the phone builds ship at log_level=warn and this exists to be
+  // read in a report. Budgeted rather than boolean so it cannot run away: the
+  // count is what a boot plus one map load costs, and it stops there.
+  if (REXCVAR_GET(filesystem_log_opens) > 0) {
+    REXCVAR_SET(filesystem_log_opens, REXCVAR_GET(filesystem_log_opens) - 1);
+    REXLOG_WARN("[open] {:#x} '{}'", result, target_path);
+  }
   return result;
 }
 
@@ -207,6 +231,25 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  }
+
+  // Which byte ranges the guest actually pulls out of a file, at WARN and on a
+  // budget. A DLC pack is one archive the title reads by offset, so "did it
+  // even look at the string table" cannot be answered from open() logs - the
+  // archive is opened once and everything after that is seeks and reads.
+  if (file && REXCVAR_GET(filesystem_log_reads) > 0) {
+    const std::string& watched = REXCVAR_GET(filesystem_log_reads_path);
+    const std::string path = file->entry() ? file->entry()->path() : std::string();
+    if (watched.empty() || path.find(watched) != std::string::npos) {
+      REXCVAR_SET(filesystem_log_reads, REXCVAR_GET(filesystem_log_reads) - 1);
+      // byte_offset_ptr is null for a sequential read - the position lives on
+      // the file object. Logging the argument alone reported every read as
+      // offset 0, which said nothing about WHICH part of the archive was being
+      // fetched, and that is the entire question here.
+      REXLOG_WARN("[read] '{}' pos={:#x} len={:#x}{}", path,
+                  byte_offset_ptr ? byte_offset : file->position(),
+                  (uint32_t)buffer_length, byte_offset_ptr ? "" : " (seq)");
+    }
   }
 
   if (XSUCCEEDED(result)) {

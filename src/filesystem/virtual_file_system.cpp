@@ -35,6 +35,26 @@ REXCVAR_DEFINE_STRING(
     "than checking it, so a missing file is an access violation, not a "
     "degraded map. Empty disables it and costs nothing.");
 
+// Budgeted log of every file the guest opens, successes included. See the use
+// site in xboxkrnl_io.cpp (NtCreateFile) for why this exists: a failed open
+// already names its path, a successful one does not, so two runs that read
+// different files look identical in the log. Counts down to zero and stops.
+REXCVAR_DEFINE_INT32(filesystem_log_reads, 0, "Filesystem",
+                     "Log the next N guest file READS at warn - path, offset and length. "
+                     "An archive is opened once and then read by offset, so this is the only "
+                     "way to see which parts of a DLC pack the title actually touches.")
+    .range(0, 200000);
+REXCVAR_DEFINE_STRING(filesystem_log_reads_path, "", "Filesystem",
+                      "Only log reads whose path contains this substring. Empty logs every "
+                      "file, which a boot will exhaust the budget on immediately.");
+
+REXCVAR_DEFINE_INT32(filesystem_log_opens, 0, "Filesystem",
+                     "Log the next N file opens at warn, path and result, successes included. "
+                     "0 disables it. For diffing two runs that differ in what the title reads - "
+                     "turning the global log level up to trace answers the same question at a "
+                     "volume that changes the timing of what is being measured.")
+    .range(0, 200000);
+
 REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
                     "Not useful to non-developers. Allows code to write to paths "
                     "relative to game://. Used for "
