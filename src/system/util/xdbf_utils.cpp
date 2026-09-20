@@ -63,8 +63,20 @@ XdbfBlock XdbfWrapper::GetEntry(XdbfSection section, uint64_t id) const {
 }
 
 std::string XdbfWrapper::GetStringTableEntry(XLanguage language, uint16_t string_id) const {
+  return GetStringTableEntry(language, string_id, true);
+}
+
+std::string XdbfWrapper::GetStringTableEntry(XLanguage language, uint16_t string_id,
+                                             bool allow_fallback) const {
   auto language_block = GetEntry(XdbfSection::kStringTable, static_cast<uint64_t>(language));
   if (!language_block) {
+    // No table at all for this language. Content built for one market carries
+    // one language and leaves the rest out entirely, so this is the ordinary
+    // case for a custom pack rather than a corrupt one - and returning empty
+    // put blank rows where names belong.
+    if (allow_fallback && language != XLanguage::kEnglish) {
+      return GetStringTableEntry(XLanguage::kEnglish, string_id, false);
+    }
     return "";
   }
 
@@ -80,6 +92,12 @@ std::string XdbfWrapper::GetStringTableEntry(XLanguage language, uint16_t string
       return std::string(reinterpret_cast<const char*>(ptr), entry->string_length);
     }
     ptr += entry->string_length;
+  }
+  // The table exists but has nothing under this id - a partially translated
+  // package. Same answer as having no table: a name in the wrong language
+  // beats the raw identifier the caller would otherwise show.
+  if (allow_fallback && language != XLanguage::kEnglish) {
+    return GetStringTableEntry(XLanguage::kEnglish, string_id, false);
   }
   return "";
 }

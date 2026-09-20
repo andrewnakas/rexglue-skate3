@@ -364,54 +364,67 @@ struct XContentMetadata {
     char16_t chars[kNumLanguagesV2 - kNumLanguagesV1][128];
   } description_ex_raw;
 
-  std::u16string display_name(XLanguage language) const {
-    uint32_t lang_id = uint32_t(language) - 1;
+  // One localised string out of a metadata block, falling back to English when
+  // this package has nothing for the language asked for.
+  //
+  // THE FALLBACK IS THE POINT. A package carries a fixed array of slots, one
+  // per language, and a package built for one market simply leaves the rest
+  // zeroed - which is every custom map pack anyone makes, because the tools
+  // that build them only ever fill in English. Reading the empty slot and
+  // returning it handed the title an empty name for the pack and empty names
+  // for everything inside it, so a player who picked French got an unnamed
+  // entry in the map list and then rows of raw identifiers where the level
+  // names should be. Reported as "the DLC maps do not load in French or
+  // Spanish"; they load, they are just unnamed, which from the outside is the
+  // same thing.
+  //
+  // Only the out-of-range case fell back before, which is the case that
+  // essentially never happens. The empty-slot case is the one that always
+  // does.
+  std::u16string localized_string(const be<uint16_t>* v1_slots, const be<uint16_t>* v2_slots,
+                                  size_t stride, XLanguage language) const {
+    const auto slot_for = [&](uint32_t lang_id) -> const be<uint16_t>* {
+      if (lang_id < kNumLanguagesV1) {
+        return v1_slots + lang_id * stride;
+      }
+      if (lang_id < kNumLanguagesV2 && metadata_version >= 2) {
+        return v2_slots + (lang_id - kNumLanguagesV1) * stride;
+      }
+      // A language this package has no room for at all: v1 metadata asked for
+      // one of the three languages only v2 carries.
+      return nullptr;
+    };
 
+    uint32_t lang_id = uint32_t(language) - 1;
     if (lang_id >= kNumLanguagesV2) {
-      assert_always();
-      // no room for this lang, read from english slot..
       lang_id = uint32_t(XLanguage::kEnglish) - 1;
     }
 
-    const be<uint16_t>* str = 0;
-    if (lang_id >= 0 && lang_id < kNumLanguagesV1) {
-      str = display_name_raw.uint[lang_id];
-    } else if (lang_id >= kNumLanguagesV1 && lang_id < kNumLanguagesV2 && metadata_version >= 2) {
-      str = display_name_ex_raw.uint[lang_id - kNumLanguagesV1];
+    if (const be<uint16_t>* str = slot_for(lang_id)) {
+      std::u16string value = memory::load_and_swap<std::u16string>(str);
+      if (!value.empty()) {
+        return value;
+      }
     }
 
-    if (!str) {
-      // Invalid language ID?
-      assert_always();
-      return u"";
+    // Nothing for that language. English is what the packing tools fill in, so
+    // it is the fallback with the best chance of being present - and a name in
+    // the wrong language beats no name at all.
+    const uint32_t english = uint32_t(XLanguage::kEnglish) - 1;
+    if (lang_id != english) {
+      if (const be<uint16_t>* str = slot_for(english)) {
+        return memory::load_and_swap<std::u16string>(str);
+      }
     }
+    return u"";
+  }
 
-    return memory::load_and_swap<std::u16string>(str);
+  std::u16string display_name(XLanguage language) const {
+    return localized_string(display_name_raw.uint[0], display_name_ex_raw.uint[0], 128, language);
   }
 
   std::u16string description(XLanguage language) const {
-    uint32_t lang_id = uint32_t(language) - 1;
-
-    if (lang_id >= kNumLanguagesV2) {
-      assert_always();
-      // no room for this lang, read from english slot..
-      lang_id = uint32_t(XLanguage::kEnglish) - 1;
-    }
-
-    const be<uint16_t>* str = 0;
-    if (lang_id >= 0 && lang_id < kNumLanguagesV1) {
-      str = description_raw.uint[lang_id];
-    } else if (lang_id >= kNumLanguagesV1 && lang_id < kNumLanguagesV2 && metadata_version >= 2) {
-      str = description_ex_raw.uint[lang_id - kNumLanguagesV1];
-    }
-
-    if (!str) {
-      // Invalid language ID?
-      assert_always();
-      return u"";
-    }
-
-    return memory::load_and_swap<std::u16string>(str);
+    return localized_string(description_raw.uint[0], description_ex_raw.uint[0], 128, language);
   }
 
   std::u16string publisher() const {

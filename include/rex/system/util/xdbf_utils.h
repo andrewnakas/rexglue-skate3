@@ -117,7 +117,12 @@ class XdbfWrapper {
 
   // Gets a string from the string table in the given language.
   // Returns the empty string if the entry is not found.
+  // Falls back to English when this package carries nothing for `language`,
+  // which is the normal shape of content built for one market. See the
+  // definition for why that beats returning empty.
   std::string GetStringTableEntry(XLanguage language, uint16_t string_id) const;
+  std::string GetStringTableEntry(XLanguage language, uint16_t string_id,
+                                  bool allow_fallback) const;
   std::vector<XdbfAchievementTableEntry> GetAchievements() const;
 
  private:
