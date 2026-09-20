@@ -641,7 +641,10 @@ void LoadConfig(const std::filesystem::path& config_path) {
     ApplyTomlTable(config, "");
     ApplyCommandLineOverrides();
     ApplyEnvironment();
-    REXLOG_INFO("Loaded config from {}", config_path.string());
+    // WARN, not INFO. The phone builds ship at log_level=warn, so a report
+    // about a setting that would not stick could not show whether the file was
+    // read at all - which is the first thing anyone reading that report needs.
+    REXLOG_WARN("Loaded config from {}", config_path.string());
   } catch (const toml::parse_error& err) {
     REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
   }
@@ -694,7 +697,8 @@ void SaveConfig(const std::filesystem::path& config_path) {
     }
 
     if (WriteConfigFile(config_path, config)) {
-      REXLOG_INFO("Saved config to {}", config_path.string());
+      // WARN for the same reason as the load line above.
+      REXLOG_WARN("Saved config to {}", config_path.string());
     }
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
@@ -737,12 +741,32 @@ void SaveConfigValues(const std::filesystem::path& config_path,
         if (entry.type == FlagType::Command) {
           continue;
         }
+        // A value back at its default is ERASED, not written - matching
+        // SaveConfig, which skips defaults for the same reason.
+        //
+        // Writing it was how a setting the player never touched ended up in
+        // settings.toml: opening and closing the menu once persisted every key
+        // in the overlay's list at its default. That is not harmless, because
+        // the phone argument builders treat "the key appears in settings.toml"
+        // as "the player chose this" and stop supplying their own default for
+        // it - so one visit to the menu permanently froze the per-device
+        // texture and mesh store budgets at whatever that launch happened to
+        // pick.
+        //
+        // Erasing rather than skipping is what makes a reset stick: this
+        // merges into the existing file, so a key left behind would keep
+        // loading the old value forever after the player set it back.
+        if (entry.getter() == entry.default_value) {
+          config.erase(entry.name);
+          continue;
+        }
         WriteConfigValue(config, entry, entry.getter());
       }
     }
 
     if (WriteConfigFile(config_path, config)) {
-      REXLOG_INFO("Saved config to {}", config_path.string());
+      // WARN for the same reason as the load line above.
+      REXLOG_WARN("Saved config to {}", config_path.string());
     }
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());

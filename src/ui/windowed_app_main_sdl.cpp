@@ -166,6 +166,95 @@ std::vector<std::string> ApplyArgumentFileOverrides(std::vector<std::string> arg
   return args;
 }
 
+#if REX_PLATFORM_IOS || REX_PLATFORM_ANDROID
+// Everything the settings menu can write is a DEFAULT, not an override.
+//
+// cvar::LoadConfig applies settings.toml first and the command line second, so
+// an argument built above silently undoes the player's choice at the next
+// launch: the menu writes the file, this overwrites it on the way back in, and
+// the row looks broken. Reported from the phone as settings not saving after a
+// session, and it was every graphics row at once - resolution, V-Sync, MSAA,
+// shadows, ambient occlusion, bloom, sun shafts, draw distance, the frame cap
+// and both store budgets were all being forced back.
+//
+// Only keys the settings overlay itself persists are listed, so nothing
+// structural - the data roots, the log file, the Vulkan feature relaxations,
+// thread placement - can be dropped by a stray line in the file.
+//
+// A substring scan rather than a TOML parse, for the same reason the argument
+// builders themselves are string lists: this runs before the cvar system
+// exists. The worst case of being crude is that a commented-out line
+// suppresses a default and the cvar's own compiled default applies instead,
+// which is still a working configuration.
+//
+// Shared by both platforms deliberately. iOS had this for the two store
+// budgets only and was still forcing back the other twenty-four, which is most
+// of its settings menu; keeping one list is what stops the two platforms
+// drifting apart again.
+std::vector<std::string> ErasePlayerOwnedArgs(std::vector<std::string> args,
+                                              const std::filesystem::path& settings_toml) {
+  static constexpr std::string_view kPlayerOwned[] = {
+      "resolution_scale",
+      "draw_resolution_scale_x",
+      "draw_resolution_scale_y",
+      "vsync",
+      "skate3_native_render_scene",
+      "skate3_native_render_scene_msaa",
+      "skate3_native_render_scene_shadow_static_size",
+      "skate3_native_render_scene_shadow_pcss",
+      "skate3_native_render_scene_ssao",
+      "skate3_native_render_scene_bloom",
+      "skate3_native_render_scene_shafts",
+      "skate3_native_render_scene_tex_store_mb",
+      "skate3_native_render_scene_mesh_store_mb",
+      "skate3_draw_distance_scale",
+      "skate3_lod_distance_scale",
+      "skate3_guest_fps_cap",
+      "skate3_guest_fps_cap_auto",
+      "skate3_ultrawide",
+      "skate3_ultrawide_target_aspect",
+      // The audio and interface rows belong here too, and their absence was
+      // the same bug wearing different clothes. Audio Buffer Size in
+      // particular looked simply broken: the menu wrote the player's choice
+      // to settings.toml, the "--audio_device_sample_frames=512" above put it
+      // straight back at the next launch, and the row showed 512 again with
+      // no explanation. Reported from an Odin2 as the setting being
+      // unchangeable, which from the outside is exactly what it was.
+      "audio_device_sample_frames",
+      "audio_mute",
+      "user_language",
+      "skate3_field_of_view",
+      "skate3_native_render_scene_shadows",
+      "skate3_native_render_scene_shadow_tile",
+      "skate3_native_render_scene_shadow_static_casters",
+  };
+  std::string settings;
+  {
+    std::ifstream in(settings_toml);
+    if (in) {
+      std::ostringstream buf;
+      buf << in.rdbuf();
+      settings = buf.str();
+    }
+  }
+  if (settings.empty()) {
+    return args;
+  }
+  for (const std::string_view key : kPlayerOwned) {
+    if (settings.find(key) == std::string::npos) {
+      continue;  // never chosen: the shipped default still applies
+    }
+    const std::string prefixed = "--" + std::string(key) + "=";
+    args.erase(std::remove_if(args.begin(), args.end(),
+                              [&](const std::string& arg) {
+                                return arg.rfind(prefixed, 0) == 0;
+                              }),
+               args.end());
+  }
+  return args;
+}
+#endif  // REX_PLATFORM_IOS || REX_PLATFORM_ANDROID
+
 #if REX_PLATFORM_IOS
 // Texture / mesh store budgets, chosen from the memory this process is
 // actually allowed rather than from a constant.
@@ -202,18 +291,17 @@ std::vector<std::string> ApplyArgumentFileOverrides(std::vector<std::string> arg
 // normally: ship the conservative, long-shipped value and expose the choice.
 // "Texture Memory" in Settings > Video offers 256 through 768 MB and takes
 // effect immediately, and the settings file beats this default - which is why
-// these budgets are only appended below when the player has not chosen one.
+// ErasePlayerOwnedArgs drops these again once the player has chosen one.
 //
-// A FLOOR OF 256 MB APPLIES TO BOTH STORES and is not visible from here:
-// skate3_native_scene_gpu.cpp computes each cap as
-// `std::max(256, <the cvar>) << 20`, so any value below 256 is silently
-// raised. That is why every "mesh store LRU start" line ever logged says
-// cap_mb=256 - at 224 (v2.5.0), and at the 128 the 2.6.0 candidate briefly
-// set. The mesh half of that rebalance was a no-op, which is also why it
-// could not have been the gameplay regression it was blamed for. The mesh
-// numbers below are therefore documentation of intent, not of effect, and
-// the medium and small tiers cannot lower either store at all until that
-// floor is raised or removed. Leave them honest rather than reassuring.
+// The floor that applies to both stores is in skate3_native_scene_gpu.cpp,
+// which computes each cap as `std::max(kStoreFloorMb, <the cvar>) << 20`.
+// That floor WAS 256, which made the medium and small tiers below a no-op:
+// every "mesh store LRU start" line ever logged said cap_mb=256, at 224
+// (v2.5.0) and at the 128 the 2.6.0 candidate briefly set, and the mesh half
+// of that rebalance could therefore not have been the gameplay regression it
+// was blamed for. It is 64 now, so the numbers below finally mean what they
+// say and the lower tiers genuinely bite. Anything changing them should be
+// measured on a device rather than reasoned about from here.
 //
 // The lower tiers exist because 288/224 is only proven on a 4 GB phone.
 // Supported 6-core iPhones include 3 GB parts (XR, SE 2020) that were never
@@ -527,40 +615,22 @@ std::vector<std::string> BuildIOSArguments() {
       "--audio_device_sample_frames=512",
   };
 
-  // Per-device store budgets, but only as a DEFAULT. cvar::LoadConfig applies
-  // settings.toml first and the command line second, so anything named in the
-  // list above can never be changed from the settings menu: the menu would
-  // write the file, this would overwrite it at the next launch, and the row
-  // would look broken in the specific way that wastes an evening. The V-Sync
-  // row was removed for exactly that. So if the player has already chosen a
-  // texture budget, say nothing and let their choice stand.
-  //
-  // A substring scan rather than a TOML parse: this runs before the cvar system
-  // exists, the keys are unique, and the worst case of being crude is that a
-  // commented-out line suppresses the default and the cvar's own compiled
-  // default applies instead - a working configuration either way.
-  {
-    std::string settings;
-    {
-      std::ifstream in(documents / "user" / "settings.toml");
-      if (in) {
-        std::ostringstream buf;
-        buf << in.rdbuf();
-        settings = buf.str();
-      }
-    }
-    const auto chosen = [&settings](const char* key) {
-      return settings.find(key) != std::string::npos;
-    };
-    if (!chosen("skate3_native_render_scene_tex_store_mb")) {
-      args.push_back("--skate3_native_render_scene_tex_store_mb=" +
-                     std::to_string(store_budgets.tex_mb));
-    }
-    if (!chosen("skate3_native_render_scene_mesh_store_mb")) {
-      args.push_back("--skate3_native_render_scene_mesh_store_mb=" +
-                     std::to_string(store_budgets.mesh_mb));
-    }
-  }
+  // Per-device store budgets, appended as a DEFAULT like everything above:
+  // ErasePlayerOwnedArgs below drops them again if the player has chosen their
+  // own from the Texture Memory row.
+  args.push_back("--skate3_native_render_scene_tex_store_mb=" +
+                 std::to_string(store_budgets.tex_mb));
+  args.push_back("--skate3_native_render_scene_mesh_store_mb=" +
+                 std::to_string(store_budgets.mesh_mb));
+
+  // Drop every default the player has already overridden from the menu. This
+  // used to cover the two store budgets only, by not appending them - which
+  // left the other twenty-four keys above still being forced back at every
+  // launch, and that is most of what the iOS settings menu offers. Render
+  // Scale, MSAA, Audio Buffer Size and the frame cap were all completely
+  // inert; shadows and volumetric lighting were half-applied, which reads as a
+  // rendering bug rather than as a setting.
+  args = ErasePlayerOwnedArgs(std::move(args), documents / "user" / "settings.toml");
 
   return ApplyArgumentFileOverrides(std::move(args), documents / "user" / "ios_args.txt",
                                     "ios_args");
@@ -593,8 +663,8 @@ std::filesystem::path AndroidFilesRoot() {
 // this renderer has been played against at length (every 4 GB iPhone shipped
 // with it, see PickStoreBudgets in the iOS branch), so an 8 GB phone starts
 // there too and raises it from user/android_args.txt once the eviction rate
-// has been measured rather than guessed. The 256 MB floor in
-// skate3_native_scene_gpu.cpp applies here as well.
+// has been measured rather than guessed. The store floor in
+// skate3_native_scene_gpu.cpp (kStoreFloorMb, 64 MB) applies here as well.
 struct AndroidStoreBudgets {
   uint32_t tex_mb;
   uint32_t mesh_mb;
@@ -886,86 +956,10 @@ std::vector<std::string> BuildAndroidArguments() {
     set_arg("skate3_native_render_lw_refresh", "2");
   }
 
-  // Everything the settings menu can write is a DEFAULT here, not an override.
-  //
-  // cvar::LoadConfig applies settings.toml first and the command line second,
-  // so an argument named here silently undoes the player's choice at the next
-  // launch: the menu writes the file, this overwrites it on the way back in,
-  // and the row looks broken. Reported from the phone as settings not saving
-  // after a session, and it was every graphics row at once - resolution,
-  // V-Sync, MSAA, shadows, ambient occlusion, bloom, sun shafts, draw
-  // distance, the frame cap and both store budgets were all being forced back.
-  //
-  // The iOS list has the same shape and solved it for the two store budgets
-  // only; this covers the whole overlap. Only keys the settings overlay itself
-  // persists are listed, so nothing structural - the data roots, the log file,
-  // the Vulkan feature relaxations, thread placement - can be dropped by a
-  // stray line in the file.
-  //
-  // A substring scan rather than a TOML parse, for the same reason as the iOS
-  // block above: this runs before the cvar system exists. The worst case of
-  // being crude is that a commented-out line suppresses a default and the
-  // cvar's own compiled default applies instead, which is still a working
-  // configuration.
-  {
-    static constexpr std::string_view kPlayerOwned[] = {
-        "resolution_scale",
-        "draw_resolution_scale_x",
-        "draw_resolution_scale_y",
-        "vsync",
-        "skate3_native_render_scene",
-        "skate3_native_render_scene_msaa",
-        "skate3_native_render_scene_shadow_static_size",
-        "skate3_native_render_scene_shadow_pcss",
-        "skate3_native_render_scene_ssao",
-        "skate3_native_render_scene_bloom",
-        "skate3_native_render_scene_shafts",
-        "skate3_native_render_scene_tex_store_mb",
-        "skate3_native_render_scene_mesh_store_mb",
-        "skate3_draw_distance_scale",
-        "skate3_lod_distance_scale",
-        "skate3_guest_fps_cap",
-        "skate3_guest_fps_cap_auto",
-        "skate3_ultrawide",
-        "skate3_ultrawide_target_aspect",
-        // The audio and interface rows belong here too, and their absence was
-        // the same bug wearing different clothes. Audio Buffer Size in
-        // particular looked simply broken: the menu wrote the player's choice
-        // to settings.toml, the "--audio_device_sample_frames=512" above put it
-        // straight back at the next launch, and the row showed 512 again with
-        // no explanation. Reported from an Odin2 as the setting being
-        // unchangeable, which from the outside is exactly what it was.
-        "audio_device_sample_frames",
-        "audio_mute",
-        "user_language",
-        "skate3_field_of_view",
-        "skate3_native_render_scene_shadows",
-        "skate3_native_render_scene_shadow_tile",
-        "skate3_native_render_scene_shadow_static_casters",
-    };
-    std::string settings;
-    {
-      std::ifstream in(root / "user" / "settings.toml");
-      if (in) {
-        std::ostringstream buf;
-        buf << in.rdbuf();
-        settings = buf.str();
-      }
-    }
-    if (!settings.empty()) {
-      for (const std::string_view key : kPlayerOwned) {
-        if (settings.find(key) == std::string::npos) {
-          continue;  // never chosen: the shipped default still applies
-        }
-        const std::string prefixed = "--" + std::string(key) + "=";
-        args.erase(std::remove_if(args.begin(), args.end(),
-                                  [&](const std::string& arg) {
-                                    return arg.rfind(prefixed, 0) == 0;
-                                  }),
-                   args.end());
-      }
-    }
-  }
+  // Drop every default the player has already overridden from the menu.
+  // Shared with the iOS builder: see ErasePlayerOwnedArgs for why, and for the
+  // list of keys the settings overlay owns.
+  args = ErasePlayerOwnedArgs(std::move(args), root / "user" / "settings.toml");
 
   return ApplyArgumentFileOverrides(std::move(args), root / "user" / "android_args.txt",
                                     "android_args");

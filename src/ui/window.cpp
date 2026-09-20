@@ -83,13 +83,15 @@ REXCVAR_DEFINE_DOUBLE(
     "\n"
     "iOS is where they diverge. SDL reports UIScreen.maximumFramesPerSecond, so "
     "a ProMotion iPhone reports 120, but iOS holds a CAMetalLayer to 60 fps "
-    "unless the bundle sets CADisableMinimumFrameDurationOnPhone - which this "
-    "one does not. Left uncapped, AutoFrameCapHz derived 114 FPS on a surface "
-    "that can only present 60: the pacer never fires, the producer overruns the "
-    "present pipeline and the frame settles on a multiple of the vblank - a "
-    "measured 33.3 ms, i.e. 30 FPS, on hardware far faster than the 60 Hz "
-    "phones that hold a locked 60 at an auto cap of 56. Raise this only "
-    "together with the Info.plist opt-in.")
+    "unless the bundle sets CADisableMinimumFrameDurationOnPhone. This bundle "
+    "does set it (cmake/ios/Info.plist.in), so the reported rate is true again "
+    "and the default here is 0. The history is why the cvar exists: before that "
+    "opt-in, AutoFrameCapHz derived 114 FPS on a surface that could only "
+    "present 60 - the pacer never fires, the producer overruns the present "
+    "pipeline and the frame settles on a multiple of the vblank, a measured "
+    "33.3 ms, i.e. 30 FPS, on hardware far faster than the 60 Hz phones that "
+    "hold a locked 60 at an auto cap of 56. Set this only for a platform that "
+    "presents slower than it reports.")
     .range(0.0, 1000.0)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 

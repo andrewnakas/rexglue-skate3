@@ -175,16 +175,24 @@ static_assert(kAspectRatioLabels.size() ==
 // the game is running.
 // Labels are [0] = Unlimited followed by one per rate, in rate order; the
 // option list is built as [Auto,] rates..., Unlimited.
-// 20 and 24 are here for consoles that cannot hold 30 in the heavier worlds.
-// They look low, but on a title whose simulation advances one refresh period
-// per rendered frame the alternative is not a higher frame rate - it is the
-// same frame rate played in slow motion, because speed is fps/refresh. A rate
-// the hardware actually holds plays at the right speed.
-constexpr std::array<double, 9> kFrameCapRates = {20.0,  24.0,  30.0, 60.0, 90.0,
+// 24 is here for consoles that cannot hold 30 in the heavier worlds. It looks
+// low, but on a title whose simulation advances one refresh period per
+// rendered frame the alternative is not a higher frame rate - it is the same
+// frame rate played in slow motion, because speed is fps/refresh. A rate the
+// hardware actually holds plays at the right speed.
+//
+// 20 was offered here and could never work: the guest video mode reports
+// 24-240 Hz (video_mode_refresh_rate's own range), so
+// MatchGuestRefreshToFrameCap declines anything below 24 and leaves the
+// refresh at 60 - making "20 FPS" exactly the one-third-speed game this list
+// exists to avoid. Restoring it means lowering that floor and establishing
+// that the title's timestep survives a 20 Hz refresh, not adding the entry
+// back.
+constexpr std::array<double, 8> kFrameCapRates = {24.0,  30.0,  60.0,  90.0,
                                                   120.0, 144.0, 165.0, 240.0};
-constexpr std::array<const char*, 10> kFrameCapLabels = {
-    "Unlimited", "20 FPS",  "24 FPS",  "30 FPS",  "60 FPS",
-    "90 FPS",    "120 FPS", "144 FPS", "165 FPS", "240 FPS"};
+constexpr std::array<const char*, 9> kFrameCapLabels = {
+    "Unlimited", "24 FPS",  "30 FPS",  "60 FPS", "90 FPS",
+    "120 FPS",   "144 FPS", "165 FPS", "240 FPS"};
 static_assert(kFrameCapLabels.size() == kFrameCapRates.size() + 1,
               "every rate needs a label, plus the Unlimited entry at [0]");
 constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
@@ -1510,7 +1518,10 @@ void SimpleSettingsDialog::ShowPerformance() {
 
 void SimpleSettingsDialog::TogglePerformance() {
   if (visible_ && category_ == kPerformanceCategory) {
-    Hide();
+    // RequestClose, not Hide, for the same reason the gear and Back paths use
+    // it: the performance chord is a normal way to leave the menu, and the
+    // Performance page carries restart-class rows of its own.
+    RequestClose();
     return;
   }
   ShowPerformance();
@@ -1834,9 +1845,19 @@ void SimpleSettingsDialog::SaveVideo() {
   //
   // Everything written above is now live in the cvars, so the staged-vs-live
   // test can no longer tell that anything happened - which is why this exists.
-  // Only the rows the game reads once at startup count: changing V-Sync or the
-  // frame cap takes effect immediately and needs no restart, and claiming
-  // otherwise would leave the prompt up forever.
+  // Only the rows the game reads once at startup count: changing V-Sync takes
+  // effect immediately and needs no restart, and claiming otherwise would
+  // leave the prompt up forever.
+  //
+  // The frame cap IS one of them, despite pacing the very next frame. The
+  // title advances one REPORTED refresh period of simulation per rendered
+  // frame, so a cap only plays at the right speed if the guest video mode says
+  // the same number - and MatchGuestRefreshToFrameCap can only set that once,
+  // before the guest starts, because the title reads the mode at startup and
+  // never again. Changing the cap mid-session therefore paces 30 fps into a
+  // guest that still believes it is 60 Hz, and the game runs at half speed.
+  // The 30 fps cap was verified from launch arguments, which is why this never
+  // showed up there.
   if (opening_.valid) {
     const bool needs_restart =
         resolution_scale_index_ != opening_.resolution_scale_index ||
@@ -1844,7 +1865,8 @@ void SimpleSettingsDialog::SaveVideo() {
         shadow_level_index_ != opening_.shadow_level_index ||
         aspect_ratio_index_ != opening_.aspect_ratio_index ||
         language_index_ != opening_.language_index ||
-        audio_buffer_index_ != opening_.audio_buffer_index;
+        audio_buffer_index_ != opening_.audio_buffer_index ||
+        frame_cap_index_ != opening_.frame_cap_index;
     // Going from nothing owed to something owed makes the notice worth showing
     // again, even if it was waved away earlier in the session. Changing a
     // second startup setting while one is already outstanding does not: the
@@ -1864,6 +1886,7 @@ void SimpleSettingsDialog::SnapshotRestartValues() {
   opening_.aspect_ratio_index = aspect_ratio_index_;
   opening_.language_index = language_index_;
   opening_.audio_buffer_index = audio_buffer_index_;
+  opening_.frame_cap_index = frame_cap_index_;
 }
 
 void SimpleSettingsDialog::RevertRestartValues() {
@@ -2160,7 +2183,14 @@ void SimpleSettingsDialog::PushFrameCapRow(std::vector<RowSpec>& rows) {
         "Limit how fast the game runs. A steady cap slightly below your display's "
         "refresh rate gives the smoothest pacing on variable-refresh displays; "
         "Auto tracks the current display and does exactly that. Frames above the "
-        "refresh rate cannot be shown and only make steady motion judder.";
+        "refresh rate cannot be shown and only make steady motion judder. A cap "
+        "below your refresh rate is applied at the next launch, because the game "
+        "is told the matching refresh rate once at startup."
+#if REX_PLATFORM_IOS
+        " Applied with Apply & Quit.";
+#else
+        " Applied with Apply & Restart.";
+#endif
     if (FrameCapHasAuto()) {
       // Same policy the guest pacer applies (see Window::AutoFrameCapHz).
       const float auto_cap =
@@ -3618,7 +3648,10 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         row.kind = RowSpec::kAction;
         row.label = "Close Settings";
         row.desc = "Return to the game.";
-        row.action = [this] { Hide(); };
+        // RequestClose, not Hide: on a touchscreen this is the obvious way out
+        // of the menu, so closing here silently is the one exit most likely to
+        // swallow the "a restart is owed" notice.
+        row.action = [this] { RequestClose(); };
         rows.push_back(std::move(row));
       }
       // The compact layout has no rail for this to sit in, so it becomes a

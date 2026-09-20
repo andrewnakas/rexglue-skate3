@@ -334,6 +334,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
     int aspect_ratio_index = 0;
     int language_index = 0;
     int audio_buffer_index = 0;
+    int frame_cap_index = 0;
   } opening_;
   // Swallow the first frame's cursor delta after Show: the pre-open cursor
   // position (or a cursor-mode warp) otherwise reads as mouse motion and
