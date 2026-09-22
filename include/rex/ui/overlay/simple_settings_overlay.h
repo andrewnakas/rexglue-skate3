@@ -167,6 +167,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void PushDrawDistanceRow(std::vector<RowSpec>& rows);
   void PushSceneScaleRow(std::vector<RowSpec>& rows);
   void PushLowEndRows(std::vector<RowSpec>& rows);
+  void PushUpdateRateRows(std::vector<RowSpec>& rows);
   // System page. Not shared with Video/Performance: this one is not a quality
   // setting, it is the switch that makes the build instrument itself.
   void PushDiagnosticsRow(std::vector<RowSpec>& rows);
@@ -239,6 +240,10 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool merge_draws_ = false;
   bool ambient_npcs_ = true;
   bool movable_props_ = true;
+  bool hair_full_ = true;
+  bool water_effects_ = true;
+  int npc_update_rate_index_ = 0;
+  int world_refresh_index_ = 0;
   int draw_distance_index_ = 1;
   int scene_scale_index_ = 0;
   int stream_probe_index_ = 0;

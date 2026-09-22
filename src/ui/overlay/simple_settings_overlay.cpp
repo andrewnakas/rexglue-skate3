@@ -205,6 +205,17 @@ static_assert(kAspectRatioLabels.size() ==
 // 1280x720 equivalent so the number means something to a player. Anything
 // below Full costs sharpness and buys fill rate, which is the trade a phone
 // that is GPU-bound wants and the one a CPU-bound phone will not feel at all.
+// Update-rate divisors. Both cvars accept 1-8; these are the useful rungs.
+// NPCs get the finer ladder because the crowd is what a slow device actually
+// chokes on, and the world one is coarser because its dispatch builds packets
+// the native renderer discards anyway.
+constexpr std::array<int32_t, 4> kNpcUpdateRates = {1, 2, 3, 4};
+constexpr std::array<const char*, 4> kNpcUpdateRateLabels = {
+    "Every frame", "Every 2nd", "Every 3rd", "Every 4th"};
+constexpr std::array<int32_t, 4> kWorldRefreshRates = {1, 2, 4, 8};
+constexpr std::array<const char*, 4> kWorldRefreshLabels = {
+    "Every frame", "Every 2nd", "Every 4th", "Every 8th"};
+
 constexpr std::array<double, 5> kSceneScales = {1.0, 0.75, 0.6667, 0.5, 0.4};
 constexpr std::array<const char*, 5> kSceneScaleLabels = {
     "Full (1280x720)", "75% (960x540)", "67% (854x480)", "50% (640x360)",
@@ -230,7 +241,11 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 45> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 49> kOptionalSimpleSettingsCvars = {
+    "skate3_native_render_scene_hair_single_pass",
+    "skate3_native_render_scene_water_effects",
+    "skate3_native_render_lw_refresh",
+    "skate3_native_render_guest_static_refresh",
     "skate3_native_render_scene_scale",
     "skate3_native_render_scene_vegetation",
     "skate3_native_render_scene_merge_draws",
@@ -903,6 +918,20 @@ int NearestValueIndex(const std::array<double, N>& values, double value) {
   double best_err = std::abs(value - values[0]);
   for (size_t i = 1; i < N; ++i) {
     const double err = std::abs(value - values[i]);
+    if (err < best_err) {
+      best = static_cast<int>(i);
+      best_err = err;
+    }
+  }
+  return best;
+}
+
+template <size_t N>
+int NearestRateIndex(const std::array<int32_t, N>& values, int32_t value) {
+  int best = 0;
+  int32_t best_err = std::abs(value - values[0]);
+  for (size_t i = 1; i < N; ++i) {
+    const int32_t err = std::abs(value - values[i]);
     if (err < best_err) {
       best = static_cast<int>(i);
       best_err = err;
@@ -1618,6 +1647,21 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                   rex::cvar::Query<bool>("skate3_native_render_scene_ambient_npcs");
   movable_props_ = !HasCvar("skate3_native_render_scene_movable_props") ||
                    rex::cvar::Query<bool>("skate3_native_render_scene_movable_props");
+  hair_full_ = !HasCvar("skate3_native_render_scene_hair_single_pass") ||
+               !rex::cvar::Query<bool>("skate3_native_render_scene_hair_single_pass");
+  water_effects_ = !HasCvar("skate3_native_render_scene_water_effects") ||
+                   rex::cvar::Query<bool>("skate3_native_render_scene_water_effects");
+  npc_update_rate_index_ =
+      HasCvar("skate3_native_render_lw_refresh")
+          ? NearestRateIndex(kNpcUpdateRates,
+                             rex::cvar::Query<int32_t>("skate3_native_render_lw_refresh"))
+          : 0;
+  world_refresh_index_ =
+      HasCvar("skate3_native_render_guest_static_refresh")
+          ? NearestRateIndex(
+                kWorldRefreshRates,
+                rex::cvar::Query<int32_t>("skate3_native_render_guest_static_refresh"))
+          : 0;
   bloom_ = HasCvar("skate3_native_render_scene_bloom") &&
            rex::cvar::Query<bool>("skate3_native_render_scene_bloom");
   // The volumetric row drives the shafts + haze pair; either one on shows
@@ -2595,6 +2639,52 @@ void SimpleSettingsDialog::PushLowEndRows(std::vector<RowSpec>& rows) {
     rows.push_back(std::move(row));
   }
 
+  if (HasCvar("skate3_native_render_scene_hair_single_pass")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Hair Detail";
+    row.desc =
+        "Full draws hair in the game's two passes, which keeps far strands "
+        "from compositing over near ones. Reduced draws it in one and halves "
+        "the cost; strands behind the head can show through. Applies "
+        "immediately.";
+    row.options = {"Reduced", "Full"};
+    row.flag = &hair_full_;
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("skate3_native_render_scene_hair_single_pass", value == 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      hair_full_ = !CvarDefaultBool("skate3_native_render_scene_hair_single_pass", false);
+      SetBoolCvar("skate3_native_render_scene_hair_single_pass", !hair_full_);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+
+  if (HasCvar("skate3_native_render_scene_water_effects")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Water Effects";
+    row.desc =
+        "Reflections and movement on water, ocean and scrolling surfaces. Off "
+        "leaves those capture probes disarmed for the whole frame, so they "
+        "cost nothing even to check, and water falls back to a flat "
+        "appearance. Applies immediately.";
+    row.options = {"Off", "On"};
+    row.flag = &water_effects_;
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("skate3_native_render_scene_water_effects", value != 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      water_effects_ = CvarDefaultBool("skate3_native_render_scene_water_effects", true);
+      SetBoolCvar("skate3_native_render_scene_water_effects", water_effects_);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+
   if (HasCvar("skate3_native_render_scene_movable_props")) {
     RowSpec row;
     row.kind = RowSpec::kEnum;
@@ -2608,6 +2698,72 @@ void SimpleSettingsDialog::PushLowEndRows(std::vector<RowSpec>& rows) {
     row.on_enum_change = [this](int value) { movable_props_ = value != 0; };
     row.reset = [this] {
       movable_props_ = CvarDefaultBool("skate3_native_render_scene_movable_props", true);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+// How often the guest simulates the crowd and dispatches the static world.
+// Both are pure CPU levers and do nothing at all for a GPU-bound device - the
+// row text says so, because "update rate" reads like a quality setting and is
+// not one.
+void SimpleSettingsDialog::PushUpdateRateRows(std::vector<RowSpec>& rows) {
+  if (HasCvar("skate3_native_render_lw_refresh")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "NPC Update Rate";
+    row.desc =
+        "How often ambient pedestrians and traffic are simulated. Simulating "
+        "the crowd is what separates a menu from gameplay on a slow machine - "
+        "the same device can hold 56 fps in the menus and 6 in the world with "
+        "the graphics chip idle for both. The skater, the board and the "
+        "physics are on different code and stay at full rate whatever this "
+        "says. Lower rates make distant figures move less smoothly. Applies "
+        "immediately.";
+    for (const char* label : kNpcUpdateRateLabels) {
+      row.options.push_back(label);
+    }
+    row.index = &npc_update_rate_index_;
+    row.on_enum_change = [this](int value) {
+      value = std::clamp(value, 0, static_cast<int>(kNpcUpdateRates.size()) - 1);
+      rex::cvar::SetFlagByName("skate3_native_render_lw_refresh",
+                               std::to_string(kNpcUpdateRates[value]));
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      npc_update_rate_index_ = 0;
+      rex::cvar::SetFlagByName("skate3_native_render_lw_refresh", "1");
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+
+  if (HasCvar("skate3_native_render_guest_static_refresh")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "World Update Rate";
+    row.desc =
+        "How often the guest engine rebuilds its static-world draw list. The "
+        "native renderer throws that list away and draws the world from its "
+        "own capture, so this is work with nothing downstream of it - yet it "
+        "is the biggest per-item cost on the guest's render thread. Scene "
+        "capture is unaffected and still runs every frame, so nothing "
+        "disappears. Pure processor saving; it does nothing on a machine "
+        "limited by its graphics chip. Applies immediately.";
+    for (const char* label : kWorldRefreshLabels) {
+      row.options.push_back(label);
+    }
+    row.index = &world_refresh_index_;
+    row.on_enum_change = [this](int value) {
+      value = std::clamp(value, 0, static_cast<int>(kWorldRefreshRates.size()) - 1);
+      rex::cvar::SetFlagByName("skate3_native_render_guest_static_refresh",
+                               std::to_string(kWorldRefreshRates[value]));
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      world_refresh_index_ = 0;
+      rex::cvar::SetFlagByName("skate3_native_render_guest_static_refresh", "1");
+      SaveSimpleSettingsConfig(config_path_);
     };
     rows.push_back(std::move(row));
   }
@@ -3171,6 +3327,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       PushVolumetricsRow(rows);
       PushSceneScaleRow(rows);
       PushLowEndRows(rows);
+      PushUpdateRateRows(rows);
   PushDrawDistanceRow(rows);
       if (HasCvar("skate3_draw_distance_stream_probe")) {
         RowSpec row;
