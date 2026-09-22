@@ -230,8 +230,12 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 41> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 45> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene_scale",
+    "skate3_native_render_scene_vegetation",
+    "skate3_native_render_scene_merge_draws",
+    "skate3_native_render_scene_ambient_npcs",
+    "skate3_native_render_scene_movable_props",
     // Which map pack is staged. Written by the level picker rather than by a
     // row here, but it has to survive the relaunch that applies it, and this
     // list is what gets written to the settings file.
@@ -1606,6 +1610,14 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
       rex::cvar::Query<bool>("skate3_native_render_scene_shadow_static_casters");
   shadow_pcss_ = HasCvar("skate3_native_render_scene_shadow_pcss") &&
                  rex::cvar::Query<bool>("skate3_native_render_scene_shadow_pcss");
+  vegetation_ = !HasCvar("skate3_native_render_scene_vegetation") ||
+                rex::cvar::Query<bool>("skate3_native_render_scene_vegetation");
+  merge_draws_ = HasCvar("skate3_native_render_scene_merge_draws") &&
+                 rex::cvar::Query<bool>("skate3_native_render_scene_merge_draws");
+  ambient_npcs_ = !HasCvar("skate3_native_render_scene_ambient_npcs") ||
+                  rex::cvar::Query<bool>("skate3_native_render_scene_ambient_npcs");
+  movable_props_ = !HasCvar("skate3_native_render_scene_movable_props") ||
+                   rex::cvar::Query<bool>("skate3_native_render_scene_movable_props");
   bloom_ = HasCvar("skate3_native_render_scene_bloom") &&
            rex::cvar::Query<bool>("skate3_native_render_scene_bloom");
   // The volumetric row drives the shafts + haze pair; either one on shows
@@ -1677,7 +1689,15 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
          vsync_ != rex::cvar::Query<bool>("vsync") ||
          tearing_ != TearingFromCvar() ||
          mnk_mode_ != rex::cvar::Query<bool>("mnk_mode") ||
-         mnk_capture_mouse_ != rex::cvar::Query<bool>("mnk_capture_mouse");
+         mnk_capture_mouse_ != rex::cvar::Query<bool>("mnk_capture_mouse") ||
+         // Restart-class: the spawn hooks latch these at boot, so a staged
+         // difference here is exactly what "needs a restart" means.
+         (HasCvar("skate3_native_render_scene_ambient_npcs") &&
+          ambient_npcs_ !=
+              rex::cvar::Query<bool>("skate3_native_render_scene_ambient_npcs")) ||
+         (HasCvar("skate3_native_render_scene_movable_props") &&
+          movable_props_ !=
+              rex::cvar::Query<bool>("skate3_native_render_scene_movable_props"));
 }
 
 void SimpleSettingsDialog::Toggle() {
@@ -1776,6 +1796,14 @@ void SimpleSettingsDialog::SaveVideo() {
       std::clamp(aspect_ratio_index_, 0, static_cast<int>(kAspectRatioLabels.size()) - 1);
   field_of_view_ = std::clamp(field_of_view_, 40.0f, 120.0f);
   graphics_api_index_ = std::clamp(graphics_api_index_, 0, 1);
+  // Restart-class content cuts: staged by their rows, written here, real after
+  // the restart. See PushLowEndRows.
+  if (HasCvar("skate3_native_render_scene_ambient_npcs")) {
+    SetBoolCvar("skate3_native_render_scene_ambient_npcs", ambient_npcs_);
+  }
+  if (HasCvar("skate3_native_render_scene_movable_props")) {
+    SetBoolCvar("skate3_native_render_scene_movable_props", movable_props_);
+  }
   // Written only when the selection changed, so an untouched row keeps the
   // cvar on "auto".
   if (HasGraphicsApiChoice() && graphics_api_index_ != GraphicsApiIndexFromCvar()) {
@@ -2493,6 +2521,98 @@ void SimpleSettingsDialog::PushVolumetricsRow(std::vector<RowSpec>& rows) {
   }
 }
 
+// Content cuts. Each is its own setting rather than one "low quality" switch,
+// because they cost very different things: vegetation and batching are paid in
+// GPU and draw calls, crowds in CPU - simulation, collision and audio - and a
+// machine is usually short of one, not both.
+void SimpleSettingsDialog::PushLowEndRows(std::vector<RowSpec>& rows) {
+  if (HasCvar("skate3_native_render_scene_vegetation")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Vegetation";
+    row.desc =
+        "Grass, shrubs and tree and leaf cards. Off drops them before the "
+        "scene is captured, so they cost no draws, no textures and no "
+        "post-processing - and the shimmer they cause at lower 3D Scene "
+        "Resolutions goes with them. Applies immediately.";
+    row.options = {"Off", "On"};
+    row.flag = &vegetation_;
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("skate3_native_render_scene_vegetation", value != 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      vegetation_ = CvarDefaultBool("skate3_native_render_scene_vegetation", true);
+      SetBoolCvar("skate3_native_render_scene_vegetation", vegetation_);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+
+  if (HasCvar("skate3_native_render_scene_merge_draws")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Draw Batching";
+    row.desc =
+        "Combine neighbouring pieces of the same material into one draw call, "
+        "rendering up to 32 extra triangles per merge to do it. That is a good "
+        "trade only when the processor is the limit and the graphics chip has "
+        "room to spare; on a machine with processor headroom it costs the "
+        "triangles for nothing. Applies to world geometry loaded afterwards.";
+    row.options = {"Off", "On"};
+    row.flag = &merge_draws_;
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("skate3_native_render_scene_merge_draws", value != 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      merge_draws_ = CvarDefaultBool("skate3_native_render_scene_merge_draws", false);
+      SetBoolCvar("skate3_native_render_scene_merge_draws", merge_draws_);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+
+  // The two restart-class rows. The spawn hooks read their value once at boot,
+  // so the toggle only stages the choice here - SaveVideo writes it and the
+  // restart makes it real. Applying live would leave a world that was already
+  // populated disagreeing with the setting, which is worse than waiting.
+  if (HasCvar("skate3_native_render_scene_ambient_npcs")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Pedestrians & Traffic";
+    row.desc =
+        "Ambient pedestrians and cars. Off stops them being created at all, so "
+        "they cost no collision, no voices, no engine noise and no simulation - "
+        "not just hidden bodies. The player and other skaters are unaffected. "
+        "Needs a restart.";
+    row.options = {"Off", "On"};
+    row.flag = &ambient_npcs_;
+    row.on_enum_change = [this](int value) { ambient_npcs_ = value != 0; };
+    row.reset = [this] {
+      ambient_npcs_ = CvarDefaultBool("skate3_native_render_scene_ambient_npcs", true);
+    };
+    rows.push_back(std::move(row));
+  }
+
+  if (HasCvar("skate3_native_render_scene_movable_props")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Movable Props";
+    row.desc =
+        "Benches, cones, bins and other pushable clutter. Off stops them being "
+        "created; rails, ledges and the surfaces you skate are untouched. "
+        "Needs a restart.";
+    row.options = {"Off", "On"};
+    row.flag = &movable_props_;
+    row.on_enum_change = [this](int value) { movable_props_ = value != 0; };
+    row.reset = [this] {
+      movable_props_ = CvarDefaultBool("skate3_native_render_scene_movable_props", true);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
 void SimpleSettingsDialog::PushSceneScaleRow(std::vector<RowSpec>& rows) {
   if (!HasCvar("skate3_native_render_scene_scale")) {
     return;
@@ -3050,6 +3170,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       PushBloomRow(rows);
       PushVolumetricsRow(rows);
       PushSceneScaleRow(rows);
+      PushLowEndRows(rows);
   PushDrawDistanceRow(rows);
       if (HasCvar("skate3_draw_distance_stream_probe")) {
         RowSpec row;

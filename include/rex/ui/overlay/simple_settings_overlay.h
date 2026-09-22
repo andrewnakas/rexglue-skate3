@@ -166,6 +166,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void PushVolumetricsRow(std::vector<RowSpec>& rows);
   void PushDrawDistanceRow(std::vector<RowSpec>& rows);
   void PushSceneScaleRow(std::vector<RowSpec>& rows);
+  void PushLowEndRows(std::vector<RowSpec>& rows);
   // System page. Not shared with Video/Performance: this one is not a quality
   // setting, it is the switch that makes the build instrument itself.
   void PushDiagnosticsRow(std::vector<RowSpec>& rows);
@@ -231,6 +232,13 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool shadow_pcss_ = true;
   bool bloom_ = true;
   bool volumetrics_ = true;
+  // Low-End Devices group. vegetation_ and merge_draws_ apply live;
+  // ambient_npcs_ and movable_props_ are restart-class, because the spawn
+  // hooks behind them are read once at boot.
+  bool vegetation_ = true;
+  bool merge_draws_ = false;
+  bool ambient_npcs_ = true;
+  bool movable_props_ = true;
   int draw_distance_index_ = 1;
   int scene_scale_index_ = 0;
   int stream_probe_index_ = 0;
