@@ -331,9 +331,18 @@ constexpr int kShadowLevelAuto = 1;
 // weak GPU it measures as nothing (36.3 fps at half, 36.0 at a quarter), while
 // on a machine the CPU limits it is one of the largest levers there is. Phones
 // are the second case.
-constexpr std::array<const char*, 5> kDrawDistanceLabels = {"Half", "Original",
-                                                            "2x", "3x", "5x"};
-constexpr std::array<double, 5> kDrawDistanceScales = {0.5, 1.0, 2.0, 3.0, 5.0};
+// Two rungs below Half, because Half was the floor and it is not low enough on
+// the phones that need it. The static world is ~750 of the ~765 items in a
+// frame (see skate3_draw_distance.cpp), so thinning props is the only content
+// lever with real weight - and the cvar has always accepted 0.05, it was this
+// row that stopped at 0.5. Both the draw and LOD scales move together, which
+// is what the row has always written.
+constexpr std::array<const char*, 7> kDrawDistanceLabels = {
+    "Eighth", "Quarter", "Half", "Original", "2x", "3x", "5x"};
+constexpr std::array<double, 7> kDrawDistanceScales = {0.125, 0.25, 0.5,
+                                                       1.0,   2.0,  3.0, 5.0};
+// Added at the FRONT, so every kGraphicsPresets draw_distance index below
+// shifted by +2 to keep the presets pointing at the values they always had.
 
 // World streaming: pre-load radius in metres for neighbouring world cells
 // (0 = the game's own cell-boundary streaming).
@@ -380,22 +389,22 @@ constexpr std::array<GraphicsPreset, 6> kGraphicsPresets = {{
     {"Potato",
      "Every frame the machine has, and the picture last. No shadows, no "
      "effects, and half the original draw distance.",
-     0, 0, 0, 0, 0, false, false, false, false, false},
+     0, 0, 0, 0, 2, false, false, false, false, false},
     {"Performance",
      "Highest frame rate with the picture intact. Shadows on, screen-space "
      "effects off, original draw distance.",
-     0, 0, 3, 0, 1, false, false, false, false, true},
+     0, 0, 3, 0, 3, false, false, false, false, true},
     {"Balanced",
      "Ambient occlusion and bloom on with 2x MSAA, original draw distance.",
-     0, 1, 3, 1, 1, true, true, false, false, true},
+     0, 1, 3, 1, 3, true, true, false, false, true},
     {"Quality",
      "Everything on at native resolution: AO, bloom, sun shafts, soft shadows "
      "and double draw distance.",
-     0, 1, 5, 1, 2, true, true, true, true, true},
+     0, 1, 5, 1, 4, true, true, true, true, true},
     {"Ultra",
      "Quality plus 2x render scale and 4x MSAA. Four times the pixels in every "
      "full-screen target - expect to drop below 60 on modest GPUs.",
-     1, 2, 5, 2, 2, true, true, true, true, true},
+     1, 2, 5, 2, 4, true, true, true, true, true},
 }};
 
 // Audio device buffer sizes in sample frames (0 = backend default).
@@ -2458,10 +2467,13 @@ void SimpleSettingsDialog::PushDrawDistanceRow(std::vector<RowSpec>& rows) {
     row.desc =
         "How far away small world objects, foliage and character detail "
         "stay visible, as a multiple of the original console distances. "
-        "Higher settings draw more of the world and cost some performance; "
-        "Half draws less of it than the console did, and is the setting that "
-        "buys the most back on a machine the emulation limits. Applies "
-        "immediately.";
+        "Higher settings draw more of the world and cost some performance. "
+        "Below Original is where the frame rate is bought back on a machine "
+        "the emulation limits: the static world is most of what a frame draws, "
+        "so thinning it is the lever with real weight. Quarter and Eighth are "
+        "deliberately stark - props and street furniture pop in close - and "
+        "exist for phones that cannot hold a frame rate any other way. "
+        "Applies immediately.";
     for (const char* label : kDrawDistanceLabels) {
       row.options.push_back(label);
     }
