@@ -107,6 +107,18 @@ int SDLWindowedAppContext::RunMainLoop() {
             // blocks for the pause, and before Java reaches surfaceDestroyed.
             SDLWindow::DetachAllSurfaces("entering the background");
 #endif
+            // Stop the work that should not continue in the background. On
+            // Android this is not a nicety: SDL blocks only its own thread
+            // while paused, so without this the guest threads keep running at
+            // full speed for the whole time the app is away.
+            //
+            // After the presentation gate above on purpose: with painting
+            // already refused, a guest thread parked here cannot be holding a
+            // frame open. Whatever this handler does must be BOUNDED - the app
+            // has seconds to go quiescent and this is the thread that owes it.
+            if (context->suspend_handler_) {
+              context->suspend_handler_();
+            }
             [[fallthrough]];
           case SDL_EVENT_LOW_MEMORY:
             // Jetsam evicts suspended processes largest-first, and this one
@@ -132,6 +144,14 @@ int SDLWindowedAppContext::RunMainLoop() {
                                                                        : "resuming (will)");
             SDLWindow::SetAllSurfacesPresentable(true, "returning to the foreground");
             rex::graphics::SetAppForeground(true);
+            // Idempotent, which is what makes it safe to run from both
+            // foreground events - and running from both is not optional: a
+            // resume delivered only as WILL would otherwise leave the guest
+            // parked for good, which looks exactly like the freeze this whole
+            // gate exists to prevent.
+            if (context->resume_handler_) {
+              context->resume_handler_();
+            }
 #if REX_PLATFORM_ANDROID
             // BOTH, for the same reason the gate above handles both.
             //

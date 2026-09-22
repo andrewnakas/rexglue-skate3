@@ -19,8 +19,32 @@
 
 #include <algorithm>
 
+REXCVAR_DEFINE_BOOL(
+    guest_backing_file, false, "Memory",
+    "Back the guest address space with a real file instead of anonymous shared memory. "
+    "Android only, and the reason it exists: ashmem pages are RAM that cannot be written "
+    "back or dropped, so the guest heap counts against the process in full and makes it "
+    "the first thing the system reclaims. A file mapping can be paged out. Off by default "
+    "until the footprint and kill-rate difference is measured on a device.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex {
 namespace memory {
+
+namespace {
+// Set once at startup, read once in CreateFileMappingHandle. Not synchronised
+// on purpose: both happen on the main thread before any guest thread exists,
+// and adding a lock would suggest a concurrency this never has.
+std::filesystem::path file_mapping_directory_;
+}  // namespace
+
+void SetFileMappingDirectory(const std::filesystem::path& directory) {
+  file_mapping_directory_ = directory;
+}
+
+const std::filesystem::path& GetFileMappingDirectory() {
+  return file_mapping_directory_;
+}
 
 // TODO(benvanik): fancy AVX versions.
 // https://github.com/gnuradio/volk/blob/master/kernels/volk/volk_16u_byteswap.h

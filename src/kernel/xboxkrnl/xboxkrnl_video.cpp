@@ -29,6 +29,7 @@
 #include <rex/types.h>
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
+#include <rex/system/guest_pause.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
@@ -452,6 +453,9 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
+  // The guest's own frame boundary, and the one checkpoint that is reached even
+  // by a thread that never waits on a kernel object. See guest_pause.h.
+  rex::system::GuestPauseCheckpoint();
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);

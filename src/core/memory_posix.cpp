@@ -22,16 +22,21 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/utils.h>
 #include <rex/platform.h>
 #include <rex/string.h>
+
+REXCVAR_DECLARE(bool, guest_backing_file);
 
 #if REX_PLATFORM_ANDROID
 #include <string.h>
 
 #include <dlfcn.h>
 #include <sys/ioctl.h>
+#include <sys/statvfs.h>
 
 #include <linux/ashmem.h>
 
@@ -363,9 +368,85 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 #endif
 }
 
+#if REX_PLATFORM_IOS || REX_PLATFORM_ANDROID
+// Opens the sparse file that backs the whole guest address space.
+//
+// The file is unlinked the moment it exists: the descriptor keeps it alive for
+// as long as the process needs it, and a crash therefore leaves no 4.5 GB
+// corpse behind for the player to find. ftruncate leaves it sparse on APFS and
+// on ext4/f2fs alike, so the reservation costs no disk until the guest actually
+// touches a page.
+//
+// Returns -1 on any failure; every caller has a fallback.
+static int OpenGuestBackingFile(const std::filesystem::path& directory,
+                                const std::filesystem::path& name, size_t length) {
+  if (directory.empty()) {
+    return -1;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(directory, ec);
+  const std::filesystem::path backing_path = directory / name;
+  int fd = open(backing_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) {
+    return -1;
+  }
+  unlink(backing_path.c_str());
+  if (ftruncate(fd, static_cast<off_t>(length)) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+#endif
+
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit) {
 #if REX_PLATFORM_ANDROID
+  // Prefer a real file over ASharedMemory, because ashmem is the reason this
+  // app is the first thing Android reclaims.
+  //
+  // Ashmem pages are RAM and nothing else: they cannot be written back and they
+  // cannot be dropped, so a guest heap of a few hundred megabytes to three
+  // gigabytes counts against the process in full, permanently, and makes it the
+  // fattest target on the device. A MAP_SHARED file mapping is different in
+  // kind - the kernel can write dirty pages out and drop clean ones under
+  // pressure - so the same guest memory stops looking like unreclaimable RAM.
+  //
+  // Internal storage deliberately, not getExternalFilesDir(): the external path
+  // is FUSE-backed, and MAP_SHARED on FUSE is exactly the case to avoid. Both
+  // live on /data, so this costs nothing in space budget.
+  //
+  // Everything here is best-effort. A device that cannot spare the space still
+  // boots, on ashmem, exactly as it did before.
+  const std::filesystem::path& backing_dir = GetFileMappingDirectory();
+  if (REXCVAR_GET(guest_backing_file) && !backing_dir.empty()) {
+    bool have_room = true;
+    struct statvfs vfs = {};
+    if (statvfs(backing_dir.c_str(), &vfs) == 0) {
+      const uint64_t available = uint64_t(vfs.f_bavail) * uint64_t(vfs.f_frsize);
+      // The guest never dirties the whole 4.5 GB - the reservation is sparse -
+      // but refuse to start down this road without room for a realistic
+      // working set plus headroom for the rest of the system.
+      constexpr uint64_t kRequiredFreeBytes = 2048ull * 1024 * 1024;
+      have_room = available >= kRequiredFreeBytes;
+      if (!have_room) {
+        REXLOG_WARN(
+            "guest backing file: only {} MB free at {}, staying on shared memory",
+            available / (1024 * 1024), backing_dir.string());
+      }
+    }
+    if (have_room) {
+      int fd = OpenGuestBackingFile(backing_dir, path.filename(), length);
+      if (fd >= 0) {
+        REXLOG_INFO("guest backing file: {} MB reserved under {}", length / (1024 * 1024),
+                    backing_dir.string());
+        return static_cast<FileMappingHandle>(fd);
+      }
+      REXLOG_WARN("guest backing file could not be created under {}; falling back to shared memory",
+                  backing_dir.string());
+    }
+  }
+
   // TODO(Triang3l): Check if memfd can be used instead on API 30+.
   if (android_ASharedMemory_create_) {
     int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
@@ -389,25 +470,20 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   }
   return static_cast<FileMappingHandle>(ashmem_fd);
 #elif REX_PLATFORM_IOS
-  // The iOS sandbox denies shm_open outright, the same reason Android needs
-  // ASharedMemory above. A regular file works, and the guest views alias it
-  // through MAP_SHARED exactly as they would a shm object.
+  // The iOS sandbox denies shm_open outright, which is why this is a plain
+  // file. The guest views alias it through MAP_SHARED exactly as they would a
+  // shm object; see OpenGuestBackingFile for the sparse/unlink handling.
   //
-  // ftruncate on APFS leaves the file sparse, so reserving the full 4.5 GB
-  // costs no disk until the guest actually touches a page. The file is
-  // unlinked immediately: the descriptor keeps it alive for the process, and
-  // nothing is left behind if we crash.
+  // TMPDIR remains the fallback for any path that reaches here before the app
+  // has said where it may write.
   (void)commit;
-  const char* tmp_dir = std::getenv("TMPDIR");
-  std::filesystem::path backing_path =
-      std::filesystem::path(tmp_dir ? tmp_dir : "/tmp") / path.filename();
-  int fd = open(backing_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
-  if (fd < 0) {
-    return kFileMappingHandleInvalid;
+  std::filesystem::path backing_dir = GetFileMappingDirectory();
+  if (backing_dir.empty()) {
+    const char* tmp_dir = std::getenv("TMPDIR");
+    backing_dir = std::filesystem::path(tmp_dir ? tmp_dir : "/tmp");
   }
-  unlink(backing_path.c_str());
-  if (ftruncate(fd, static_cast<off_t>(length)) != 0) {
-    close(fd);
+  int fd = OpenGuestBackingFile(backing_dir, path.filename(), length);
+  if (fd < 0) {
     return kFileMappingHandleInvalid;
   }
   return static_cast<FileMappingHandle>(fd);

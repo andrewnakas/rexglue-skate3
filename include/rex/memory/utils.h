@@ -162,6 +162,17 @@ void AlignedFree(T* ptr) {
 using FileMappingHandle = intptr_t;
 constexpr FileMappingHandle kFileMappingHandleInvalid = -1;
 
+// Directory the guest backing file is created in, on the platforms that back
+// the guest address space with a real file (iOS, Android).
+//
+// This exists because the choice of directory is a platform-app question and
+// CreateFileMappingHandle is in core/, which cannot reach SDL or a JNI
+// environment to ask where the app may write. The app sets it once before
+// Memory::Initialize; an empty or unset value leaves each platform on its own
+// fallback, so nothing breaks if it is never called.
+void SetFileMappingDirectory(const std::filesystem::path& directory);
+const std::filesystem::path& GetFileMappingDirectory();
+
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit);
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path);

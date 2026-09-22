@@ -26,6 +26,7 @@
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/guest_pause.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/util/string_utils.h>
@@ -373,6 +374,7 @@ u32 KeQueryPerformanceFrequency_entry() {
 }
 
 u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
+  rex::system::GuestPauseCheckpoint();
   XThread* thread = XThread::GetCurrentThread();
 
   if (alertable) {
@@ -879,6 +881,9 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
 
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
+  // A guest thread about to block is holding no host lock, which is what makes
+  // this a safe place to park it across a suspend. See guest_pause.h.
+  rex::system::GuestPauseCheckpoint();
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
   // timeout={}",
@@ -893,6 +898,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
+  rex::system::GuestPauseCheckpoint();
   // Only the ones that block for a long time: this is the hottest call in the
   // title and logging every one buries the file. A handle that shows up here
   // repeatedly is an event whose signal never arrives.
@@ -974,6 +980,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
 
 u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
                                      u32 alertable, mapped_u64 timeout_ptr) {
+  rex::system::GuestPauseCheckpoint();
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                       timeout_ptr ? &timeout : nullptr);

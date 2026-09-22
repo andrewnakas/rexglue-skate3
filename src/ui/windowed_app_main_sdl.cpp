@@ -44,6 +44,7 @@ REXCVAR_DEFINE_INT32(vulkan_mvk_log_level, 1, "GPU/Vulkan",
 #include <SDL3/SDL_system.h>
 #include <jni.h>
 #include <rex/main_android.h>
+#include <rex/memory/utils.h>
 #endif
 
 #if REX_PLATFORM_MOBILE
@@ -990,6 +991,17 @@ int main(int argc, char** argv) {
       // InitializeAndroidAppFromMainThread took its own global ref.
       env->DeleteLocalRef(activity);
     }
+  }
+
+  // Back the 4.5 GB guest address space with a real file instead of ashmem.
+  //
+  // INTERNAL storage, not getExternalFilesDir(): the external path is
+  // FUSE-backed and MAP_SHARED on FUSE is the case to avoid. Both are on /data,
+  // so this is not a space trade. Memory::Initialize runs much later, and
+  // CreateFileMappingHandle falls back to ashmem if this directory turns out to
+  // be unusable, so a failure here is not fatal.
+  if (const char* internal = SDL_GetAndroidInternalStoragePath(); internal && *internal) {
+    rex::memory::SetFileMappingDirectory(std::filesystem::path(internal) / "guestmem");
   }
 #endif
 
