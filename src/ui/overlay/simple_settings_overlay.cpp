@@ -2849,6 +2849,28 @@ void SimpleSettingsDialog::PushDrawDistanceRow(std::vector<RowSpec>& rows) {
 }
 
 void SimpleSettingsDialog::PushFpsCounterRow(std::vector<RowSpec>& rows) {
+  // The benchmark sits with the counter rows rather than in the graphics list:
+  // it is a measurement, not a setting, and it is what the settings above are
+  // meant to be judged with.
+  if (HasCvar("skate3_benchmark_frames")) {
+    RowSpec row;
+    row.kind = RowSpec::kAction;
+    row.label = "Run Benchmark";
+    row.desc =
+        "Closes this menu and measures the next 3600 frames - about a minute "
+        "at 60 fps - then reports the average, the median, p95, p99 and the "
+        "worst frame, in the log and on screen. The first 120 frames are "
+        "discarded so shader compilation is not counted, and pauses longer "
+        "than a second are ignored. Skate normally while it runs, in the same "
+        "place each time, or the numbers compare two different things rather "
+        "than two settings.";
+    row.action = [this] {
+      rex::cvar::SetFlagByName("skate3_benchmark_frames", "3600");
+      Hide();
+    };
+    rows.push_back(std::move(row));
+  }
+
   if (HasCvar("show_fps_percentiles")) {
     RowSpec row;
     row.kind = RowSpec::kEnum;
