@@ -53,7 +53,12 @@ namespace memory {
 
 namespace {
 
-#if REX_PLATFORM_MAC
+// Android too, not just Apple: Android 15 devices built for 16 KB pages
+// (Pixel 8 and newer) hit exactly the macOS problem - the guest allocates in
+// 4 KB pages and an unaligned mprotect/mmap is refused with EINVAL, so every
+// guest commit fails and the title cannot start. A 4 KB-page device aligns a
+// 4 KB range to itself, so this is a no-op there.
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
 void AlignHostPageRange(void*& base_address, size_t& length) {
   const uintptr_t page_mask = uintptr_t(page_size() - 1);
   const uintptr_t start = reinterpret_cast<uintptr_t>(base_address);
@@ -248,7 +253,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
       break;
   }
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
   if (base_address &&
       (allocation_type == AllocationType::kCommit ||
        allocation_type == AllocationType::kReserveCommit)) {
@@ -285,7 +290,18 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
        allocation_type == AllocationType::kReserveCommit)) {
     // Verify the entire range is mapped before using mprotect
     if (IsRangeFullyMapped(base_address, length)) {
-      if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+      // Align here too. This is the path Android actually takes for a commit
+      // into the existing guest reservation, and an unaligned mprotect is
+      // refused on a 16 KB-page device exactly as above. Widening to the host
+      // page also touches the neighbouring guest pages, which is inherent:
+      // four 4 KB guest pages inside one 16 KB host page cannot be protected
+      // independently on such a device.
+      void* protect_base = base_address;
+      size_t protect_length = length;
+#if REX_PLATFORM_ANDROID
+      AlignHostPageRange(protect_base, protect_length);
+#endif
+      if (mprotect(protect_base, protect_length, static_cast<int>(prot_requested)) == 0) {
         return base_address;
       }
     }
@@ -299,7 +315,7 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
   switch (deallocation_type) {
     case DeallocationType::kDecommit: {
       // Decommit: remove access first, then release physical pages
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
       AlignHostPageRange(base_address, length);
 #endif
       if (mprotect(base_address, length, PROT_NONE) != 0) {
@@ -340,7 +356,7 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
 #endif
 
   uint32_t prot = ToPosixProtectFlags(access);
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
   AlignHostPageRange(base_address, length);
 #endif
   return mprotect(base_address, length, prot) == 0;
