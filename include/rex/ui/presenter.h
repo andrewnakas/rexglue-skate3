@@ -349,6 +349,13 @@ class Presenter {
     // Averaged over the sampling window (zero when no recent frames).
     double fps = 0.0;
     double frame_time_ms = 0.0;
+    // Frame-interval percentiles over the last four seconds (zero until two
+    // frames exist): the mean of the slowest 1% expressed as FPS, and p95/p99
+    // as frame times. An average hides exactly the stutters that make a game
+    // feel bad, which is what these are for.
+    double low_1pct_fps = 0.0;
+    double p95_ms = 0.0;
+    double p99_ms = 0.0;
     // Time the guest output producer (GPU emulation thread) reported spending
     // blocked on host GPU waits during the last frame, via
     // AddGuestFrameWaitMicroseconds. Near frame_time_ms = host GPU bound,

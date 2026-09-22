@@ -15,6 +15,15 @@
 #include <algorithm>
 
 #include <imgui.h>
+#include <rex/cvar.h>
+
+// Off by default: three extra lines on a phone screen is a lot, and the
+// average is what most people want most of the time. On when a number is
+// being chased - an average hides exactly the stutters that make a game feel
+// bad, which is the whole reason these exist.
+REXCVAR_DEFINE_BOOL(show_fps_percentiles, false, "UI",
+                    "Add 1% low FPS and p95/p99 frame times to the FPS counter")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::ui {
 
@@ -38,6 +47,12 @@ void FpsOverlayDialog::OnDraw(ImGuiIO& io) {
       ImGui::Text("%.0f FPS", stats.fps);
       ImGui::PushFont(nullptr, 14.0f);
       ImGui::Text("%.2f ms", stats.frame_time_ms);
+      // p99 is the gate rather than p95: both are zero until the ring has two
+      // frames inside the four-second window, and p99 is the last to fill.
+      if (REXCVAR_GET(show_fps_percentiles) && stats.p99_ms > 0.0) {
+        ImGui::Text("1%% low %.0f FPS", stats.low_1pct_fps);
+        ImGui::Text("p95 %.2f  p99 %.2f ms", stats.p95_ms, stats.p99_ms);
+      }
       // Time the GPU emulation thread spent blocked on host GPU fences last
       // frame: near the frame time = GPU-bound, near zero = thread-bound.
       ImGui::Text("wait %.2f ms", stats.wait_ms);

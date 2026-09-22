@@ -241,7 +241,8 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 49> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 50> kOptionalSimpleSettingsCvars = {
+    "show_fps_percentiles",
     "skate3_native_render_scene_hair_single_pass",
     "skate3_native_render_scene_water_effects",
     "skate3_native_render_lw_refresh",
@@ -1676,6 +1677,8 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
   mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
+  fps_percentiles_ = HasCvar("show_fps_percentiles") &&
+                     rex::cvar::Query<bool>("show_fps_percentiles");
   diagnostics_ = HasCvar("skate3_diagnostics") && rex::cvar::Query<bool>("skate3_diagnostics");
   touch_opacity_index_ =
       HasCvar("touch_opacity")
@@ -2846,6 +2849,30 @@ void SimpleSettingsDialog::PushDrawDistanceRow(std::vector<RowSpec>& rows) {
 }
 
 void SimpleSettingsDialog::PushFpsCounterRow(std::vector<RowSpec>& rows) {
+  if (HasCvar("show_fps_percentiles")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "FPS Percentiles";
+    row.desc =
+        "Add the 1% low and the p95/p99 frame times to the counter. The "
+        "average hides exactly the stutters that make a game feel bad: a "
+        "steady 60 and a 60 that drops four frames a second read the same as "
+        "an average and nothing like each other to play. Use these when "
+        "comparing two settings. Applies immediately.";
+    row.options = {"Off", "On"};
+    row.flag = &fps_percentiles_;
+    row.on_enum_change = [this](int value) {
+      SetBoolCvar("show_fps_percentiles", value != 0);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    row.reset = [this] {
+      fps_percentiles_ = CvarDefaultBool("show_fps_percentiles", false);
+      SetBoolCvar("show_fps_percentiles", fps_percentiles_);
+      SaveSimpleSettingsConfig(config_path_);
+    };
+    rows.push_back(std::move(row));
+  }
+
   if (HasCvar("show_fps_counter")) {
     RowSpec row;
     row.kind = RowSpec::kEnum;

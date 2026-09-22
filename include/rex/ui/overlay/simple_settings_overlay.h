@@ -242,6 +242,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool movable_props_ = true;
   bool hair_full_ = true;
   bool water_effects_ = true;
+  bool fps_percentiles_ = false;
   int npc_update_rate_index_ = 0;
   int world_refresh_index_ = 0;
   int draw_distance_index_ = 1;
