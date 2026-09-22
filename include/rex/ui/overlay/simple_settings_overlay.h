@@ -165,6 +165,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void PushBloomRow(std::vector<RowSpec>& rows);
   void PushVolumetricsRow(std::vector<RowSpec>& rows);
   void PushDrawDistanceRow(std::vector<RowSpec>& rows);
+  void PushSceneScaleRow(std::vector<RowSpec>& rows);
   // System page. Not shared with Video/Performance: this one is not a quality
   // setting, it is the switch that makes the build instrument itself.
   void PushDiagnosticsRow(std::vector<RowSpec>& rows);
@@ -231,6 +232,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool bloom_ = true;
   bool volumetrics_ = true;
   int draw_distance_index_ = 1;
+  int scene_scale_index_ = 0;
   int stream_probe_index_ = 0;
   bool mode_indicator_ = true;
   bool fps_counter_ = false;

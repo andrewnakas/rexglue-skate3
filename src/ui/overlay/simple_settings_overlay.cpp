@@ -188,11 +188,35 @@ static_assert(kAspectRatioLabels.size() ==
 // exists to avoid. Restoring it means lowering that floor and establishing
 // that the title's timestep survives a 20 Hz refresh, not adding the entry
 // back.
-constexpr std::array<double, 8> kFrameCapRates = {24.0,  30.0,  60.0,  90.0,
-                                                  120.0, 144.0, 165.0, 240.0};
-constexpr std::array<const char*, 9> kFrameCapLabels = {
-    "Unlimited", "24 FPS",  "30 FPS",  "60 FPS", "90 FPS",
-    "120 FPS",   "144 FPS", "165 FPS", "240 FPS"};
+// 40, 45 and 50 are for phones that pace better below their panel: 40 divides
+// a 120 Hz refresh evenly and 45 divides 90 Hz, so each frame lands on a
+// vblank instead of beating against one. All three are inside the guest video
+// mode's 24-240 Hz range, so MatchGuestRefreshToFrameCap can follow them and
+// the game plays at full speed at the lower rate rather than in slow motion -
+// which is the whole reason a sub-60 cap is worth offering at all.
+// 3D scene raster as a fraction of the guest output, driving
+// skate3_native_render_scene_scale. The lever has existed and worked for a
+// long time - the scene renders at this size and one fullscreen blit carries
+// it to the output - but nothing exposed it, so the only way to reach it was
+// a hand-edited settings file.
+//
+// A fraction rather than a pixel size, because that is what the renderer
+// takes and because the guest output is not always 720p; the labels carry the
+// 1280x720 equivalent so the number means something to a player. Anything
+// below Full costs sharpness and buys fill rate, which is the trade a phone
+// that is GPU-bound wants and the one a CPU-bound phone will not feel at all.
+constexpr std::array<double, 5> kSceneScales = {1.0, 0.75, 0.6667, 0.5, 0.4};
+constexpr std::array<const char*, 5> kSceneScaleLabels = {
+    "Full (1280x720)", "75% (960x540)", "67% (854x480)", "50% (640x360)",
+    "40% (512x288)"};
+static_assert(kSceneScaleLabels.size() == kSceneScales.size(),
+              "every scene scale needs a label");
+
+constexpr std::array<double, 11> kFrameCapRates = {24.0,  30.0,  40.0, 45.0,  50.0, 60.0,
+                                                   90.0,  120.0, 144.0, 165.0, 240.0};
+constexpr std::array<const char*, 12> kFrameCapLabels = {
+    "Unlimited", "24 FPS",  "30 FPS",  "40 FPS",  "45 FPS",  "50 FPS",
+    "60 FPS",    "90 FPS",  "120 FPS", "144 FPS", "165 FPS", "240 FPS"};
 static_assert(kFrameCapLabels.size() == kFrameCapRates.size() + 1,
               "every rate needs a label, plus the Unlimited entry at [0]");
 constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
@@ -206,7 +230,8 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 40> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 41> kOptionalSimpleSettingsCvars = {
+    "skate3_native_render_scene_scale",
     // Which map pack is staged. Written by the level picker rather than by a
     // row here, but it has to survive the relaunch that applies it, and this
     // list is what gets written to the settings file.
@@ -880,6 +905,14 @@ int NearestValueIndex(const std::array<double, N>& values, double value) {
     }
   }
   return best;
+}
+
+int SceneScaleIndexFromCvar() {
+  if (!HasCvar("skate3_native_render_scene_scale")) {
+    return 0;
+  }
+  return NearestValueIndex(kSceneScales,
+                           rex::cvar::Query<double>("skate3_native_render_scene_scale"));
 }
 
 int DrawDistanceIndexFromCvar() {
@@ -1582,6 +1615,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                  (HasCvar("skate3_native_render_scene_haze") &&
                   rex::cvar::Query<bool>("skate3_native_render_scene_haze"));
   draw_distance_index_ = DrawDistanceIndexFromCvar();
+  scene_scale_index_ = SceneScaleIndexFromCvar();
   stream_probe_index_ = StreamProbeIndexFromCvar();
   mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
@@ -2459,6 +2493,41 @@ void SimpleSettingsDialog::PushVolumetricsRow(std::vector<RowSpec>& rows) {
   }
 }
 
+void SimpleSettingsDialog::PushSceneScaleRow(std::vector<RowSpec>& rows) {
+  if (!HasCvar("skate3_native_render_scene_scale")) {
+    return;
+  }
+  RowSpec row;
+  row.kind = RowSpec::kEnum;
+  row.label = "3D Scene Resolution";
+  row.desc =
+      "Size of the 3D scene buffer, as a share of the output. The world, "
+      "shadows and screen-space effects all render at this size and one "
+      "fullscreen stretch carries the result to the screen, so lowering it "
+      "cuts almost all of the per-pixel work while the HUD and menus stay "
+      "sharp. This is the lever to reach for on a phone that is running out "
+      "of GPU rather than CPU; if the frame rate does not move, the limit is "
+      "elsewhere and this only costs sharpness. Applies immediately.";
+  for (const char* label : kSceneScaleLabels) {
+    row.options.push_back(label);
+  }
+  row.index = &scene_scale_index_;
+  row.on_enum_change = [this](int value) {
+    value = std::clamp(value, 0, static_cast<int>(kSceneScales.size()) - 1);
+    rex::cvar::SetFlagByName("skate3_native_render_scene_scale",
+                             std::to_string(kSceneScales[value]));
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  row.reset = [this] {
+    scene_scale_index_ = NearestValueIndex(
+        kSceneScales, CvarDefaultDouble("skate3_native_render_scene_scale", 1.0));
+    rex::cvar::SetFlagByName("skate3_native_render_scene_scale",
+                             std::to_string(kSceneScales[scene_scale_index_]));
+    SaveSimpleSettingsConfig(config_path_);
+  };
+  rows.push_back(std::move(row));
+}
+
 void SimpleSettingsDialog::PushDrawDistanceRow(std::vector<RowSpec>& rows) {
   if (HasDrawDistanceCvars()) {
     RowSpec row;
@@ -2980,7 +3049,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
       PushSsaoRow(rows);
       PushBloomRow(rows);
       PushVolumetricsRow(rows);
-      PushDrawDistanceRow(rows);
+      PushSceneScaleRow(rows);
+  PushDrawDistanceRow(rows);
       if (HasCvar("skate3_draw_distance_stream_probe")) {
         RowSpec row;
         row.kind = RowSpec::kEnum;
