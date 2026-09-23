@@ -70,6 +70,30 @@ REXCVAR_DEFINE_BOOL(
     "it is the O(cached sets) scan the index exists to avoid. If a one-frame "
     "invisibility or a wrong texture disappears with this on, the index is "
     "failing to find sets that name a destroyed view.");
+// Adreno and Mali are tile-based: ending a render pass stores the tile to
+// memory and beginning one loads it back. SetRenderTargets ended the pass
+// unconditionally, even when handed the targets already bound, so a chain of
+// passes that differ only by viewport paid a full store+load between each.
+// The shadow blur is the clearest case - three consecutive passes into one
+// atlas, so two logical passes cost six tile cycles.
+// On a tiler the per-frame render-pass list IS the bandwidth budget: each pass
+// costs a tile load and a tile store of its whole attachment. Counting them by
+// reading the code has already produced two wrong answers, because which
+// passes run depends on settings the player owns (haze off means the
+// volumetric pass never runs, which changes what reads depth and therefore
+// what may be discarded). This prints the real list, once per N frames.
+REXCVAR_DEFINE_INT32(vulkan_log_pass_opens, 0, "GPU/Vulkan",
+                     "Log every render pass opened, every Nth frame (0 = off). Prints target, "
+                     "size, format and load ops - the per-frame tile-cycle budget as it "
+                     "actually runs, rather than as the code reads.")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_keep_render_pass, true, "GPU/Vulkan",
+                    "Keep the render pass open when SetRenderTargets is handed the targets "
+                    "that are already bound. Off restores the unconditional end/begin.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(vulkan_drain_budget_us, 2000, "GPU/Vulkan",
                      "Microseconds per frame the backend may spend destroying retired GPU "
                      "objects. An eviction sweep retires thousands at once and freeing them is "
@@ -568,6 +592,8 @@ class NrCmdVulkan : public nrhi::Cmd {
 
   bool EnsureRenderPassOpen();
   void EndRenderPassIfOpen();
+  uint32_t pass_open_seq_ = 0;  // passes actually begun this frame
+  uint32_t pass_frame_ = 0;     // frames recorded; see vulkan_log_pass_opens
   bool EnsureDrawState();
   void LatchPendingClear(NrTextureVulkan* texture, const float* color4, float depth);
 
@@ -1012,6 +1038,12 @@ class NrDeviceVulkan : public nrhi::Device {
     auto* t = static_cast<NrTextureVulkan*>(texture);
     if (t->is_guest_output) return;  // wrappers are owned by the device cache
     RetireFramebuffersForView(t->attachment_view);
+    // Close the pass before dropping the binding. Nulling rt_color_/rt_depth_
+    // while render_pass_open_ stays true leaves an open pass whose attachment
+    // is being destroyed, and with the same-target early-out in
+    // SetRenderTargets that state is no longer guaranteed to be corrected by
+    // the next bind.
+    if (cmd_.rt_color_ == t || cmd_.rt_depth_ == t) cmd_.EndRenderPassIfOpen();
     if (cmd_.rt_color_ == t) cmd_.rt_color_ = nullptr;
     if (cmd_.rt_depth_ == t) cmd_.rt_depth_ = nullptr;
     std::erase(pending_clear_textures_, t);
@@ -3247,6 +3279,16 @@ void NrCmdVulkan::EndFrame() {
   // Submit remaining queued barriers (including the app's release of the
   // guest output back to kGuestOutput, if it did not flush explicitly).
   device->cp()->SubmitBarriers(true);
+  // Per-frame reset for the pass-open diagnostic. The count is the tile-cycle
+  // budget for this frame; the sequence numbers show the ORDER, which is what
+  // decides whether two passes onto the same target can be merged.
+  const int32_t pass_log_every = REXCVAR_GET(vulkan_log_pass_opens);
+  if (pass_log_every > 0 && pass_open_seq_ > 0 &&
+      pass_frame_ % uint32_t(pass_log_every) == 0) {
+    REXLOG_WARN("[pass] frame {} opened {} render passes", pass_frame_, pass_open_seq_);
+  }
+  ++pass_frame_;
+  pass_open_seq_ = 0;
 }
 
 void NrCmdVulkan::EndRenderPassIfOpen() {
@@ -3327,6 +3369,20 @@ bool NrCmdVulkan::EnsureRenderPassOpen() {
   device->cp()->deferred_command_buffer().CmdVkBeginRenderPass(&begin_info,
                                                                VK_SUBPASS_CONTENTS_INLINE);
   render_pass_open_ = true;
+  if (const int32_t every = REXCVAR_GET(vulkan_log_pass_opens); every > 0) {
+    // Counted here rather than in SetRenderTargets: this is the only place a
+    // tile cycle is actually paid, and the same-target early-out means the two
+    // numbers differ.
+    ++pass_open_seq_;
+    if (pass_frame_ % uint32_t(every) == 0) {
+      REXLOG_WARN("[pass] #{} {}x{} color={} depth={} load={} store=STORE target={}",
+                  pass_open_seq_, width, height,
+                  rt_color_ != nullptr ? int(rt_color_->vk_format) : -1,
+                  rt_depth_ != nullptr ? int(rt_depth_->vk_format) : -1,
+                  color_clear ? "CLEAR" : "LOAD",
+                  static_cast<const void*>(rt_color_));
+    }
+  }
   return true;
 }
 
@@ -3489,9 +3545,42 @@ void NrCmdVulkan::SetTextures(uint32_t param, nrhi::TextureView* const* views, u
 }
 
 void NrCmdVulkan::SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth) {
+  auto* new_color = static_cast<NrTextureVulkan*>(color);
+  auto* new_depth = static_cast<NrTextureVulkan*>(depth);
+  // Same targets, pass already open: keep the tile resident. Viewport and
+  // scissor are dynamic state (VK_DYNAMIC_STATE_VIEWPORT/SCISSOR) and never
+  // needed a new pass, so a chain of passes differing only by viewport was
+  // paying a full tile store + load between each one.
+  //
+  // TWO things the end/begin cycle used to do are skipped here, not one.
+  //
+  // 1. A PENDING CLEAR. The clear is applied by the pass loadOp (see
+  //    EnsureRenderPassOpen), so skipping the cycle would drop it silently -
+  //    a wrong image, not a crash. Guarded below. In practice the guard is
+  //    belt-and-braces: ClearRenderTarget/ClearDepth only latch when the
+  //    target is NOT the bound one of an open pass, and otherwise record
+  //    vkCmdClearAttachments in place. It is kept because three separate
+  //    reviewers had to derive that, which is exactly when an explicit test
+  //    earns its keep.
+  //
+  // 2. EnsureLayout + SubmitBarriers(true), which EnsureRenderPassOpen ran
+  //    before beginning the pass. That made SetRenderTargets an implicit
+  //    barrier-submit point. It no longer is. Today every caller pairs a
+  //    Barrier() with FlushBarriers() before the dependent draw, so nothing
+  //    is stranded - but a future caller writing
+  //        Barrier(X) -> SetRenderTargets(same, same) -> Draw reading X
+  //    without a FlushBarriers would now read stale data, where the old code
+  //    silently covered for it. That is the invariant this early-out makes
+  //    load-bearing, and it is not asserted anywhere.
+  if (render_pass_open_ && new_color == rt_color_ && new_depth == rt_depth_ &&
+      !(new_color != nullptr && new_color->pending_clear) &&
+      !(new_depth != nullptr && new_depth->pending_clear) &&
+      REXCVAR_GET(vulkan_keep_render_pass)) {
+    return;
+  }
   EndRenderPassIfOpen();
-  rt_color_ = static_cast<NrTextureVulkan*>(color);
-  rt_depth_ = static_cast<NrTextureVulkan*>(depth);
+  rt_color_ = new_color;
+  rt_depth_ = new_depth;
 }
 
 void NrCmdVulkan::LatchPendingClear(NrTextureVulkan* t, const float* color4, float depth) {
