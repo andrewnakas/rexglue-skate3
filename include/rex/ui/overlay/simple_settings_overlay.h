@@ -244,9 +244,6 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool hair_full_ = true;
   bool water_effects_ = true;
   bool fps_percentiles_ = false;
-  // Index into kBenchmarkLengths; 2 = Standard. Not a cvar: it only decides
-  // what Run Benchmark arms, and the run itself clears the cvar when it ends.
-  int benchmark_length_index_ = 2;
   int npc_update_rate_index_ = 0;
   int world_refresh_index_ = 0;
   int draw_distance_index_ = 1;
