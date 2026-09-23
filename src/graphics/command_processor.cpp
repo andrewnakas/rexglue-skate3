@@ -66,6 +66,17 @@ REXCVAR_DEFINE_INT32(
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// The per-opcode timer runs on the busiest thread in the emulator: two
+// steady_clock reads and two atomic increments on EVERY type-3 packet, which
+// at a measured ~830k packets/s is ~1.7M vDSO clock reads a second. It shipped
+// enabled, so every player paid for an instrument nobody was reading. Off by
+// default; [cp-op] says so rather than printing zeros, because a silent zero
+// reads as "this opcode is free" in exactly the investigation that needs it.
+REXCVAR_DEFINE_BOOL(gpu_op_timing, false, "GPU",
+                    "Time every PM4 packet by opcode for the [cp-op] report. Costs two clock "
+                    "reads and two atomics per packet on the command-processor thread.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(gpu_wait_reg_mem_timeout_ms, 500, "GPU",
                      "Abandon a WAIT_REG_MEM poll after this many milliseconds (0 = wait forever)");
 
@@ -430,6 +441,9 @@ CpSummary g_cp_summary;
 // find out which is to time all of them and let the biggest speak up.
 std::atomic<uint64_t> g_op_us[128] = {};
 std::atomic<uint64_t> g_op_count[128] = {};
+// Cached from gpu_op_timing and refreshed once per report window. Read twice
+// per packet, so it has to be a plain relaxed load and not a cvar lookup.
+std::atomic<bool> g_op_timing{false};
 
 // Defined in the Vulkan command processor: what the emulated path still
 // executes while the native renderer is replacing the frame.
@@ -462,6 +476,16 @@ void CommandProcessor::AccumulateWaitRegMem(uint64_t wait_us, bool abandoned) {
 
 void CommandProcessor::ReportCpSummary() {
   const auto now = std::chrono::steady_clock::now();
+  // Arm the per-packet timer BEFORE the early returns below. This function is
+  // called once per batch, but it returns immediately on the first call and on
+  // every call inside a 30-second window. Refreshing the flag further down -
+  // past both returns - left it false for the whole of the first window however
+  // the cvar was set, so the first [cp-op] line reported zeros for a window in
+  // which nothing had been timed. That is exactly the reading the cvar's own
+  // comment says this design exists to avoid, and ab.sh harvests these lines.
+  // A cvar read per batch is nothing against ExecutePrimaryBuffer.
+  const bool op_timing = REXCVAR_GET(gpu_op_timing);
+  g_op_timing.store(op_timing, std::memory_order_relaxed);
   if (g_cp_summary.last_report.time_since_epoch().count() == 0) {
     g_cp_summary.last_report = now;
     return;
@@ -509,6 +533,16 @@ void CommandProcessor::ReportCpSummary() {
   {
     // The five most expensive opcodes this window, by time. Names would need a
     // table that does not exist here; the opcode number is enough to look up.
+    //
+    // The counters are drained UNCONDITIONALLY, even when timing is off. If the
+    // drain sat inside the enabled branch, turning timing off mid-window would
+    // strand that window's partial accumulation in the arrays, and the next
+    // enable would print it against a window in which nothing was timed. There
+    // would be no tell: a [cp-op] line over 100% of the window is NORMAL here,
+    // because PM4_INDIRECT_BUFFER recurses inside its own OpTimer and nested
+    // packets are double-counted (a 130% line is cited as real at
+    // skate3_native_scene.cpp:3127), so a stale report looks exactly like a
+    // healthy one. 128 relaxed exchanges once per 30 s is free.
     struct Op { uint32_t op; uint64_t us; uint64_t n; };
     Op top[5] = {};
     uint64_t total_op_us = 0;
@@ -528,8 +562,12 @@ void CommandProcessor::ReportCpSummary() {
       if (o.us == 0) break;
       line += fmt::format("op{:02X}={:.0f}ms/{} ", o.op, double(o.us) / 1000.0, o.n);
     }
-    REXLOG_WARN("[cp-op] packets={:.0f}ms ({:.1f}% of window) | top: {}",
-                double(total_op_us) / 1000.0, double(total_op_us) / (secs * 10000.0), line);
+    if (op_timing) {
+      REXLOG_WARN("[cp-op] packets={:.0f}ms ({:.1f}% of window) | top: {}",
+                  double(total_op_us) / 1000.0, double(total_op_us) / (secs * 10000.0), line);
+    } else {
+      REXLOG_WARN("[cp-op] per-opcode timing is off (gpu_op_timing=false)");
+    }
   }
   {
     // The swap, broken into its parts. Everything the frame waits on is in
@@ -1227,10 +1265,17 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
 
   bool result = false;
   // Timed by opcode. RAII so every early return inside the switch is counted.
+  // Both the clock read and the accumulate are gated: the construction cost is
+  // the expensive half, so checking only in the destructor would save nothing.
+  const bool time_this_packet = g_op_timing.load(std::memory_order_relaxed);
   struct OpTimer {
     uint32_t op;
+    bool on;
     std::chrono::steady_clock::time_point t0;
     ~OpTimer() {
+      if (!on) {
+        return;
+      }
       g_op_us[op & 0x7F].fetch_add(
           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                        std::chrono::steady_clock::now() - t0)
@@ -1238,7 +1283,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
           std::memory_order_relaxed);
       g_op_count[op & 0x7F].fetch_add(1, std::memory_order_relaxed);
     }
-  } op_timer{opcode, std::chrono::steady_clock::now()};
+  } op_timer{opcode, time_this_packet,
+             time_this_packet ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{}};
   switch (opcode) {
     case PM4_ME_INIT:
       result = ExecutePacketType3_ME_INIT(reader, packet, count);
