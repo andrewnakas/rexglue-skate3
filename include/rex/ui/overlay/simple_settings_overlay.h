@@ -234,12 +234,13 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool bloom_ = true;
   bool volumetrics_ = true;
   // Low-End Devices group. vegetation_ and merge_draws_ apply live;
-  // ambient_npcs_ and movable_props_ are restart-class, because the spawn
-  // hooks behind them are read once at boot.
+  // ambient_npcs_, movable_props_ and other_skaters_ are restart-class,
+  // because the spawn hooks behind them are read once at boot.
   bool vegetation_ = true;
   bool merge_draws_ = false;
   bool ambient_npcs_ = true;
   bool movable_props_ = true;
+  bool other_skaters_ = true;
   bool hair_full_ = true;
   bool water_effects_ = true;
   bool fps_percentiles_ = false;

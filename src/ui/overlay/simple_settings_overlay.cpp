@@ -249,7 +249,7 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 50> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 51> kOptionalSimpleSettingsCvars = {
     "show_fps_percentiles",
     "skate3_native_render_scene_hair_single_pass",
     "skate3_native_render_scene_water_effects",
@@ -260,6 +260,7 @@ constexpr std::array<std::string_view, 50> kOptionalSimpleSettingsCvars = {
     "skate3_native_render_scene_merge_draws",
     "skate3_native_render_scene_ambient_npcs",
     "skate3_native_render_scene_movable_props",
+    "skate3_native_render_scene_other_skaters",
     // Which map pack is staged. Written by the level picker rather than by a
     // row here, but it has to survive the relaunch that applies it, and this
     // list is what gets written to the settings file.
@@ -1656,6 +1657,8 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
                   rex::cvar::Query<bool>("skate3_native_render_scene_ambient_npcs");
   movable_props_ = !HasCvar("skate3_native_render_scene_movable_props") ||
                    rex::cvar::Query<bool>("skate3_native_render_scene_movable_props");
+  other_skaters_ = !HasCvar("skate3_native_render_scene_other_skaters") ||
+                   rex::cvar::Query<bool>("skate3_native_render_scene_other_skaters");
   hair_full_ = !HasCvar("skate3_native_render_scene_hair_single_pass") ||
                !rex::cvar::Query<bool>("skate3_native_render_scene_hair_single_pass");
   water_effects_ = !HasCvar("skate3_native_render_scene_water_effects") ||
@@ -1752,7 +1755,10 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
               rex::cvar::Query<bool>("skate3_native_render_scene_ambient_npcs")) ||
          (HasCvar("skate3_native_render_scene_movable_props") &&
           movable_props_ !=
-              rex::cvar::Query<bool>("skate3_native_render_scene_movable_props"));
+              rex::cvar::Query<bool>("skate3_native_render_scene_movable_props")) ||
+         (HasCvar("skate3_native_render_scene_other_skaters") &&
+          other_skaters_ !=
+              rex::cvar::Query<bool>("skate3_native_render_scene_other_skaters"));
 }
 
 void SimpleSettingsDialog::Toggle() {
@@ -1858,6 +1864,9 @@ void SimpleSettingsDialog::SaveVideo() {
   }
   if (HasCvar("skate3_native_render_scene_movable_props")) {
     SetBoolCvar("skate3_native_render_scene_movable_props", movable_props_);
+  }
+  if (HasCvar("skate3_native_render_scene_other_skaters")) {
+    SetBoolCvar("skate3_native_render_scene_other_skaters", other_skaters_);
   }
   // Written only when the selection changed, so an untouched row keeps the
   // cvar on "auto".
@@ -2646,6 +2655,26 @@ void SimpleSettingsDialog::PushLowEndRows(std::vector<RowSpec>& rows) {
     row.on_enum_change = [this](int value) { ambient_npcs_ = value != 0; };
     row.reset = [this] {
       ambient_npcs_ = CvarDefaultBool("skate3_native_render_scene_ambient_npcs", true);
+    };
+    rows.push_back(std::move(row));
+  }
+
+  if (HasCvar("skate3_native_render_scene_other_skaters")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Other Skaters";
+    row.desc =
+        "The other skaters who roam the world with you - about four at a "
+        "time. Off stops them being created at all, so they cost no "
+        "animation, no cloth, no physics and no collision, not just hidden "
+        "bodies. You are unaffected, and so is anyone a challenge brings in "
+        "for a race or a versus. Needs a restart.";
+    row.options = {"Off", "On"};
+    row.flag = &other_skaters_;
+    row.on_enum_change = [this](int value) { other_skaters_ = value != 0; };
+    row.reset = [this] {
+      other_skaters_ =
+          CvarDefaultBool("skate3_native_render_scene_other_skaters", true);
     };
     rows.push_back(std::move(row));
   }
