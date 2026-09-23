@@ -209,6 +209,14 @@ static_assert(kAspectRatioLabels.size() ==
 // NPCs get the finer ladder because the crowd is what a slow device actually
 // chokes on, and the world one is coarser because its dispatch builds packets
 // the native renderer discards anyway.
+// Benchmark length. A run has to fit inside the route being measured: at ~70
+// fps, 3600 frames is 53 seconds (measured), and a run that outlasts the route
+// spends its tail measuring whatever happens after - standing still, a crash,
+// a menu - and puts that in the p99.
+constexpr std::array<int32_t, 4> kBenchmarkLengths = {900, 1800, 3600, 7200};
+constexpr std::array<const char*, 4> kBenchmarkLengthLabels = {
+    "Short (~15 s)", "Medium (~30 s)", "Standard (~60 s)", "Long (~2 min)"};
+
 constexpr std::array<int32_t, 4> kNpcUpdateRates = {1, 2, 3, 4};
 constexpr std::array<const char*, 4> kNpcUpdateRateLabels = {
     "Every frame", "Every 2nd", "Every 3rd", "Every 4th"};
@@ -2849,6 +2857,24 @@ void SimpleSettingsDialog::PushDrawDistanceRow(std::vector<RowSpec>& rows) {
 }
 
 void SimpleSettingsDialog::PushFpsCounterRow(std::vector<RowSpec>& rows) {
+  if (HasCvar("skate3_benchmark_frames")) {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Benchmark Length";
+    row.desc =
+        "How long Run Benchmark measures for. Pick one that fits inside the "
+        "run you are going to do: a benchmark that outlasts the route spends "
+        "its tail measuring you standing still, and that lands in the worst "
+        "frame and the p99. Times assume about 60 fps.";
+    for (const char* label : kBenchmarkLengthLabels) {
+      row.options.push_back(label);
+    }
+    row.index = &benchmark_length_index_;
+    row.on_enum_change = [this](int value) { benchmark_length_index_ = value; };
+    row.reset = [this] { benchmark_length_index_ = 2; };
+    rows.push_back(std::move(row));
+  }
+
   // The benchmark sits with the counter rows rather than in the graphics list:
   // it is a measurement, not a setting, and it is what the settings above are
   // meant to be judged with.
@@ -2865,7 +2891,11 @@ void SimpleSettingsDialog::PushFpsCounterRow(std::vector<RowSpec>& rows) {
         "place each time, or the numbers compare two different things rather "
         "than two settings.";
     row.action = [this] {
-      rex::cvar::SetFlagByName("skate3_benchmark_frames", "3600");
+      const int index =
+          std::clamp(benchmark_length_index_, 0,
+                     static_cast<int>(kBenchmarkLengths.size()) - 1);
+      rex::cvar::SetFlagByName("skate3_benchmark_frames",
+                               std::to_string(kBenchmarkLengths[index]));
       Hide();
     };
     rows.push_back(std::move(row));
