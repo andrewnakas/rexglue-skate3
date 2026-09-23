@@ -873,12 +873,18 @@ std::vector<std::string> BuildAndroidArguments() {
       // This costs nothing on a GPU that has the feature, because the check it
       // relaxes passes there anyway - no device that works today is affected.
       "--vulkan_require_vertex_pipeline_stores_and_atomics=false",
-      // TEST BUILD: pre-optimise SPIR-V before the driver compiles it. Older
-      // Adreno drivers segfault in their own shader compiler on unoptimized
-      // input - a Retroid Pocket 5 (Adreno 650, driver 0746.0) faults inside
+      // Pre-optimise SPIR-V before the driver compiles it. Older Adreno
+      // drivers segfault in their own shader compiler on unoptimized input - a
+      // Retroid Pocket 5 (Adreno 650, driver 0746.0) faults inside
       // vulkan.adreno.so three seconds in, where an Adreno 730 on a current
-      // driver never does. Costs shader compile time, so this is not a
-      // default; it is here to find out whether it is the fix.
+      // driver never does.
+      //
+      // This went in as a test and the comment said so for five releases while
+      // it shipped as a default the whole time. It stays: v0.1.22 through
+      // v0.1.26 carried it with no report of the crash it was aimed at and no
+      // report against it. The cost is real but one-off - shader compile time
+      // on first launch, which is the same window the synchronous-compile fix
+      // for the blank setup screen widened, so the two want watching together.
       "--vulkan_spirv_optimize=true",
       "--skate3_auto_install_dlc=true",
       "--vulkan_log_debug_messages=false",
