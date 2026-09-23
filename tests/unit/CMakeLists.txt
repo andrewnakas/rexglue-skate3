@@ -13,6 +13,7 @@ add_executable(unit_tests
     codegen/template_registry_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
+    input/button_map_test.cpp
     system/guest_path_test.cpp
     system/function_dispatcher_test.cpp
     codegen/manifest_test.cpp
@@ -20,6 +21,8 @@ add_executable(unit_tests
     rexglue/ui_test.cpp
 )
 
+# button_map.cpp is not listed here: rexruntime already links rexinput, which
+# carries it, and compiling it again would define every symbol twice.
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/commands/migration_scan.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp

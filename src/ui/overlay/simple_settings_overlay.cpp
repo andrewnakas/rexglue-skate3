@@ -127,6 +127,7 @@ constexpr std::array<double, 7> kTexStoreMb = {256, 288, 320, 384, 448, 576, 768
 constexpr std::array<const char*, 7> kTexStoreLabels = {
     "256 MB", "288 MB (default)", "320 MB", "384 MB", "448 MB", "576 MB", "768 MB"};
 
+
 constexpr std::array<const char*, 3> kResolutionLabels = {"720p (1x)", "1440p (2x)",
                                                           "2160p (3x)"};
 // Aspect ratio. Index 0 is off - skate3_ultrawide false, the game presents
@@ -209,7 +210,6 @@ static_assert(kAspectRatioLabels.size() ==
 // NPCs get the finer ladder because the crowd is what a slow device actually
 // chokes on, and the world one is coarser because its dispatch builds packets
 // the native renderer discards anyway.
-
 constexpr std::array<int32_t, 4> kNpcUpdateRates = {1, 2, 3, 4};
 constexpr std::array<const char*, 4> kNpcUpdateRateLabels = {
     "Every frame", "Every 2nd", "Every 3rd", "Every 4th"};
@@ -242,7 +242,8 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
 // Optional cvars persisted when the host defines them (HasCvar-gated: app
 // cvars like the native-renderer knobs don't exist in every embedder, and
 // backend/platform cvars don't exist in every build).
-constexpr std::array<std::string_view, 51> kOptionalSimpleSettingsCvars = {
+constexpr std::array<std::string_view, 52> kOptionalSimpleSettingsCvars = {
+    "hid_button_map",
     "show_fps_percentiles",
     "skate3_native_render_scene_hair_single_pass",
     "skate3_native_render_scene_water_effects",
@@ -504,6 +505,64 @@ constexpr uint16_t kPadA = 0x1000;
 constexpr uint16_t kPadB = 0x2000;
 constexpr uint16_t kPadX = 0x4000;
 constexpr uint16_t kPadY = 0x8000;
+// Navigation reads none of these; the button-mapping rows bind them.
+constexpr uint16_t kPadStart = 0x0010;
+constexpr uint16_t kPadBack = 0x0020;
+constexpr uint16_t kPadLThumb = 0x0040;
+constexpr uint16_t kPadRThumb = 0x0080;
+
+// The remappable inputs, in the order the rows are built: face buttons,
+// shoulders, triggers, stick clicks, system, d-pad. Kept as a local mirror of
+// rex::input::PadInput for the same reason kPad* mirrors the button bits -
+// this overlay does not depend on the kernel input headers. The tokens are the
+// wire format of the hid_button_map cvar and must match button_map.cpp.
+struct PadBindInfo {
+  const char* token;
+  const char* label;
+  uint16_t bit;  // 0 for the two triggers, which are not bits
+};
+constexpr std::array<PadBindInfo, 16> kPadBinds = {{
+    {"a", "A", kPadA},
+    {"b", "B", kPadB},
+    {"x", "X", kPadX},
+    {"y", "Y", kPadY},
+    {"lb", "Left Bumper", kPadLShoulder},
+    {"rb", "Right Bumper", kPadRShoulder},
+    {"lt", "Left Trigger", 0},
+    {"rt", "Right Trigger", 0},
+    {"l3", "Left Stick Click", kPadLThumb},
+    {"r3", "Right Stick Click", kPadRThumb},
+    {"back", "Back", kPadBack},
+    {"start", "Start", kPadStart},
+    {"dpad_up", "D-Pad Up", kPadDpadUp},
+    {"dpad_down", "D-Pad Down", kPadDpadDown},
+    {"dpad_left", "D-Pad Left", kPadDpadLeft},
+    {"dpad_right", "D-Pad Right", kPadDpadRight},
+}};
+constexpr int kPadBindCount = static_cast<int>(kPadBinds.size());
+constexpr int kBindLtIndex = 6;
+constexpr int kBindRtIndex = 7;
+
+// Named layouts, as hid_button_map specs. Anything else the player builds by
+// hand shows as Custom, exactly as the chord rows do.
+constexpr std::array<const char*, 3> kButtonLayoutSpecs = {
+    "",
+    "a=b,b=a,x=y,y=x",
+    "lb=lt,rb=rt,lt=lb,rt=rb",
+};
+constexpr std::array<const char*, 3> kButtonLayoutLabels = {
+    "Default",
+    "Nintendo (A/B, X/Y swapped)",
+    "Swap Bumpers & Triggers",
+};
+
+// A trigger pulled at least this far counts as a press while capturing a bind.
+constexpr uint8_t kBindTriggerPress = 96;
+
+// How long a bind row waits for a button before giving up. Every button is
+// bindable, so none can be reserved for "cancel" - the timeout is the way out,
+// and the row counts it down so it never looks stuck.
+constexpr float kBindCaptureSeconds = 5.0f;
 
 // Categories shown in the left rail.
 struct CategoryInfo {
@@ -1494,7 +1553,7 @@ void EnsureSimpleSettingsConfig(const std::filesystem::path& config_path) {
 
 // One setting row (or section header) in the content column.
 struct SimpleSettingsDialog::RowSpec {
-  enum Kind { kHeader, kEnum, kSlider, kAction, kText };
+  enum Kind { kHeader, kEnum, kSlider, kAction, kText, kBind };
   Kind kind = kEnum;
   const char* label = nullptr;
   const char* desc = nullptr;
@@ -1516,6 +1575,8 @@ struct SimpleSettingsDialog::RowSpec {
   std::function<void()> on_value_change;
   // kAction
   std::function<void()> action;
+  // kBind (index into kPadBinds of the guest input this row drives)
+  int bind_guest = -1;
   // kText
   char* text_buf = nullptr;
   size_t text_buf_size = 0;
@@ -1578,6 +1639,7 @@ void SimpleSettingsDialog::Show() {
   content_scroll_ = 0.0f;
   content_scroll_anim_ = 0.0f;
   editing_text_ = false;
+  capturing_bind_ = -1;
   highlight_anim_y_ = -1.0f;
   rail_anim_y_ = -1.0f;
   prev_pad_buttons_ = 0xFFFF;  // swallow buttons already held at open
@@ -1722,6 +1784,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
       HasCvar("hid_invert_camera_y") && rex::cvar::Query<bool>("hid_invert_camera_y");
   swap_sticks_ = HasCvar("hid_swap_sticks") && rex::cvar::Query<bool>("hid_swap_sticks");
   guide_button_ = HasCvar("guide_button") && rex::cvar::Query<bool>("guide_button");
+  LoadButtonMap();
 }
 
 bool SimpleSettingsDialog::HasSettingsChanges() const {
@@ -1782,6 +1845,7 @@ void SimpleSettingsDialog::RequestClose() {
 }
 
 void SimpleSettingsDialog::Hide() {
+  capturing_bind_ = -1;
   if (!visible_) {
     return;
   }
@@ -2346,6 +2410,232 @@ void SimpleSettingsDialog::PushFrameCapRow(std::vector<RowSpec>& rows) {
         rate = CvarDefaultDouble("d3d12_present_frame_limiter_fps", 0.0);
       }
       frame_cap_index_ = FrameCapIndexFromRate(rate);
+    };
+    rows.push_back(std::move(row));
+  }
+}
+
+namespace {
+
+// Index into kPadBinds for a hid_button_map token, or -1.
+int PadBindIndexFromToken(std::string_view token) {
+  for (int i = 0; i < kPadBindCount; ++i) {
+    if (token == kPadBinds[size_t(i)].token) {
+      return i;
+    }
+  }
+  // The chord cvars accept these spellings, and someone hand-editing
+  // settings.toml after reading that help text should not be punished.
+  if (token == "select" || token == "view") return PadBindIndexFromToken("back");
+  if (token == "menu") return PadBindIndexFromToken("start");
+  return -1;
+}
+
+// "a=b,b=a" -> map[guest] = source, always a permutation. Mirrors
+// rex::input::ParseButtonMap; the overlay deliberately does not depend on the
+// kernel input headers, the same way kPad* mirrors the button bits.
+std::array<int, 16> ParseButtonMapSpec(std::string_view spec) {
+  std::array<int, 16> map{};
+  for (int i = 0; i < kPadBindCount; ++i) {
+    map[size_t(i)] = i;
+  }
+  std::array<bool, 16> guest_seen{};
+  std::array<bool, 16> source_taken{};
+
+  std::string guest_token;
+  std::string source_token;
+  bool in_source = false;
+  auto flush = [&]() {
+    const int guest = PadBindIndexFromToken(guest_token);
+    const int source = PadBindIndexFromToken(source_token);
+    if (guest >= 0 && source >= 0 && !guest_seen[size_t(guest)] &&
+        !source_taken[size_t(source)]) {
+      guest_seen[size_t(guest)] = true;
+      source_taken[size_t(source)] = true;
+      map[size_t(guest)] = source;
+    }
+    guest_token.clear();
+    source_token.clear();
+    in_source = false;
+  };
+  for (size_t i = 0; i <= spec.size(); ++i) {
+    const char c = i < spec.size() ? spec[i] : ',';
+    if (c == ',' || c == ';') {
+      flush();
+      continue;
+    }
+    if (c == '=' || c == ':') {
+      in_source = true;
+      continue;
+    }
+    if (c == ' ' || c == '\t') {
+      continue;
+    }
+    (in_source ? source_token : guest_token)
+        .push_back(char(std::tolower(static_cast<unsigned char>(c))));
+  }
+  // Whatever the spec named may have taken a source an unnamed guest still
+  // holds by identity. Park those and hand out what is left, so the result is
+  // a permutation no matter what the file said.
+  for (int i = 0; i < kPadBindCount; ++i) {
+    if (guest_seen[size_t(i)]) continue;
+    if (!source_taken[size_t(map[size_t(i)])]) {
+      source_taken[size_t(map[size_t(i)])] = true;
+    } else {
+      map[size_t(i)] = -1;
+    }
+  }
+  for (int i = 0; i < kPadBindCount; ++i) {
+    if (map[size_t(i)] >= 0) continue;
+    for (int j = 0; j < kPadBindCount; ++j) {
+      if (!source_taken[size_t(j)]) {
+        source_taken[size_t(j)] = true;
+        map[size_t(i)] = j;
+        break;
+      }
+    }
+  }
+  return map;
+}
+
+// Only the entries that differ from identity, so the console layout writes ""
+// and SaveConfigValues then drops the key entirely.
+std::string FormatButtonMapSpec(const std::array<int, 16>& map) {
+  std::string out;
+  for (int i = 0; i < kPadBindCount; ++i) {
+    if (map[size_t(i)] == i) continue;
+    if (!out.empty()) out.push_back(',');
+    out += kPadBinds[size_t(i)].token;
+    out.push_back('=');
+    out += kPadBinds[size_t(map[size_t(i)])].token;
+  }
+  return out;
+}
+
+// The keys the keyboard half of GatherInput acts on. None of them can ever
+// complete a bind - InputSystem::GetUiGamepadState reports physical pads only,
+// because the touch and keyboard drivers both decline that path - so a press
+// while a bind is armed means "stop waiting" rather than being swallowed.
+bool AnyNavKeyPressed() {
+  return ImGui::IsKeyPressed(ImGuiKey_UpArrow, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_DownArrow, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_Space, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_Q, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_R, false) || ImGui::IsKeyPressed(ImGuiKey_F, false);
+}
+
+// Rebind one guest input, swapping with whoever held that source. Keeping the
+// map a permutation is what makes the feature safe without a confirmation
+// step: no guest button can ever end up unreachable.
+void ButtonMapAssignLocal(std::array<int, 16>& map, int guest, int source) {
+  if (guest < 0 || guest >= kPadBindCount || source < 0 || source >= kPadBindCount) {
+    return;
+  }
+  const int previous = map[size_t(guest)];
+  if (previous == source) {
+    return;
+  }
+  for (int i = 0; i < kPadBindCount; ++i) {
+    if (map[size_t(i)] == source) {
+      map[size_t(i)] = previous;
+      break;
+    }
+  }
+  map[size_t(guest)] = source;
+}
+
+}  // namespace
+
+// Which named layout the current map is, or one past the end for Custom.
+// Compares the PARSED maps rather than the spec strings: two different strings
+// can describe the same layout, and a preset that failed to match would read
+// back as Custom the instant it was selected.
+int SimpleSettingsDialog::ButtonLayoutIndexForMap() const {
+  for (size_t i = 0; i < kButtonLayoutSpecs.size(); ++i) {
+    if (ParseButtonMapSpec(kButtonLayoutSpecs[i]) == button_map_) {
+      return static_cast<int>(i);
+    }
+  }
+  return static_cast<int>(kButtonLayoutSpecs.size());
+}
+
+void SimpleSettingsDialog::LoadButtonMap() {
+  button_map_ = ParseButtonMapSpec(HasCvar("hid_button_map")
+                                       ? rex::cvar::Query<std::string>("hid_button_map")
+                                       : std::string());
+  button_layout_index_ = ButtonLayoutIndexForMap();
+}
+
+void SimpleSettingsDialog::StoreButtonMap() {
+  rex::cvar::SetFlagByName("hid_button_map", FormatButtonMapSpec(button_map_));
+  button_layout_index_ = ButtonLayoutIndexForMap();
+  SaveSimpleSettingsConfig(config_path_);
+}
+
+void SimpleSettingsDialog::PushButtonMapRows(std::vector<RowSpec>& rows) {
+  if (!HasCvar("hid_button_map")) {
+    return;
+  }
+  {
+    RowSpec row;
+    row.kind = RowSpec::kEnum;
+    row.label = "Button Layout";
+    row.desc =
+        "A whole set of button assignments at once. Nintendo-style pads report "
+        "A and B - and X and Y - the other way round from an Xbox pad, which "
+        "is what the second option puts right. Rebinding anything below leaves "
+        "this on Custom. Applies immediately.";
+    for (const char* preset : kButtonLayoutLabels) {
+      row.options.push_back(preset);
+    }
+    // Same shape as the chord rows: a layout the player built by hand is kept
+    // as a trailing entry rather than snapping the row back to Default.
+    if (button_layout_index_ >= static_cast<int>(kButtonLayoutSpecs.size())) {
+      row.options.push_back("Custom");
+    }
+    row.index = &button_layout_index_;
+    row.on_enum_change = [this](int value) {
+      if (value < 0 || value >= static_cast<int>(kButtonLayoutSpecs.size())) {
+        return;  // the Custom entry is a readout, not a choice
+      }
+      button_map_ = ParseButtonMapSpec(kButtonLayoutSpecs[size_t(value)]);
+      StoreButtonMap();
+    };
+    row.reset = [this] {
+      button_map_ = ParseButtonMapSpec("");
+      StoreButtonMap();
+    };
+    rows.push_back(std::move(row));
+  }
+  for (int guest = 0; guest < kPadBindCount; ++guest) {
+    RowSpec row;
+    row.kind = RowSpec::kBind;
+    row.label = kPadBinds[size_t(guest)].label;
+    row.desc =
+        "Which button on your controller does this. Select the row, then press "
+        "the button you want. If that button is already used somewhere else, "
+        "the two trade places, so nothing is ever left unreachable. Applies "
+        "immediately.";
+    row.bind_guest = guest;
+    row.reset = [this, guest] {
+      ButtonMapAssignLocal(button_map_, guest, guest);
+      StoreButtonMap();
+    };
+    rows.push_back(std::move(row));
+  }
+  {
+    RowSpec row;
+    row.kind = RowSpec::kAction;
+    row.label = "Reset All Buttons";
+    row.desc = "Put every button back to the original controller layout.";
+    row.action = [this] {
+      button_map_ = ParseButtonMapSpec("");
+      StoreButtonMap();
     };
     rows.push_back(std::move(row));
   }
@@ -3898,6 +4188,10 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
         };
         rows.push_back(std::move(row));
       }
+      if (HasCvar("hid_button_map")) {
+        header("Button Mapping");
+        PushButtonMapRows(rows);
+      }
       break;
     }
     case 3: {  // Audio
@@ -4106,6 +4400,51 @@ SimpleSettingsDialog::NavIntents SimpleSettingsDialog::GatherInput(ImGuiIO& io) 
   // (e.g. the Back+Start chord) don't fire actions on the first frame.
   const uint16_t pressed = pad.buttons & ~prev_pad_buttons_;
   prev_pad_buttons_ = pad.buttons;
+  pad_connected_ = pad.connected;
+
+  // A bind row is waiting for a button. Swallow the pad entirely while it is:
+  // the press that lands the bind must not also move the cursor, and since
+  // every button is bindable none can be reserved as a cancel - the countdown
+  // is the way out. Same suppression shape as the confirm card and the
+  // gamertag field further down.
+  if (capturing_bind_ >= 0) {
+    capture_age_ += io.DeltaTime;
+    int captured = -1;
+    const uint16_t newly = uint16_t(pad.buttons & ~capture_prev_buttons_);
+    for (int i = 0; i < kPadBindCount; ++i) {
+      const uint16_t bit = kPadBinds[size_t(i)].bit;
+      if (bit != 0 && (newly & bit) != 0) {
+        captured = i;
+        break;
+      }
+    }
+    if (captured < 0 && pad.left_trigger >= kBindTriggerPress &&
+        capture_prev_lt_ < kBindTriggerPress) {
+      captured = kBindLtIndex;
+    }
+    if (captured < 0 && pad.right_trigger >= kBindTriggerPress &&
+        capture_prev_rt_ < kBindTriggerPress) {
+      captured = kBindRtIndex;
+    }
+    capture_prev_buttons_ = pad.buttons;
+    capture_prev_lt_ = pad.left_trigger;
+    capture_prev_rt_ = pad.right_trigger;
+    if (captured >= 0) {
+      ButtonMapAssignLocal(button_map_, capturing_bind_, captured);
+      StoreButtonMap();
+      capturing_bind_ = -1;
+    } else if (capture_age_ >= kBindCaptureSeconds) {
+      capturing_bind_ = -1;
+    }
+    // Swallow the PAD for the duration, not the keyboard. A keyboard cannot
+    // finish this bind, so eating its keys for five seconds would strand a
+    // desktop player mid-menu with no way out but the mouse.
+    if (capturing_bind_ >= 0 && AnyNavKeyPressed()) {
+      capturing_bind_ = -1;
+    }
+    pad_active_ = true;
+    return NavIntents{};
+  }
 
   int dir_x = 0;
   int dir_y = 0;
@@ -4354,6 +4693,21 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
 
   std::vector<RowSpec> rows;
   BuildRows(rows, category_);
+  // A capture must not outlive its row. Leaving the Controls page by tapping
+  // the rail is the one navigation the pad swallow above does not block, and
+  // an orphaned capture would eat every button for five seconds.
+  if (capturing_bind_ >= 0) {
+    bool still_present = false;
+    for (const RowSpec& r : rows) {
+      if (r.kind == RowSpec::kBind && r.bind_guest == capturing_bind_) {
+        still_present = true;
+        break;
+      }
+    }
+    if (!still_present) {
+      capturing_bind_ = -1;
+    }
+  }
 
   // Selectable row indices (headers and disabled rows are skipped by nav).
   std::vector<int> selectable;
@@ -4441,6 +4795,16 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
       case RowSpec::kText:
         editing_text_ = true;
         text_edit_focus_pending_ = true;
+        break;
+      case RowSpec::kBind:
+        // Arm capture. The press that armed it is still down, so seed the
+        // edge detector with the current pad or the same press binds itself
+        // the moment it is released and re-read.
+        capturing_bind_ = row.bind_guest;
+        capture_age_ = 0.0f;
+        capture_prev_buttons_ = 0xFFFF;
+        capture_prev_lt_ = 255;
+        capture_prev_rt_ = 255;
         break;
       default:
         break;
@@ -5125,6 +5489,47 @@ void SimpleSettingsDialog::OnDraw(ImGuiIO& io) {
         // activation, and disabled rows read from their dim label alone.
         if (clicked && hovered && row.enabled && !row_activated_this_frame) {
           activate_row(row);
+          row_activated_this_frame = true;
+        }
+        break;
+      }
+      case RowSpec::kBind: {
+        // Right-aligned value, same as the gamertag row: the physical input
+        // driving this guest button, or the countdown while it waits for one.
+        char text[48];
+        const bool capturing = capturing_bind_ == row.bind_guest;
+        if (capturing && !pad_connected_) {
+          // Only a physical pad can answer: the on-screen controls and the
+          // keyboard both decline the overlay's input path on purpose.
+          std::snprintf(text, sizeof(text), "%s", "Connect a controller\u2026");
+        } else if (capturing) {
+          const int left =
+              std::max(1, int(std::ceil(kBindCaptureSeconds - capture_age_)));
+          std::snprintf(text, sizeof(text), "Press a button\u2026 %d", left);
+        } else {
+          const int source = row.bind_guest >= 0 && row.bind_guest < kPadBindCount
+                                 ? button_map_[size_t(row.bind_guest)]
+                                 : -1;
+          std::snprintf(text, sizeof(text), "%s",
+                        source >= 0 && source < kPadBindCount
+                            ? kPadBinds[size_t(source)].label
+                            : "-");
+        }
+        const ImU32 text_col = capturing ? kColInteract : value_col;
+        ImVec2 extent = row_bold->CalcTextSizeA(value_size, FLT_MAX, 0.0f, text);
+        dl->AddText(row_bold, value_size,
+                    ImVec2(Snap(vx1 - extent.x), Snap(cy - extent.y * 0.5f)), text_col, text);
+        if (clicked && hovered && row.enabled && !row_activated_this_frame) {
+          zone_ = FocusZone::kContent;
+          row_index_ = i;
+          // A tap while armed cancels rather than re-arming: on a touchscreen
+          // there is no pad button to press, so the tap is the only way out
+          // before the countdown expires.
+          if (capturing) {
+            capturing_bind_ = -1;
+          } else {
+            activate_row(row);
+          }
           row_activated_this_frame = true;
         }
         break;

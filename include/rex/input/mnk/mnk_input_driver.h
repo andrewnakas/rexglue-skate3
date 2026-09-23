@@ -40,6 +40,9 @@ class MnkInputDriver final : public InputDriver,
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
+  // Keyboard/mouse has its own binding table (the keybind_* cvars), so the pad
+  // it synthesises is already the layout the player asked for.
+  bool remappable() const override { return false; }
 
   void OnWindowAvailable(rex::ui::Window* window) override;
 

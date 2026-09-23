@@ -5,6 +5,7 @@
  */
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -56,6 +57,12 @@ struct SimpleSettingsGamepad {
   uint16_t buttons = 0;  // X_INPUT_GAMEPAD_* bits
   int16_t thumb_lx = 0;
   int16_t thumb_ly = 0;
+  // Navigation needs none of these. The button-mapping rows do: a trigger has
+  // to be bindable, and it is not a bit in `buttons`.
+  uint8_t left_trigger = 0;
+  uint8_t right_trigger = 0;
+  int16_t thumb_rx = 0;
+  int16_t thumb_ry = 0;
 };
 
 class SimpleSettingsDialog final : public ImGuiDialog {
@@ -175,6 +182,15 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   void PushTouchControlsRow(std::vector<RowSpec>& rows);
   void PushTouchStickSizeRow(std::vector<RowSpec>& rows);
   void PushTouchLayoutRows(std::vector<RowSpec>& rows);
+  // Controls page: the button-mapping group - layout preset, one row per
+  // remappable guest input, and a reset.
+  void PushButtonMapRows(std::vector<RowSpec>& rows);
+  // Reads hid_button_map into button_map_ / button_layout_index_.
+  void LoadButtonMap();
+  // Writes button_map_ back to hid_button_map and saves.
+  void StoreButtonMap();
+  // Which named layout button_map_ is, or one past the end for Custom.
+  int ButtonLayoutIndexForMap() const;
   void PushLevelPickerRow(std::vector<RowSpec>& rows);
   void PushFpsCounterRow(std::vector<RowSpec>& rows);
   // One controller-chord row. `allow_guide` offers the Guide button, which
@@ -244,6 +260,24 @@ class SimpleSettingsDialog final : public ImGuiDialog {
   bool hair_full_ = true;
   bool water_effects_ = true;
   bool fps_percentiles_ = false;
+  // Button mapping. button_map_[guest] is an index into kPadBinds naming the
+  // physical input that drives it; it is always a permutation, so no guest
+  // button can end up driven by nothing.
+  std::array<int, 16> button_map_ = {};
+  int button_layout_index_ = 0;
+  // Index into kPadBinds of the guest input whose row is waiting for a press,
+  // or -1. Deliberately the guest index and not a row index: BuildRows runs
+  // more than once per frame, so a row index would not survive a rebuild.
+  // While this is set, GatherInput swallows the pad entirely.
+  int capturing_bind_ = -1;
+  float capture_age_ = 0.0f;
+  uint16_t capture_prev_buttons_ = 0;
+  uint8_t capture_prev_lt_ = 0;
+  uint8_t capture_prev_rt_ = 0;
+  // Whether the last poll saw a physical pad. Only one can complete a bind, so
+  // the row says "Connect a controller" rather than counting down at someone
+  // who has nothing to press.
+  bool pad_connected_ = false;
   int npc_update_rate_index_ = 0;
   int world_refresh_index_ = 0;
   int draw_distance_index_ = 1;

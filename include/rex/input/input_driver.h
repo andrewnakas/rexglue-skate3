@@ -44,6 +44,13 @@ class InputDriver {
     return GetState(user_index, out_state);
   }
   virtual X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) = 0;
+
+  // Whether the player's button map (hid_button_map) applies to this driver.
+  // False for drivers whose controls are already labelled by guest function -
+  // the on-screen touch pad draws "A" on the A button, and remapping its
+  // output would make every label lie - and for drivers with a binding table
+  // of their own, like keyboard/mouse.
+  virtual bool remappable() const { return true; }
   virtual X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                                 X_INPUT_KEYSTROKE* out_keystroke) = 0;
 

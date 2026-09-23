@@ -189,6 +189,10 @@ class TouchInputDriver final : public InputDriver {
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                         X_INPUT_KEYSTROKE* out_keystroke) override;
+  // The on-screen buttons are drawn with the guest's own labels, so the pad
+  // they report is already in guest terms. Remapping it would make the A
+  // button on screen do something other than A.
+  bool remappable() const override { return false; }
 
  private:
   bool watch_installed_ = false;

@@ -13,12 +13,14 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
 
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/input/button_map.h>
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
@@ -104,6 +106,17 @@ REXCVAR_DEFINE_BOOL(hid_invert_camera_y, false, "Input",
                     "Invert the vertical axis of the right stick (camera).");
 REXCVAR_DEFINE_BOOL(hid_swap_sticks, false, "Input",
                     "Swap the left and right thumbsticks.");
+// Empty is the console layout, so an install that never opens the Controls
+// page is bit-for-bit unaffected - and SaveConfigValues drops keys that are at
+// their default, so the key never appears in a settings.toml that never used
+// it. One packed string rather than sixteen cvars: it resets in a single
+// write and can be copied between devices, and the config format has no array
+// type anyway.
+REXCVAR_DEFINE_STRING(hid_button_map, "", "Input",
+                      "Controller button remapping, as comma-separated guest=source pairs, "
+                      "e.g. \"a=b,b=a\". Tokens: a, b, x, y, lb, rb, lt, rt, l3, r3, back, "
+                      "start, dpad_up, dpad_down, dpad_left, dpad_right. Empty is the "
+                      "console layout.");
 namespace rex::input {
 namespace {
 
@@ -172,6 +185,33 @@ void ApplyStickDeadzone(int16_t& x, int16_t& y, float deadzone) {
 // The user-facing stick/trigger options, applied to the merged pad on its way
 // to the guest. Every one of them defaults to a no-op, so an untouched
 // install behaves exactly as the console did.
+// Parsing sixteen tokens on every poll, for every user index, is not free and
+// the string changes about once a year. Cache it against the spec it came
+// from. Returned by value - it is sixteen bytes, and guest threads poll this
+// concurrently, so handing out a reference into the cache would be a race.
+//
+// Read through GetFlagByName, NOT REXCVAR_GET. REXCVAR_GET hands back a
+// reference to the cvar's own std::string and copies it unlocked, while the
+// settings menu assigns that same string from the UI thread on every rebind.
+// GetFlagByName copies under the registry mutex - the one SetFlagByName holds.
+// The chord cvars read the same way and have got away with it because every
+// chord spec fits in libc++'s 22-character small-string buffer, so no heap
+// pointer is ever swapped under a reader. "lb=lt,rb=rt,lt=lb,rt=rb" is 23, and
+// a reader that sees the long-string flag with a stale pointer is a
+// use-after-free on a guest thread.
+ButtonMap CurrentButtonMap() {
+  static std::mutex mutex;
+  static std::string cached_spec = "\x01";  // a spec no valid string can equal
+  static ButtonMap cached_map = DefaultButtonMap();
+  std::string spec = rex::cvar::GetFlagByName("hid_button_map");
+  std::lock_guard lock(mutex);
+  if (spec != cached_spec) {
+    cached_map = ParseButtonMap(spec);
+    cached_spec = std::move(spec);
+  }
+  return cached_map;
+}
+
 void ApplyGamepadTuning(X_INPUT_GAMEPAD& pad) {
   // The fields are big-endian wrappers, so every axis is read out into a
   // native temporary, tuned, and written back once.
@@ -286,6 +326,18 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   bool first_result = true;
   X_INPUT_STATE merged = {};
 
+  const ButtonMap button_map = CurrentButtonMap();
+  // The console layout is the default and the overwhelmingly common case, so
+  // skip the whole step rather than running an identity permutation.
+  const bool remap_active = !ButtonMapIsDefault(button_map);
+  const uint32_t trigger_threshold = REXCVAR_GET(hid_trigger_threshold);
+  // The chords below must keep matching PHYSICAL buttons. If they matched the
+  // remapped word, a player who moved Start somewhere strange could no longer
+  // open the settings menu to undo it, and the menu chord is the only way back
+  // on a phone with a pad attached (the on-screen controls hide themselves
+  // whenever one is).
+  uint16_t raw_chord_buttons = 0;
+
   for (auto& driver : drivers_) {
     X_INPUT_STATE state = {};
     X_RESULT result = driver->GetState(user_index, &state);
@@ -293,6 +345,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
       any_connected = true;
     }
     if (result == X_ERROR_SUCCESS) {
+      raw_chord_buttons |= static_cast<uint16_t>(state.gamepad.buttons);
+      // Per driver, not once after the merge: the on-screen touch pad and the
+      // keyboard already report in guest terms and must not be permuted.
+      if (remap_active && driver->remappable()) {
+        ApplyButtonMap(state.gamepad, button_map, trigger_threshold);
+      }
       if (first_result) {
         merged = state;
         first_result = false;
@@ -354,7 +412,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   const uint16_t menu_chord_buttons = ChordMaskFromSpec(REXCVAR_GET(menu_chord));
   const bool menu_chord_down =
       menu_chord_buttons != 0 &&
-      (static_cast<uint16_t>(merged.gamepad.buttons) & menu_chord_buttons) == menu_chord_buttons;
+      (raw_chord_buttons & menu_chord_buttons) == menu_chord_buttons;
   if (menu_chord_down && !menu_chord_down_ && menu_chord_callback_) {
     menu_chord_callback_();
   }
@@ -368,7 +426,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   const uint16_t perf_chord_buttons = ChordMaskFromSpec(REXCVAR_GET(perf_chord));
   const bool perf_chord_down =
       perf_chord_buttons != 0 && perf_chord_buttons != menu_chord_buttons &&
-      (static_cast<uint16_t>(merged.gamepad.buttons) & perf_chord_buttons) == perf_chord_buttons;
+      (raw_chord_buttons & perf_chord_buttons) == perf_chord_buttons;
   if (perf_chord_down && !perf_chord_down_ && perf_chord_callback_) {
     perf_chord_callback_();
   }
@@ -380,8 +438,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   const uint16_t picker_chord_buttons = ChordMaskFromSpec(REXCVAR_GET(picker_chord));
   const bool picker_chord_down =
       picker_chord_buttons != 0 &&
-      (static_cast<uint16_t>(merged.gamepad.buttons) & picker_chord_buttons) ==
-          picker_chord_buttons;
+      (raw_chord_buttons & picker_chord_buttons) == picker_chord_buttons;
   if (picker_chord_down && !picker_chord_down_ && picker_chord_callback_) {
     picker_chord_callback_();
   }
