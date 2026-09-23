@@ -241,8 +241,56 @@ std::vector<std::string> ErasePlayerOwnedArgs(std::vector<std::string> args,
   if (settings.empty()) {
     return args;
   }
+  // Match a real TOML assignment, not any occurrence of the name.
+  //
+  // This was `settings.find(key)`, a raw substring search, and the bug it hid
+  // was expensive: "skate3_guest_fps_cap" is a SUBSTRING of
+  // "skate3_guest_fps_cap_auto". Toggling the auto-cap row wrote _auto into
+  // settings.toml, the substring matched, and the shipped
+  // "--skate3_guest_fps_cap=60" was erased along with it. That cvar defaults
+  // to 0.0 - uncapped - so a player who touched that row once was left running
+  // the guest flat out into a 60 Hz panel through a MAILBOX swapchain, which
+  // renders about twice the frames the display can show and throws the rest
+  // away as heat. That heat is what drives the Adreno thermal clamp from
+  // 818 MHz to 317, and the clamp is what "60 fps, drops to 30 after a few
+  // minutes" actually is. Confirmed on a Galaxy S23 FE: settings.toml held
+  // _auto and no cap, and the log read
+  // "[pace] guest frame cap is now OFF" with no args file present at all.
+  //
+  // Three other pairs collide the same way: "resolution_scale" inside
+  // "draw_resolution_scale_x/y" (default 2, i.e. twice the pixels),
+  // "skate3_native_render_scene" inside its eleven _scene_* children, and
+  // "skate3_ultrawide" inside "skate3_ultrawide_target_aspect". The last two
+  // are harmless only because their defaults happen to equal what Android
+  // ships, which is luck, not design.
+  const auto player_chose = [&settings](std::string_view key) {
+    size_t pos = 0;
+    while ((pos = settings.find(key, pos)) != std::string::npos) {
+      const size_t end = pos + key.size();
+      // Must start a line (allowing leading whitespace)...
+      size_t back = pos;
+      while (back > 0 && (settings[back - 1] == ' ' || settings[back - 1] == '\t')) {
+        --back;
+      }
+      const bool at_line_start = back == 0 || settings[back - 1] == '\n';
+      // ...and be followed by whitespace then '=', so a longer key that merely
+      // begins with this one does not count.
+      size_t after = end;
+      while (after < settings.size() &&
+             (settings[after] == ' ' || settings[after] == '\t')) {
+        ++after;
+      }
+      const bool assigned = after < settings.size() && settings[after] == '=';
+      if (at_line_start && assigned) {
+        return true;
+      }
+      pos = end;
+    }
+    return false;
+  };
+
   for (const std::string_view key : kPlayerOwned) {
-    if (settings.find(key) == std::string::npos) {
+    if (!player_chose(key)) {
       continue;  // never chosen: the shipped default still applies
     }
     const std::string prefixed = "--" + std::string(key) + "=";
