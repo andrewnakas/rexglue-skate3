@@ -602,9 +602,18 @@ std::vector<std::string> BuildIOSArguments() {
       // 53-83%. The earlier objection to setting these - that pinning them
       // beats settings.toml, so someone asking for 0.75 silently got more -
       // is answered by Documents/user/ios_args.txt, which overrides anything
-      // here without a rebuild.
-      "--skate3_draw_distance_scale=1.0",
-      "--skate3_lod_distance_scale=1.0",
+      // here without a rebuild, and by kPlayerOwned, which drops these two the
+      // moment the Draw Distance row has been touched.
+      //
+      // 0.5 - the "Half" row - goes one step BELOW the console, and that is a
+      // deliberate trade rather than a free win: props, street furniture and
+      // foliage pop in visibly closer than they did in 2.6.3. It is the only
+      // content lever on this port with real mass behind it, because the static
+      // world is ~750 of the ~765 items in a frame; pedestrians, cars and other
+      // skaters together are about a dozen. One row in Settings > Video puts it
+      // back to Original.
+      "--skate3_draw_distance_scale=0.5",
+      "--skate3_lod_distance_scale=0.5",
 
       // ---- Command processor stalls --------------------------------------
       // Skate 3 parks the command processor on a WAIT_REG_MEM poll that never

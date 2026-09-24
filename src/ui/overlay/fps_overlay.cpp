@@ -17,11 +17,23 @@
 #include <imgui.h>
 #include <rex/cvar.h>
 
-// Off by default: three extra lines on a phone screen is a lot, and the
-// average is what most people want most of the time. On when a number is
-// being chased - an average hides exactly the stutters that make a game feel
-// bad, which is the whole reason these exist.
-REXCVAR_DEFINE_BOOL(show_fps_percentiles, false, "UI",
+// On by default, and the default is load-bearing rather than a preference.
+//
+// This ships on because the average is exactly the statistic that hides a
+// stutter - a steady 60 and a 60 that drops four frames a second read the
+// same - so anyone who turns the counter on to chase a number wants these.
+// It costs nothing until then: the overlay dialog only exists while
+// show_fps_counter is set, and these are two lines inside it.
+//
+// It must be the REGISTERED DEFAULT and not a compiled-in --flag. SaveConfigValues
+// erases any key sitting at its registered default (see the comment there - that
+// erasure is deliberate, and it is what makes a reset stick). Shipping this on via
+// an argument with the default still false meant the player's "Off" equalled the
+// default, was erased from settings.toml rather than written to it, and so
+// ErasePlayerOwnedArgs could not see that the player had chosen anything - the
+// argument came back at the next launch and the row flipped itself on again.
+// With the default true, "Off" is the non-default value, gets written, and sticks.
+REXCVAR_DEFINE_BOOL(show_fps_percentiles, true, "UI",
                     "Add 1% low FPS and p95/p99 frame times to the FPS counter")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
