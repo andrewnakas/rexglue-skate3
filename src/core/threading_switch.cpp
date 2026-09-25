@@ -43,6 +43,12 @@ static_assert(REX_PLATFORM_SWITCH, "This file is Horizon-only");
 #include <switch.h>
 
 #include <atomic>
+#include <chrono>
+#include <thread>
+#include <algorithm>
+#include <string>
+#include <vector>
+#include <mutex>
 #include <array>
 #include <cerrno>
 #include <charconv>
@@ -207,7 +213,81 @@ Placement LookUpPlacement(std::string_view name) {
 // itself - can be placed too. Only threads that named themselves were being
 // placed before, which left the rest at priority 59 on the process default
 // core, all on top of each other.
+// ---- Per-thread CPU time -------------------------------------------------
+// The career world is CPU-bound at ~30 fps and nothing could say WHICH of the
+// ~40 threads burns the cores: the sampling profiler is a stub here. Horizon
+// counts CPU ticks per thread, so every named thread is registered and the
+// top consumers are logged every 30 s as a share of one core.
+struct CpuEntry {
+  Handle handle;
+  std::string name;
+  u64 last_ticks;
+};
+std::mutex g_cpu_mutex;
+std::vector<CpuEntry> g_cpu_threads;
+
+bool QueryThreadTicks(Handle handle, u64& out) {
+  if (R_SUCCEEDED(svcGetInfo(&out, InfoType_ThreadTickCount, handle, UINT64_MAX))) {
+    return true;
+  }
+  return R_SUCCEEDED(svcGetInfo(&out, InfoType_ThreadTickCountDeprecated, handle, UINT64_MAX));
+}
+
+void CpuReporterMain() {
+  constexpr int kWindowSeconds = 30;
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::seconds(kWindowSeconds));
+    struct Row {
+      std::string name;
+      u64 delta;
+    };
+    std::vector<Row> rows;
+    {
+      std::lock_guard<std::mutex> lock(g_cpu_mutex);
+      for (auto& e : g_cpu_threads) {
+        u64 now = 0;
+        if (!QueryThreadTicks(e.handle, now)) {
+          continue;  // exited
+        }
+        rows.push_back({e.name, now >= e.last_ticks ? now - e.last_ticks : 0});
+        e.last_ticks = now;
+      }
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.delta > b.delta; });
+    const double window_ticks = double(armGetSystemTickFreq()) * kWindowSeconds;
+    double total = 0;
+    for (const auto& r : rows) {
+      total += double(r.delta);
+    }
+    std::string top;
+    for (size_t i = 0; i < rows.size() && i < 14; ++i) {
+      top += fmt::format(" {}={:.0f}%", rows[i].name, 100.0 * double(rows[i].delta) / window_ticks);
+    }
+    REXLOG_WARN("[cpu] {}s: {} threads, {:.0f}% of 300% |{}", kWindowSeconds, rows.size(),
+                100.0 * total / window_ticks, top);
+  }
+}
+
+void RegisterThreadForCpu(Handle handle, std::string_view name) {
+  if (handle == CUR_THREAD_HANDLE) {
+    handle = threadGetCurHandle();
+  }
+  static std::once_flag started;
+  std::call_once(started, [] { std::thread(CpuReporterMain).detach(); });
+  u64 ticks = 0;
+  QueryThreadTicks(handle, ticks);
+  std::lock_guard<std::mutex> lock(g_cpu_mutex);
+  for (auto& e : g_cpu_threads) {
+    if (e.handle == handle) {
+      e.name = std::string(name);
+      return;
+    }
+  }
+  g_cpu_threads.push_back({handle, std::string(name), ticks});
+}
+
 void ApplyPlacementForThread(Handle handle, std::string_view name) {
+  RegisterThreadForCpu(handle, name);
   const Placement p = LookUpPlacement(name);
   if (!p.matched) {
     return;
