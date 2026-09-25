@@ -139,6 +139,25 @@ __declspec(dllexport) uint32_t AmdPowerXpressRequestHighPerformance = 1;
 }  // extern "C"
 #endif  // REX_PLATFORM_WIN32
 
+namespace {
+// Does the guest actually receive the vblanks this thread means to send?
+// Skate 3's felt speed tracks fps/60 however the video mode and the vblank
+// rate are set, which is what a title stepping by vblank COUNT would do if
+// its interrupts arrived once per rendered frame. The handler runs under the
+// global lock, so a guest thread holding it across a frame would do exactly
+// that - and the catch-up below silently drops what it cannot send.
+struct VblankStats {
+  uint64_t window_start_host = 0;
+  uint32_t sent = 0;
+  uint32_t dropped = 0;
+  uint64_t dispatch_us_total = 0;
+  uint64_t dispatch_us_max = 0;
+  uint32_t over_period = 0;  // dispatches longer than one vblank period
+} g_vblank_stats;
+
+void NoteVblankDropped(uint64_t n) { g_vblank_stats.dropped += uint32_t(n); }
+}  // namespace
+
 GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
 
 GraphicsSystem::~GraphicsSystem() = default;
@@ -249,6 +268,25 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             chrono::Clock::QueryHostTickCount() +
             (REXCVAR_GET(vsync) ? vsync_interval_host_ticks : no_vsync_interval_host_ticks);
         while (vsync_worker_running_) {
+          // Follow the reported refresh rather than latching it here. This
+          // thread starts in runtime setup, before the app's OnPostSetup
+          // matches video_mode_refresh_rate to the frame cap, so a latched
+          // rate kept the guest at 60 vblanks/s under a 30 Hz video mode -
+          // and Skate 3's step follows the vblanks, not the video mode.
+          {
+            system::X_VIDEO_MODE current_mode;
+            kernel::xboxkrnl::VdQueryVideoMode(&current_mode);
+            const double current_hz = std::max(1.0, double(float(current_mode.refresh_rate)));
+            if (current_hz != refresh_rate_hz) {
+              REXGPU_WARN("GPU VSync: guest vblank rate {:.0f} Hz -> {:.0f} Hz", refresh_rate_hz,
+                          current_hz);
+              refresh_rate_hz = current_hz;
+              vsync_interval_ticks = std::max(
+                  uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+              vsync_interval_host_ticks =
+                  std::max(uint64_t(1), uint64_t(double(host_tick_frequency) / refresh_rate_hz));
+            }
+          }
           if (REXCVAR_GET(vblank_host_clock_pacing)) {
             bool vsync_enabled = REXCVAR_GET(vsync);
             no_vsync_interval_ticks = get_no_vsync_interval_ticks(guest_tick_frequency);
@@ -278,6 +316,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                        current_host_tick >= next_frame_host_tick);
 
               if (current_host_tick >= next_frame_host_tick) {
+                NoteVblankDropped((current_host_tick - next_frame_host_tick) / interval_host_ticks +
+                                  1);
                 next_frame_time = current_guest_tick + interval_ticks;
                 next_frame_host_tick = current_host_tick + interval_host_ticks;
               }
@@ -301,6 +341,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                      current_time >= next_frame_time);
 
             if (current_time >= next_frame_time) {
+              NoteVblankDropped((current_time - next_frame_time) / interval_ticks + 1);
               next_frame_time = current_time + interval_ticks;
             }
           }
@@ -494,6 +535,7 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                          rex::countof(args));
 }
 
+
 void GraphicsSystem::MarkVblank() {
   // Driven from here because it is the one thing already ticking at a steady
   // rate that the guest can observe. See KernelState::UpdateGuestThreadTimestamps.
@@ -512,7 +554,35 @@ void GraphicsSystem::MarkVblank() {
   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
+  const uint64_t host_freq = chrono::Clock::QueryHostTickFrequency();
+  const uint64_t t0 = chrono::Clock::QueryHostTickCount();
   DispatchInterruptCallback(0, 2);
+  const uint64_t t1 = chrono::Clock::QueryHostTickCount();
+
+  auto& st = g_vblank_stats;
+  const uint64_t us = (t1 - t0) * 1000000 / host_freq;
+  ++st.sent;
+  st.dispatch_us_total += us;
+  st.dispatch_us_max = std::max(st.dispatch_us_max, us);
+  system::X_VIDEO_MODE mode;
+  kernel::xboxkrnl::VdQueryVideoMode(&mode);
+  const double hz = std::max(1.0, double(float(mode.refresh_rate)));
+  if (double(us) > 1000000.0 / hz) {
+    ++st.over_period;
+  }
+  if (st.window_start_host == 0) {
+    st.window_start_host = t1;
+  } else if (t1 - st.window_start_host >= 30 * host_freq) {
+    const double secs = double(t1 - st.window_start_host) / double(host_freq);
+    REXGPU_WARN(
+        "[vblank] {:.0f}s: sent={} ({:.1f}/s of {:.0f} Hz) dropped={} dispatch avg={:.2f}ms "
+        "max={:.1f}ms over-period={}",
+        secs, st.sent, st.sent / secs, hz, st.dropped,
+        st.sent ? double(st.dispatch_us_total) / st.sent / 1000.0 : 0.0,
+        double(st.dispatch_us_max) / 1000.0, st.over_period);
+    st = VblankStats{};
+    st.window_start_host = t1;
+  }
 }
 
 void GraphicsSystem::ClearCaches() {
