@@ -180,6 +180,18 @@ bool WriteConfigFile(const std::filesystem::path& config_path, const toml::table
   }
   std::error_code ec;
   std::filesystem::rename(temp_path, config_path, ec);
+#if defined(__SWITCH__)
+  // Horizon's FAT driver refuses to rename over an existing file (EEXIST), so
+  // every save after the first failed and no setting ever persisted. Replace
+  // in two steps. A crash between them loses settings.toml (defaults on next
+  // boot) but leaves the full config in the .tmp beside it.
+  if (ec && std::filesystem::exists(config_path)) {
+    std::error_code remove_ec;
+    std::filesystem::remove(config_path, remove_ec);
+    ec.clear();
+    std::filesystem::rename(temp_path, config_path, ec);
+  }
+#endif
   if (ec) {
     REXLOG_ERROR("SaveConfig: failed to replace {}: {}", config_path.string(), ec.message());
     std::error_code remove_ec;
