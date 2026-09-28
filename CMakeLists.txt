@@ -120,15 +120,32 @@ if(NOT WIN32)
 endif()
 
 # Global compile options
-add_compile_options(
-    -fno-strict-aliasing
-    -ffp-model=strict
-    $<$<CONFIG:DEBUG>:-g>
-    $<$<CONFIG:DEBUG>:-O0>
-    $<$<CONFIG:RELEASE>:-O3>
-    $<$<CONFIG:RELEASE>:-DNDEBUG>
-    -fno-char8_t
-)
+add_compile_options(-fno-strict-aliasing)
+
+# clang-cl reports MSVC=TRUE (it drives an MSVC-style command line even
+# though CMAKE_CXX_COMPILER_ID is "Clang").
+if(MSVC)
+    # It already receives /O2 /Ob2 /DNDEBUG or /Od from CMake's own per-config
+    # MSVC default flags, so adding GNU-style -O3/-O0/-g on top is redundant
+    # -- and on any target that also sets /WX (e.g. SPIRV-Tools-opt), the
+    # resulting "argument unused" warning becomes a hard build error. So
+    # nothing more is added here for optimization/debug info.
+    #
+    # -ffp-model=strict and -fno-char8_t are real Clang flags that clang-cl's
+    # MSVC-compatible argument parser rejects outright under
+    # -Werror,-Wunknown-argument. /clang: forces them straight through to the
+    # underlying clang frontend instead.
+    add_compile_options(/clang:-ffp-model=strict /clang:-fno-char8_t)
+else()
+    add_compile_options(
+        $<$<CONFIG:DEBUG>:-g>
+        $<$<CONFIG:DEBUG>:-O0>
+        $<$<CONFIG:RELEASE>:-O3>
+        $<$<CONFIG:RELEASE>:-DNDEBUG>
+        -ffp-model=strict
+        -fno-char8_t
+    )
+endif()
 
 # CMake sets both APPLE and UNIX for iOS, so an explicit flag is needed to tell
 # it apart from macOS everywhere below.
